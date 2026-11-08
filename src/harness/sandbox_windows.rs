@@ -299,8 +299,8 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE,
     FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, READ_CONTROL,
-    SYNCHRONIZE, WRITE_DAC,
+    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, GetLongPathNameW, OPEN_EXISTING,
+    READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
 };
 // The launch half of the backend: the process-attribute list that carries the confinement
 // declaration, `CreateProcessW` and the wait for the child, and the std-handle inspection that
@@ -984,38 +984,34 @@ fn env_dirs(names: &[&str]) -> Vec<PathBuf> {
 }
 
 /// Compare two path spellings the way the Windows filesystem does: case-insensitively, with the
-/// separators and the verbatim markers flattened away, so a canonicalised spelling and a plain one
-/// name the same location.
+/// separators and the verbatim markers flattened away and the 8.3 short components resolved, so
+/// every spelling of one location names the same location.
 fn paths_match(left: &Path, right: &Path) -> bool {
     comparable_components(left) == comparable_components(right)
 }
 
-/// The components of `path`, normalised for [`paths_match`]: lower-cased, split on either
-/// separator, with the verbatim markers Windows accepts dropped.
+/// The components of `path`, normalised for [`paths_match`]: the spelling put into this module's
+/// one comparison domain ([`comparison_spelling`]), lower-cased and split on the separator.
 ///
-/// The spelling a path is written in is not part of its identity, and the two spellings this
-/// policy meets are not the same one: the workspace root arrives canonicalised
+/// The spelling a path is written in is not part of its identity, and the spellings this policy
+/// meets are not the same one: the workspace root arrives canonicalised
 /// (`\\?\C:\Users\fredrik\source\marmel`, the shape `canonicalize()` produces and that the
-/// name-based ACL APIs are handed), while the denied directories come from the environment in
-/// their plain spelling (`C:\Users\fredrik\.ssh`). Comparing the drive **prefix** as a component
-/// made those two spellings different locations, so the sensitive-directory invariant — the hard
-/// `RuleSetup` failure for a workspace root that is, or contains, a denied directory — never fired
-/// for a real root, only for the plain-spelled fixtures the tests used.
+/// name-based ACL APIs are handed), the denied directories come from the environment in their
+/// plain spelling (`C:\Users\fredrik\.ssh`), and the same environment can spell the profile
+/// directory by its 8.3 short name (`C:\Users\RUNNER~1`, which is what `%TEMP%` holds on a GitHub
+/// runner). Comparing the drive **prefix** as a component made the first two spellings different
+/// locations, so the sensitive-directory invariant — the hard `RuleSetup` failure for a workspace
+/// root that is, or contains, a denied directory — never fired for a real root, only for the
+/// plain-spelled fixtures the tests used; comparing the components literally makes the short and
+/// the long spelling of the same directory different locations, which is the same bypass one step
+/// further along (t-034, and the `RUNNER~1` table this module now refuses).
 ///
-/// The markers are what has to go: `\\?\C:\Users` and `C:\Users` are one volume, and
-/// `\\?\UNC\server\share` and `\\server\share` are one share (a mapped, redirected or WSL workspace
-/// root canonicalises to the UNC spelling).
+/// What has to go is everything that says *how* a location is written rather than *which* location
+/// it is: the markers (`\\?\C:\Users` and `C:\Users` are one volume, `\\?\UNC\server\share` and
+/// `\\server\share` one share — a mapped, redirected or WSL workspace root canonicalises to the UNC
+/// spelling), the separator spelling, and the short form of a component the host can name in long.
 fn comparable_components(path: &Path) -> Vec<String> {
-    let spelling = path.as_os_str().to_string_lossy().to_lowercase();
-    // Every separator spelling Windows accepts is flattened **before** the markers are stripped,
-    // and the order of those two steps is the whole point (t-034): a marker is itself spelled with
-    // separators, so `//?/C:/Users` — a verbatim path that reached this code through a channel
-    // which normalises `\` to `/` — was never recognised as a marker and left a leading `?`
-    // segment behind. The drive prefix of that spelling (`?`, then `c:`) could then never equal
-    // the drive prefix of the plain one (`c:`): the same `\\?\c:` versus `c:` mismatch the
-    // backslash spelling used to have, surviving in the one spelling the strip could not see.
-    let spelling = spelling.replace('/', "\\");
-    strip_windows_path_markers(&spelling)
+    comparison_spelling(path)
         .split('\\')
         // An empty segment is what a separator pair leaves behind, and a `.` segment says "this
         // directory": neither names a part of the location.
@@ -1029,43 +1025,261 @@ fn comparable_components(path: &Path) -> Vec<String> {
 const VERBATIM_MARKER: &str = "\\\\?\\";
 
 /// The marker of a verbatim **share**: the marker above, plus the `UNC` word that names the share
-/// form (checked against the lower-cased spelling, which is what `comparable_components` works
-/// with).
+/// form (matched case-insensitively, because a share spelling arrives with whatever case the caller
+/// or the host wrote it in).
 const VERBATIM_UNC_MARKER: &str = "\\\\?\\unc\\";
 
 /// The device form of the marker above (`\\` + `.` + `\`), which names a device namespace such as
 /// `\\.\COM1` rather than a volume.
 const DEVICE_MARKER: &str = "\\\\.\\";
 
+/// The share marker as this module **writes** it: [`VERBATIM_UNC_MARKER`] is the same prefix folded
+/// to lower case so it can match whatever case the host spelled it in, and an operator-facing entry
+/// is spelled the way Windows spells it.
+const VERBATIM_UNC_PREFIX: &str = "\\\\?\\UNC\\";
+
 /// The separator that opens a plain share spelling. A verbatim share rewrites onto the two of
 /// these that a plain spelling opens with, so both spellings keep one component list.
 const UNC_SEPARATOR: &str = "\\";
 
-/// Drop the verbatim and device markers from a lower-cased path spelling, and rewrite a verbatim
-/// UNC to the plain share spelling.
+/// How a spelling is prefixed: with nothing, or with one of the markers Windows reads as "interpret
+/// the rest literally" — see [`strip_windows_path_markers`] for why the marker is not part of the
+/// location, and [`normalised_spelling`] for the one case where it has to survive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathMarker {
+    /// No marker: the API parses the path, normalises it and holds it to `MAX_PATH`.
+    None,
+    /// `\\?\` in front of a drive (or of a device namespace written the verbatim way).
+    Verbatim,
+    /// `\\?\UNC\` in front of a share: the verbatim spelling of `\\server\share`.
+    Unc,
+    /// `\\.\` in front of a device namespace (`\\.\COM1`): a namespace, not a volume.
+    Device,
+}
+
+/// The marker `spelling` is written with, recognising it in either separator spelling and in either
+/// case (the marker is itself spelled with separators and with letters, so both are flattened and
+/// folded before it is looked for).
+#[must_use]
+fn path_marker(spelling: &str) -> PathMarker {
+    let probe = spelling.replace('/', "\\").to_lowercase();
+    if probe.starts_with(VERBATIM_UNC_MARKER) {
+        PathMarker::Unc
+    } else if probe.starts_with(DEVICE_MARKER) {
+        PathMarker::Device
+    } else if probe.starts_with(VERBATIM_MARKER) {
+        PathMarker::Verbatim
+    } else {
+        PathMarker::None
+    }
+}
+
+/// Drop the verbatim and device markers from a path spelling, and rewrite a verbatim UNC to the
+/// plain share spelling.
 ///
 /// A marker says how Windows is to **interpret** a path, not which location it names, so the two
-/// spellings of one location have to lose the marker before they can be compared:
+/// spellings of one location have to lose the marker before they can be compared or stored:
 /// `\\?\C:\Users` becomes `C:\Users` and `\\?\UNC\server\share` becomes `\\server\share`. A
-/// spelling without a marker is returned as it stands.
+/// spelling without a marker comes back with its separators flattened, which is what puts it in
+/// the same domain as one that was written with them the other way.
 ///
-/// The spelling arrives with every separator already flattened to `\` by the caller, because the
-/// markers themselves are spelled with separators: `//?/C:/Users` is the marker of one volume
-/// written with the other separator, not a `?` segment on a relative path.
+/// Every separator spelling Windows accepts is flattened **before** the marker is looked for, and
+/// the order of those two steps is the whole point (t-034): a marker is itself spelled with
+/// separators, so `//?/C:/Users` — a verbatim path that reached this code through a channel which
+/// normalises `\` to `/` — was never recognised as a marker and left a leading `?` segment behind.
+/// The drive prefix of that spelling (`?`, then `c:`) could then never equal the drive prefix of
+/// the plain one (`c:`): the same `\\?\c:` versus `c:` mismatch the backslash spelling used to
+/// have, surviving in the one spelling the strip could not see.
 fn strip_windows_path_markers(spelling: &str) -> String {
-    if let Some(rest) = spelling.strip_prefix(VERBATIM_UNC_MARKER) {
-        // The marker ends with the separator that closes the `UNC` word, so `rest` starts at the
+    let flattened = spelling.replace('/', "\\");
+    // The marker is matched case-insensitively but sliced out of the original spelling, so the
+    // location behind it keeps the case it was handed. Every byte of every marker is ASCII, so the
+    // fold cannot change the length of the prefix and the offset below is a character boundary.
+    let probe = flattened.to_lowercase();
+    if probe.starts_with(VERBATIM_UNC_MARKER) {
+        // The marker ends with the separator that closes the `UNC` word, so the rest starts at the
         // share name. A plain spelling opens that same share name with two separators, and the
         // rewrite supplies exactly those two.
-        return format!("{UNC_SEPARATOR}{UNC_SEPARATOR}{rest}");
+        let share = &flattened[VERBATIM_UNC_MARKER.len()..];
+        return format!("{UNC_SEPARATOR}{UNC_SEPARATOR}{share}");
     }
-    if let Some(rest) = spelling.strip_prefix(DEVICE_MARKER) {
-        return rest.to_owned();
+    if probe.starts_with(DEVICE_MARKER) {
+        return flattened[DEVICE_MARKER.len()..].to_owned();
     }
-    if let Some(rest) = spelling.strip_prefix(VERBATIM_MARKER) {
-        return rest.to_owned();
+    if probe.starts_with(VERBATIM_MARKER) {
+        return flattened[VERBATIM_MARKER.len()..].to_owned();
     }
-    spelling.to_owned()
+    flattened
+}
+
+/// `windef.h` `MAX_PATH`: at or beyond this many UTF-16 code units a path can only be handed to the
+/// file and security APIs with a verbatim marker in front of it, so below the ceiling the marker is
+/// noise this module removes, and at or above it the marker is the only way to name the object.
+const MAX_PATH_CEILING: usize = 260;
+
+/// The ceiling of a `\\?\` path — 32 767 UTF-16 code units. An answer longer than that from the
+/// long-name call is a broken host rather than a long path, and is declined rather than trusted.
+const VERBATIM_PATH_CEILING: usize = 32_767;
+
+/// The spelling of `path` in this module's **one** comparison domain: marker-free, separator-
+/// flattened, long-name resolved, lower-cased.
+///
+/// This is the text every containment and deny-list decision is taken in ([`paths_match`],
+/// [`is_ancestor_or_self`] and therefore [`sensitive_conflict`]). Entry construction puts the same
+/// text into the stored [`PolicyPath`] through [`normalise_policy_path`], so the table, the grants
+/// and the checks cannot disagree about which directory a spelling names.
+fn comparison_spelling(path: &Path) -> String {
+    let plain = strip_windows_path_markers(&path.to_string_lossy());
+    match long_path_spelling(&plain) {
+        Some(resolved) => resolved.to_lowercase(),
+        None => plain.to_lowercase(),
+    }
+}
+
+/// The one spelling this policy stores: the comparison domain, with the verbatim marker kept only
+/// where the path could not be named without it.
+///
+/// Normalising at construction is what makes the containment checks and the deny-list suppression
+/// agree with the table they are read from. Before it, one CI table held three spellings of one
+/// location at once — the canonicalised root in its verbatim long form, and every entry derived
+/// from the environment in the 8.3 short form of the same profile directory — so a workspace root
+/// inside `%USERPROFILE%\.ssh` was not seen to be inside `%USERPROFILE%\.ssh`, and the deny-list
+/// that is the only way Windows has of closing a directory silently did not fire.
+#[must_use]
+fn normalise_policy_path(path: &Path) -> PathBuf {
+    PathBuf::from(normalised_spelling(&path.to_string_lossy()))
+}
+
+/// The domain spelling of `spelling`: separators flattened, marker removed, short components
+/// resolved to long ([`long_path_spelling`]).
+///
+/// Two spellings are deliberately left alone. A device namespace (`\\.\COM1`) names no volume, so
+/// there is no long-name domain to resolve it into and the marker is the name. And a path at or
+/// beyond [`MAX_PATH_CEILING`] keeps the marker it arrived with, because the marker is what makes a
+/// path that long nameable by `CreateFileW`, `GetNamedSecurityInfoW` and `SetNamedSecurityInfoW` at
+/// all: dropping it would turn a workspace root the sandbox can grant into one it can only refuse,
+/// and the point of this function is to name locations better, not to lose them.
+fn normalised_spelling(spelling: &str) -> String {
+    let flattened = spelling.replace('/', "\\");
+    let marker = path_marker(&flattened);
+    if marker == PathMarker::Device {
+        return flattened;
+    }
+    let plain = strip_windows_path_markers(&flattened);
+    let resolved = match long_path_spelling(&plain) {
+        Some(resolved) => resolved,
+        None => plain,
+    };
+    if marker != PathMarker::None && resolved.encode_utf16().count() >= MAX_PATH_CEILING {
+        return with_verbatim_marker(marker, &resolved);
+    }
+    resolved
+}
+
+/// Put `plain` back into the spelling a path this long has to be handed to Win32 in.
+fn with_verbatim_marker(marker: PathMarker, plain: &str) -> String {
+    match marker {
+        PathMarker::Unc => {
+            // The plain share spelling opens with the two separators the marker replaces, and the
+            // marker supplies them in its own words.
+            let share = plain
+                .strip_prefix(UNC_SEPARATOR)
+                .and_then(|share| share.strip_prefix(UNC_SEPARATOR))
+                .unwrap_or(plain);
+            format!("{VERBATIM_UNC_PREFIX}{share}")
+        }
+        // A drive spelled verbatim, and the device case, which [`normalised_spelling`] has already
+        // returned by now.
+        PathMarker::Verbatim | PathMarker::Device | PathMarker::None => {
+            format!("{VERBATIM_MARKER}{plain}")
+        }
+    }
+}
+
+/// The last Win32 status behind a declined long-name resolution, in the one record this module
+/// writes for it: which call declined, which spelling, and the code it reported — decimal and
+/// `code_hex`, because `0x00000003` and `3` are the same answer and only one of them is recognisable.
+fn log_long_path_decline(call: &str, spelling: &str, code: WIN32_ERROR) {
+    tracing::debug!(
+        path = spelling,
+        call,
+        code,
+        code_hex = format!("{code:#010x}").as_str(),
+        "the host could not resolve the long-name spelling of this path: the policy keeps the \
+         spelling it was handed"
+    );
+}
+
+/// The long-name spelling of a marker-free absolute `spelling`, or `None` when this host cannot name
+/// one for it.
+///
+/// `GetLongPathNameW` is the only API that turns the 8.3 component of a path (`RUNNER~1`) into the
+/// long component the same directory answers under a `canonicalize()` — and hosts really do hand out
+/// short spellings, in `%TEMP%` and in whatever `Path::canonicalize` or an operator's config copied
+/// from it, which is how one location reached this module as both `C:\Users\runneradmin\…` and
+/// `C:\Users\RUNNER~1\…`.
+///
+/// It is used best-effort, and that is exactly what makes it safe to call on a path this policy may
+/// never have seen before:
+///
+/// * the sizing call answers with the number of code units the answer needs **including** the
+///   terminating NUL, so the second call is handed a buffer of precisely that size;
+/// * a call that answers `0` failed and the caller keeps the spelling it already had — the
+///   component that cannot be resolved is most often one that does not exist (`ERROR_FILE_NOT_FOUND`,
+///   `ERROR_PATH_NOT_FOUND`), and a malformed spelling is rejected outright (`ERROR_INVALID_NAME`);
+/// * a spelling that is not absolute is left alone instead of being resolved against the current
+///   directory of whoever happened to call last, which would invent a location for a relative path
+///   the policy is about to reject as relative anyway;
+/// * an answer past [`VERBATIM_PATH_CEILING`] is declined rather than trusted.
+///
+/// Every one of those outcomes is "the spelling was not improved": the function has no error path,
+/// so a policy that meets a path the host cannot resolve behaves exactly as it did before.
+fn long_path_spelling(spelling: &str) -> Option<String> {
+    if spelling.is_empty() || !Path::new(spelling).is_absolute() {
+        return None;
+    }
+    let wide = WideString::new(spelling);
+    let mut probe = [0u16; 1];
+    // SAFETY: the input is owned by `wide` and NUL-terminated, `probe` is a writable one-code-unit
+    // buffer, and a size too small is the documented way to ask for the size the answer needs.
+    let needed = unsafe { GetLongPathNameW(wide.pcwstr(), probe.as_mut_ptr(), probe.len() as u32) };
+    if needed == 0 {
+        let (code, _) = last_win32_error_detail();
+        log_long_path_decline("GetLongPathNameW (sizing)", spelling, code);
+        return None;
+    }
+    let Some(needed) = usize::try_from(needed)
+        .ok()
+        .filter(|needed| *needed <= VERBATIM_PATH_CEILING)
+    else {
+        log_long_path_decline("GetLongPathNameW (sizing)", spelling, 0);
+        return None;
+    };
+    let mut buffer: Vec<u16> = vec![0; needed];
+    // SAFETY: `buffer` holds exactly `needed` code units, which is the size the sizing call asked
+    // for, and the pointer handed to the API is that buffer's own.
+    let written = unsafe {
+        GetLongPathNameW(
+            wide.pcwstr(),
+            buffer.as_mut_ptr(),
+            u32::try_from(needed).ok()?,
+        )
+    };
+    if written == 0
+        || usize::try_from(written)
+            .ok()
+            .is_none_or(|written| written >= buffer.len())
+    {
+        let (code, _) = last_win32_error_detail();
+        log_long_path_decline("GetLongPathNameW", spelling, code);
+        return None;
+    }
+    let resolved = wide_cstr_to_string(buffer.as_ptr());
+    if resolved.is_empty() {
+        log_long_path_decline("GetLongPathNameW", spelling, 0);
+        return None;
+    }
+    Some(resolved)
 }
 
 /// Whether `candidate` names an ancestor of (or the same directory as) `target`.
@@ -1222,7 +1436,10 @@ fn build_policy_table(
         });
     }
     entries.push(PolicyPath {
-        path: workspace_root.to_path_buf(),
+        // The entry is stored in the domain, not in the spelling the caller happened to use, so
+        // every later comparison against the table — duplicate suppression, verification, the
+        // operator-facing entry list — is made against one spelling of one directory.
+        path: normalise_policy_path(workspace_root),
         grant: Grant::ReadWrite,
         required: true,
     });
@@ -1288,6 +1505,10 @@ fn push_entry(
     extra: Option<&String>,
 ) {
     let text = path_text(path);
+    // From here the entry is handled in this module's one spelling domain, while `text` stays the
+    // spelling the operator (or the environment) actually wrote: a note has to name what was
+    // rejected, and the entry has to name a location the rest of the module can compare against.
+    let path = &normalise_policy_path(path);
 
     // The user-profile root first, ahead of the generic conflict check below. That check *would*
     // also reject this entry (the root contains every denied directory under it), but its wording
@@ -3575,7 +3796,9 @@ mod tests {
         SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_QUERY,
         TOKEN_USER, TokenUser,
     };
-    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WRITE_OWNER, WriteFile};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetShortPathNameW, ReadFile, WRITE_OWNER, WriteFile,
+    };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::OpenProcessToken;
 
@@ -3654,6 +3877,477 @@ mod tests {
         PathBuf::from(format!("\\\\?\\{}", text.trim_start_matches(['/', '\\'])))
     }
 
+    /// The 8.3 short spelling of `path`, as this volume stores it — the spelling a runner's `%TEMP%`
+    /// holds for its own directory. `GetShortPathNameW` answers a too-small buffer with the size the
+    /// answer needs (including the terminating NUL), the same sizing protocol [`GetLongPathNameW`]
+    /// documents; a host that declines, or a volume that stores no short names, yields the input.
+    fn short_path_spelling(path: &Path) -> PathBuf {
+        let wide = WideString::from_path(path);
+        let mut probe = [0u16; 1];
+        // SAFETY: `wide` owns the NUL-terminated input for the duration of the call, and `probe` is
+        // a writable buffer of exactly the length stated.
+        let needed =
+            unsafe { GetShortPathNameW(wide.pcwstr(), probe.as_mut_ptr(), probe.len() as u32) };
+        let Ok(needed) = usize::try_from(needed) else {
+            return path.to_path_buf();
+        };
+        if needed == 0 || needed > VERBATIM_PATH_CEILING {
+            return path.to_path_buf();
+        }
+        let mut buffer: Vec<u16> = vec![0; needed];
+        // SAFETY: `buffer` holds `needed` code units, which is the size handed to the call, and the
+        // answer it writes stays inside it.
+        let written = unsafe {
+            GetShortPathNameW(
+                wide.pcwstr(),
+                buffer.as_mut_ptr(),
+                u32::try_from(needed).unwrap_or(0),
+            )
+        };
+        if written == 0
+            || usize::try_from(written)
+                .ok()
+                .is_none_or(|written| written >= buffer.len())
+        {
+            return path.to_path_buf();
+        }
+        PathBuf::from(wide_cstr_to_string(buffer.as_ptr()))
+    }
+
+    /// The marker half of the policy domain, on its own: every marker spelling Windows accepts is
+    /// removed — in either separator, in either case — a verbatim share is rewritten onto the plain
+    /// share spelling, a device marker goes the same way, and a `?` that is a real segment rather
+    /// than a marker is left exactly where it was.
+    #[test]
+    fn test_the_marker_strip_recognises_every_marker_spelling_and_only_a_marker() {
+        for (spelling, expected) in [
+            (r"\\?\C:\Users\fredrik", r"C:\Users\fredrik"),
+            (r"//?/C:/Users/fredrik", r"C:\Users\fredrik"),
+            (r"//?\C:/Users/fredrik", r"C:\Users\fredrik"),
+            (r"\\?\c:\users\FREDRIK", r"c:\users\FREDRIK"),
+            (r"\\?\UNC\server\share\work", r"\\server\share\work"),
+            (r"//?/UNC/server/share/work", r"\\server\share\work"),
+            (r"\\?\unc\SERVER\Share", r"\\SERVER\Share"),
+            (r"\\.\COM1", "COM1"),
+            (r"//./COM1", "COM1"),
+            (r"C:/Users/fredrik", r"C:\Users\fredrik"),
+            (r"repos\alpha", r"repos\alpha"),
+            (r"C:\Users\?\dir", r"C:\Users\?\dir"),
+        ] {
+            assert_eq!(strip_windows_path_markers(spelling), expected, "{spelling}");
+        }
+
+        // Which of them was removed is a fact the storage step needs (a share rewrites differently
+        // from a volume), and the answer does not depend on how the host typed the marker.
+        assert_eq!(path_marker(r"\\?\UNC\SERVER\share"), PathMarker::Unc);
+        assert_eq!(path_marker(r"//?/unc/SERVER/share"), PathMarker::Unc);
+        assert_eq!(path_marker(r"\\?\C:\a"), PathMarker::Verbatim);
+        assert_eq!(path_marker(r"//?/C:/a"), PathMarker::Verbatim);
+        assert_eq!(path_marker(r"\\.\COM1"), PathMarker::Device);
+        assert_eq!(path_marker(r"C:\a"), PathMarker::None);
+        assert_eq!(path_marker(r"C:\a\?\b"), PathMarker::None);
+    }
+
+    /// The domain a [`PolicyPath`] is stored in is one spelling per location: the `\\?\C:\…` form
+    /// `canonicalize()` produces, the same marker written `//?/C:/…` by a channel that flattens
+    /// separators on the way in, and the plain `C:\…` all normalise onto one path, and a verbatim
+    /// share keeps its server and its share instead of hiding them behind the marker.
+    #[test]
+    fn test_the_policy_domain_collapses_the_marker_spellings() {
+        let plain = Path::new(r"C:\Users\fredrik\source\marmel");
+        let spellings = [
+            plain,
+            Path::new(r"\\?\C:\Users\fredrik\source\marmel"),
+            Path::new(r"//?/C:/Users/fredrik/source/marmel"),
+            Path::new(r"//?\C:\Users\fredrik\source\marmel"),
+            Path::new(r"C:/Users/fredrik/source/marmel"),
+        ];
+        let normalised: Vec<PathBuf> = spellings
+            .iter()
+            .map(|path| normalise_policy_path(path))
+            .collect();
+        let first = normalised
+            .first()
+            .expect("the fixture list is not empty")
+            .clone();
+        for (spelling, path) in spellings.iter().zip(&normalised) {
+            assert!(
+                paths_match(path, plain),
+                "{} normalises to a path that is not the location it names: {}",
+                spelling.display(),
+                path_text(path)
+            );
+            assert_eq!(
+                *path, first,
+                "every marker spelling reaches one stored path"
+            );
+            assert_eq!(
+                normalise_policy_path(path),
+                *path,
+                "the domain is stable under itself"
+            );
+        }
+        let text = path_text(&first);
+        assert!(
+            !text.starts_with(VERBATIM_MARKER) && !text.starts_with("//?/"),
+            "a path below the ceiling is stored without its marker: {text}"
+        );
+
+        for spelling in [
+            r"\\?\UNC\server\share\work",
+            r"//?/UNC/server/share/work",
+            r"\\?\unc\SERVER\share\work",
+        ] {
+            let normalised = normalise_policy_path(Path::new(spelling));
+            assert!(
+                paths_match(&normalised, Path::new(r"\\server\share\work")),
+                "{spelling} is one share: {}",
+                path_text(&normalised)
+            );
+            // The identity of the share survives: the server and the share are still the first two
+            // components of the stored path, not a `?` and a `UNC` segment in front of them.
+            let components = comparable_components(&normalised);
+            assert!(
+                components.starts_with(&["server".to_string(), "share".to_string()]),
+                "{spelling} loses the share identity: {components:?}"
+            );
+            assert!(
+                !path_text(&normalised).starts_with(VERBATIM_MARKER),
+                "{spelling} is below the ceiling and so stored without its marker: {}",
+                path_text(&normalised)
+            );
+        }
+    }
+
+    /// The marker is noise only while the path can be named without it: at or beyond `MAX_PATH` it
+    /// is the spelling the file and security APIs accept and nothing else is, so the domain keeps it
+    /// there — and never invents one for a spelling that did not carry it.
+    #[test]
+    fn test_a_path_at_the_max_path_ceiling_keeps_the_marker_it_needed_to_be_named() {
+        let tail = format!(
+            "\\{}",
+            "a_directory_name_that_is_far_too_long_for_eight\\".repeat(6)
+        );
+        let long = format!("C:{tail}");
+        assert!(
+            long.encode_utf16().count() >= MAX_PATH_CEILING,
+            "the fixture is at or beyond the ceiling: {}",
+            long.encode_utf16().count()
+        );
+
+        let verbatim = PathBuf::from(format!("{VERBATIM_MARKER}{long}"));
+        let kept = normalise_policy_path(&verbatim);
+        assert!(
+            paths_match(&kept, &verbatim),
+            "one location, spelled two ways: {}",
+            path_text(&kept)
+        );
+        assert!(
+            path_text(&kept).starts_with(VERBATIM_MARKER),
+            "a path at the ceiling is stored with the marker that makes it nameable: {}",
+            path_text(&kept)
+        );
+        assert_eq!(
+            normalise_policy_path(&kept),
+            kept,
+            "and normalising it again changes nothing"
+        );
+
+        let verbatim_share = PathBuf::from(format!("{VERBATIM_UNC_MARKER}server\\share{tail}"));
+        let kept = normalise_policy_path(&verbatim_share);
+        assert!(
+            paths_match(&kept, &verbatim_share),
+            "one share, spelled two ways: {}",
+            path_text(&kept)
+        );
+        assert!(
+            path_text(&kept).starts_with(VERBATIM_UNC_PREFIX),
+            "the share form of the ceiling keeps the share marker: {}",
+            path_text(&kept)
+        );
+
+        assert!(
+            !path_text(&normalise_policy_path(Path::new(r"\\?\C:\Users\fredrik")))
+                .starts_with(VERBATIM_MARKER),
+            "below the ceiling, the same marker is noise and goes"
+        );
+        assert!(
+            !path_text(&normalise_policy_path(Path::new(&long))).starts_with(VERBATIM_MARKER),
+            "a plain spelling is not handed a marker it never had: the policy does not reinterpret \
+             how Windows is to parse the path"
+        );
+    }
+
+    /// The half of the domain no synthetic fixture can stand in for: the 8.3 short name a volume
+    /// really stores for a real directory, and the long name `canonicalize()` answers with for that
+    /// same directory. A runner's `%TEMP%` is spelled the first way and a canonicalised root the
+    /// second, which is how one profile directory reached the CI policy table as both
+    /// `C:\Users\RUNNER~1\…` and `C:\Users\runneradmin\…`.
+    #[test]
+    fn test_a_short_name_and_its_long_name_are_one_location_in_the_policy_domain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        // A component with no 8.3 form of its own, so the volume has to *make* one for it.
+        let component = "a directory name far too long for eight dot three";
+        let long = root.path().join(component).join(".ssh").join("repo");
+        std::fs::create_dir_all(&long)?;
+        let short = short_path_spelling(&long);
+        let canonical = std::fs::canonicalize(&long)?;
+
+        for (left, right) in [
+            (short.clone(), long.clone()),
+            (long.clone(), short.clone()),
+            (short.clone(), canonical.clone()),
+            (canonical.clone(), long.clone()),
+        ] {
+            assert!(
+                paths_match(&left, &right),
+                "{} and {} are one directory: {:?} vs {:?}",
+                left.display(),
+                right.display(),
+                comparable_components(&left),
+                comparable_components(&right)
+            );
+        }
+
+        // The containment the deny-list is built from is taken in the same domain, in both
+        // directions and across spellings — this is the check that silently missed the root sitting
+        // inside `.ssh` while the profile was spelled `RUNNER~1`.
+        let profile = root.path();
+        let short_profile = short_path_spelling(profile);
+        assert!(
+            is_ancestor_or_self(profile, &short),
+            "the profile is the ancestor of the repository spelled short: {}",
+            short.display()
+        );
+        assert!(
+            is_ancestor_or_self(&short_profile, &long),
+            "the profile spelled short is still the ancestor of the repository spelled long: {}",
+            short_profile.display()
+        );
+        assert!(
+            !is_ancestor_or_self(&short, profile),
+            "and the relation still discriminates: a descendant is not an ancestor"
+        );
+
+        // An entry made from the short spelling is stored as the location, not as the spelling.
+        let entry = normalise_policy_path(&short);
+        assert!(
+            paths_match(&entry, &long),
+            "the entry a short spelling becomes still names the directory: {}",
+            path_text(&entry)
+        );
+        assert_eq!(
+            normalise_policy_path(&entry),
+            entry,
+            "and normalising that again changes nothing"
+        );
+        if !path_text(&short).contains(component) {
+            // This volume stores 8.3 names and shortened a component of the fixture, so this is the
+            // CI case in full: the short spelling is a different string from the long one, and the
+            // entry made from it names the location in its long form. Where the volume stores no
+            // short names, `GetShortPathNameW` hands the long path straight back, and the comparisons
+            // above are the whole of what that host can be shown.
+            let short_text = path_text(&short);
+            assert!(
+                short_text.contains("~1"),
+                "{short_text} shortened a component without naming an 8.3 short name"
+            );
+            assert!(
+                path_text(&entry).contains(component),
+                "the stored entry restores the long name of the shortened component: {}",
+                path_text(&entry)
+            );
+            assert_ne!(
+                entry, short,
+                "the short spelling is not already the domain spelling"
+            );
+            assert_ne!(
+                short, long,
+                "a short spelling is not the spelling it was made from"
+            );
+        }
+        Ok(())
+    }
+
+    /// The security property a mixed-spelling table broke: a protected directory stays inaccessible
+    /// when the two sides of the comparison arrive in **different** spellings. The host publishes the
+    /// profile in the 8.3 short form its `%TEMP%` holds, while the workspace root inside
+    /// `%USERPROFILE%\.ssh` arrives in the long form `canonicalize()` produces — the CI host, both
+    /// ways round. The deny-list has to fire, and name the directory it sits inside.
+    #[test]
+    fn test_the_deny_list_fires_across_spellings_of_the_protected_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = FakeHost::new()?;
+        let inside = host.profile.join(".ssh").join("repo");
+        std::fs::create_dir_all(&inside)?;
+        let short_profile = short_path_spelling(&host.profile);
+        let canonical_profile = std::fs::canonicalize(&host.profile)?;
+        let canonical_inside = canonical_profile.join(".ssh").join("repo");
+
+        let cases = [
+            (
+                "plain host, plain root",
+                host.profile.clone(),
+                inside.clone(),
+            ),
+            (
+                "short host, canonicalised root",
+                short_profile.clone(),
+                canonical_inside.clone(),
+            ),
+            (
+                "short host, plain root",
+                short_profile.clone(),
+                inside.clone(),
+            ),
+            (
+                "canonicalised host, plain root",
+                canonical_profile.clone(),
+                inside.clone(),
+            ),
+            (
+                "plain host, canonicalised root",
+                host.profile.clone(),
+                canonical_inside,
+            ),
+        ];
+        for (label, profile, root) in cases {
+            let mut host_paths = host.host.clone();
+            host_paths.user_profile = Some(profile.clone());
+            match build_policy_table(&root, &[], &host_paths) {
+                Ok(table) => panic!(
+                    "{label}: {} inside a denied directory names no honest policy, got {:?}",
+                    root.display(),
+                    table
+                        .entries
+                        .iter()
+                        .map(|entry| path_text(&entry.path))
+                        .collect::<Vec<String>>()
+                ),
+                Err(err @ WindowsSandboxError::RuleSetup { .. }) => {
+                    let rendered = err.to_string();
+                    assert!(
+                        rendered.contains("sits inside the sensitive directory"),
+                        "{label}: the refusal has to name the denied directory it sits inside: {rendered}"
+                    );
+                }
+                Err(other) => panic!("{label}: expected a rule setup failure, got {other:?}"),
+            }
+        }
+
+        // The same property one step later in the table, where it is a suppression rather than a
+        // refusal: the profile root offered as an extra in one spelling, while the host publishes it
+        // in another, is still the profile root and never becomes a grant.
+        let suppressions = [
+            (
+                "host short, extra long",
+                short_profile.clone(),
+                canonical_profile.clone(),
+            ),
+            ("host long, extra short", canonical_profile, short_profile),
+        ];
+        for (label, profile, extra) in suppressions {
+            let mut host_paths = host.host.clone();
+            host_paths.user_profile = Some(profile);
+            let table = build_policy_table(&host.workspace, &[path_text(&extra)], &host_paths)?;
+            assert!(
+                table.notes.iter().any(|note| {
+                    note.contains("the user profile directory itself is never granted")
+                }),
+                "{label}: the profile root is rejected whichever side of the comparison is spelled \
+                 short: {:?}",
+                table.notes
+            );
+            assert!(
+                table
+                    .entries
+                    .iter()
+                    .all(|entry| !paths_match(&entry.path, &extra)),
+                "{label}: the profile root never becomes an entry, however it is spelled: {:?}",
+                table
+                    .entries
+                    .iter()
+                    .map(|entry| path_text(&entry.path))
+                    .collect::<Vec<String>>()
+            );
+        }
+        Ok(())
+    }
+
+    /// Every entry a table produces is stored in the one domain — which is the property whose
+    /// absence let a single CI table name one profile directory three ways at once, the required
+    /// entry verbatim and every derived entry in short form.
+    #[test]
+    fn test_every_entry_of_a_table_is_stored_in_one_spelling_domain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = FakeHost::new()?;
+        let extra = host.workspace.join("extra");
+        std::fs::create_dir_all(&extra)?;
+        let extras = vec![
+            verbatim_spelling(&extra).to_string_lossy().into_owned(),
+            path_text(&short_path_spelling(&extra)),
+        ];
+        // The root reaches the table in the verbatim spelling, as it does in production.
+        let root = verbatim_spelling(&host.workspace);
+        let table = build_policy_table(&root, &extras, &host.host)?;
+        assert!(
+            !table.entries.is_empty(),
+            "the fixture host produces a policy: {:?}",
+            table.notes
+        );
+
+        for entry in &table.entries {
+            let text = path_text(&entry.path);
+            assert_eq!(
+                *entry.path,
+                normalise_policy_path(&entry.path),
+                "{text} is not stored in the domain"
+            );
+            if text.encode_utf16().count() < MAX_PATH_CEILING {
+                assert!(
+                    !text.starts_with(r"\\?\") && !text.starts_with("//?/"),
+                    "{text} is below the ceiling and so stored without a marker"
+                );
+            }
+        }
+
+        assert_eq!(
+            table
+                .entries
+                .iter()
+                .filter(|entry| paths_match(&entry.path, &extra))
+                .count(),
+            1,
+            "the verbatim and the short spelling of one extra are the one grant they name: {:?}",
+            table
+                .entries
+                .iter()
+                .map(|entry| path_text(&entry.path))
+                .collect::<Vec<String>>()
+        );
+        assert_eq!(
+            table
+                .entries
+                .iter()
+                .filter(|entry| paths_match(&entry.path, &host.temp_dir))
+                .count(),
+            1,
+            "one entry per directory, in whichever spelling the host published it: {:?}",
+            table
+                .entries
+                .iter()
+                .map(|entry| path_text(&entry.path))
+                .collect::<Vec<String>>()
+        );
+        assert_eq!(
+            table.entries.iter().filter(|entry| entry.required).count(),
+            1,
+            "and the root is still the one required entry"
+        );
+        Ok(())
+    }
+
     /// The profile name is derived from the workspace root, survives sanitisation, and stays
     /// inside the name ceiling Windows enforces for an AppContainer profile.
     #[test]
@@ -3715,7 +4409,16 @@ mod tests {
             "exactly one entry is required, the table holds {}",
             table.entries.len()
         );
-        assert_eq!(required[0].path, host.workspace);
+        assert!(
+            paths_match(&required[0].path, &host.workspace),
+            "the required entry is the workspace root the table was asked for: {}",
+            path_text(&required[0].path)
+        );
+        assert_eq!(
+            required[0].path,
+            normalise_policy_path(&host.workspace),
+            "and it is stored in the table's one spelling domain, not in the spelling it arrived in"
+        );
         assert_eq!(required[0].grant, Grant::ReadWrite);
 
         let read_write: Vec<PathBuf> = table
@@ -3725,10 +4428,17 @@ mod tests {
             .map(|entry| entry.path.clone())
             .collect();
         assert!(
-            read_write.contains(&host.temp_dir),
+            read_write
+                .iter()
+                .any(|path| paths_match(path, &host.temp_dir)),
             "the temporary directory is read-write: {read_write:?}"
         );
-        assert!(read_write.contains(&host.workspace));
+        assert!(
+            read_write
+                .iter()
+                .any(|path| paths_match(path, &host.workspace)),
+            "the workspace root is the read-write entry it was asked to be: {read_write:?}"
+        );
         Ok(())
     }
 
@@ -3752,7 +4462,16 @@ mod tests {
             1,
             "exactly one entry may be confinement critical, got {critical:?}"
         );
-        assert_eq!(critical[0], host.workspace, "and it is the workspace root");
+        assert!(
+            paths_match(&critical[0], &host.workspace),
+            "and it is the workspace root: {}",
+            path_text(&critical[0])
+        );
+        assert_eq!(
+            critical[0],
+            normalise_policy_path(&host.workspace),
+            "stored in the one domain, whatever spelling the root arrived in"
+        );
 
         let optional: Vec<PathBuf> = table
             .optional_read_write_entries()
