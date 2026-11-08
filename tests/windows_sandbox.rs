@@ -30,7 +30,23 @@
 //! 7. the confined child can still print on stdout and stderr — the inherited-handle capability
 //!    grant is what makes the anonymous pipes of a one-shot run usable from inside an AppContainer;
 //! 8. a bare interactive-shell payload stays a bare shell through the re-entry, instead of being
-//!    turned into `<comspec> /C cmd`.
+//!    turned into `<comspec> /C cmd`;
+//! 9. the whole re-entry chain runs **as production runs it**: the built `marmel` bin target, a
+//!    `tempfile` fixture workspace, exit 0, the payload's own text on stdout, and the nested
+//!    in-workspace write the confined shell has to be able to perform — the leg that turns a host
+//!    where **every** command costs [`SANDBOX_REFUSE_EXIT_CODE`] into a failing test;
+//! 10. the failure contract of that same chain: a workspace whose policy cannot be built exits
+//!     [`SANDBOX_REFUSE_EXIT_CODE`], runs nothing, and carries [`SANDBOX_REFUSAL_MARKER`], the step
+//!     it happened at and the class it is diagnosed by;
+//! 11. the runner legs: real `cmd.exe` payloads driven straight through the backend's own entry
+//!     points (`run_in_appcontainer`/`spawn_in_appcontainer`) — exit-code propagation, confined
+//!     stdout and stderr through the inherited standard streams, writes inside the workspace and into
+//!     `%TEMP%`, denials outside them, a read of a key in the sensitive directory, a toolchain lookup
+//!     through the read-only grant, and the `internetClient` capability the launch declares;
+//! 12. the regression guard for the universal-73 shape: on a healthy fixture the attempt has to come
+//!     back **applied** (`sandbox_outcome` accepts it) and the command launched inside it has to run,
+//!     so the one failure mode that costs every command on a desktop is reported by this test, with
+//!     the refusal reason in its message.
 //!
 //! Fixtures: the fixture a denial is proved **in** never sits under a temporary directory, because
 //! the Windows policy grants those read-write on its own and a denial there would prove nothing —
@@ -38,6 +54,12 @@
 //! process is always a **subprocess**: confining the test process itself would confine the harness
 //! for the rest of the run, so confinement is applied inside the re-entry child. Nothing is ever
 //! written into the real user profile: `%USERPROFILE%` is probed by reading it only.
+//!
+//! The runner legs (11) drive the backend library directly, the way the re-entry child of a
+//! production run does. The one leg of that group that has to **read** what the confined child wrote
+//! on its standard streams re-runs this very test binary with `--exact` on its own name and with
+//! `MARMEL_WINDOWS_RUNNER_CHILD` set: the process that launches a confined child is the process
+//! whose streams that child writes on, and a leg can only read a pipe it owns itself.
 //!
 //! One Windows-specific point of contract matters below: an explicit opt-out read by the
 //! **re-entry child** runs the pending command **unconfined** — the shell argv of the spawn side,
@@ -52,7 +74,14 @@
 #![cfg(target_os = "windows")]
 
 use marmennill::harness::pty::{SANDBOX_EXEC_ARG, SANDBOX_OPTOUT_ENV};
-use marmennill::harness::sandbox::{SANDBOX_EXTRA_RO_PATHS_ENV, SANDBOX_REFUSE_EXIT_CODE};
+use marmennill::harness::sandbox::{
+    SANDBOX_EXTRA_RO_PATHS_ENV, SANDBOX_REFUSAL_MARKER, SANDBOX_REFUSE_EXIT_CODE, SandboxAttempt,
+    sandbox_outcome,
+};
+use marmennill::harness::sandbox_windows::{
+    CapabilitySids, attempt_windows_sandbox, prepare_windows_policy, run_in_appcontainer,
+    spawn_in_appcontainer,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -139,12 +168,20 @@ fn stdout_of(out: &Output) -> String {
 /// the legs that use this helper also pin the exit code, the file system state and an unconfined run
 /// in the same fixture, so this text check is corroboration rather than the only evidence.
 fn names_denial(out: &Output) -> bool {
-    let combined = format!("{} {}", stdout_of(out), stderr_of(out)).to_lowercase();
-    combined.contains("access is denied")
-        || combined.contains("denied")
-        || combined.contains("cannot create")
-        || combined.contains("cannot find the path")
-        || combined.contains("file not found")
+    names_denial_in(&format!("{} {}", stdout_of(out), stderr_of(out)))
+}
+
+/// The same vocabulary as [`names_denial`], applied to a body of text rather than to the streams of
+/// a leg: the runner legs read a confined child's own text out of a file the payload was told to
+/// capture it into, because the streams of the process that launches the confined child belong to
+/// that process, and cannot be read back by the leg.
+fn names_denial_in(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("access is denied")
+        || lower.contains("denied")
+        || lower.contains("cannot create")
+        || lower.contains("cannot find the path")
+        || lower.contains("file not found")
 }
 
 /// One path, spelled the way `cmd.exe` needs it inside a payload: quoted, because every fixture and
@@ -809,5 +846,695 @@ fn test_windows_confined_reentry_keeps_a_bare_interactive_shell() {
             && !combined_lower.contains("syntax of the command"),
         "{name}: the payload must have stayed a bare shell, with no shell-lookup error in the \
          output, {combined}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The functional legs: what a real confined spawn has to prove
+// ---------------------------------------------------------------------------
+//
+// Everything above answers "what does the AppContainer policy enforce?". The legs below answer the
+// question a host with a broken sandbox asks instead: does a real confined command run at all, or
+// does every command cost [`SANDBOX_REFUSE_EXIT_CODE`]? They are shaped like a production run — the
+// built `[[bin]]` target of this package (`marmel`, reported to an integration test as
+// `CARGO_BIN_EXE_marmel`) driven the way `run_command` drives it, and the backend's own entry points
+// driven with real `cmd.exe` payloads in `tempfile` fixtures — so a host on which the sandbox never
+// gets past its own attempt fails here, loudly, while every leg above it passes.
+
+/// The marker of the end-to-end legs: a pending command that ran, printed it.
+const E2E_MARK: &str = "SANDBOX-OK";
+/// The marker of the confined command a runner leg launches inside a healthy setup.
+const RUNNER_MARK: &str = "RUNNER-PROBE-OK";
+/// As [`STDOUT_MARK`], on the standard stream a runner-level confined child inherits.
+const RUNNER_STDOUT_MARK: &str = "RUNNER-STDOUT-OK";
+/// As [`STDERR_MARK`], on the standard stream a runner-level confined child inherits.
+const RUNNER_STDERR_MARK: &str = "RUNNER-STDERR-OK";
+/// The knob that tells a test process it is the **worker** of the confined-streams leg: the process
+/// that launches a confined child is the process whose standard streams that child writes on, so the
+/// leg has to drive a process whose output it can read — see
+/// [`test_windows_runner_confined_child_writes_on_the_inherited_streams`].
+const RUNNER_CHILD_ENV: &str = "MARMEL_WINDOWS_RUNNER_CHILD";
+
+/// The text of a file a runner payload was told to write its own streams into. At runner level the
+/// payload's stdout and stderr belong to the **test process**, which no leg can read back, so the
+/// payload redirects them into the (granted) workspace, where the leg can read them instead.
+fn captured(file: &Path) -> String {
+    std::fs::read_to_string(file).unwrap_or_else(|err| {
+        panic!(
+            "the runner leg must be able to read {}: {err}",
+            file.display()
+        )
+    })
+}
+
+/// The payload of a runner leg, with the streams of the confined child captured into `stdout_file`
+/// and `stderr_file` inside the workspace the leg can read.
+fn runner_captured_payload(command: &str, stdout_file: &Path, stderr_file: &Path) -> String {
+    format!(
+        "{command} > {} 2> {}",
+        quoted(stdout_file),
+        quoted(stderr_file)
+    )
+}
+
+/// The lower-cased text of a path, for the comparisons Windows itself does case-insitionally.
+fn path_text_lower(path: &Path) -> String {
+    path.display().to_string().to_lowercase()
+}
+
+/// The end-to-end leg, on the exact shape a production `run_command` uses: the built bin target, a
+/// `tempfile` fixture workspace and one pending command. It proves the whole chain at once — the
+/// re-entry protocol, the Windows attempt, the parked hand-off setup, the confined launch, the exit
+/// code the harness reports, and the write the confined shell performs inside the workspace.
+#[test]
+fn test_windows_reentry_end_to_end_run_in_a_fixture_workspace_succeeds() {
+    let name = "test_windows_reentry_end_to_end_run_in_a_fixture_workspace_succeeds";
+    let workspace = tempfile::tempdir().expect("fixture workspace");
+
+    // Leg 1: a trivial command, confined, in a fixture workspace. The exit code is the point: a host
+    // whose sandbox cannot be established answers 73 here and runs nothing, which is exactly the
+    // desktop failure these legs exist to catch.
+    let run = run_child(workspace.path(), &format!("echo {E2E_MARK}"), None, false);
+    let run_stderr = stderr_of(&run);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{name}: a confined command in a fixture workspace must run and exit 0 — a refusal means the \
+         sandbox itself is broken on this host, not the command — stdout: {} stderr: {run_stderr}",
+        stdout_of(&run)
+    );
+    assert!(
+        stdout_of(&run).contains(E2E_MARK),
+        "{name}: the pending command must have run and printed what it echoed, got: {}",
+        stdout_of(&run)
+    );
+    assert!(
+        !run_stderr.contains(SANDBOX_REFUSAL_MARKER),
+        "{name}: a healthy run must not print a refusal line, got: {run_stderr}"
+    );
+
+    // Leg 2: the in-workspace write a real tool call performs — a nested path inside the workspace,
+    // written by the confined shell through its own redirection. The workspace root is the one
+    // **required** policy entry, so a confined command that cannot write there cannot run a build, a
+    // test run or a `git` invocation at all.
+    let nested = workspace.path().join("nested");
+    std::fs::create_dir_all(&nested).expect("nested directory inside the fixture workspace");
+    let inside = nested.join("inside.txt");
+    let write = run_child(workspace.path(), &write_payload(&inside), None, false);
+    assert_eq!(
+        write.status.code(),
+        Some(0),
+        "{name}: a nested write inside the workspace must succeed, stdout: {} stderr: {}",
+        stdout_of(&write),
+        stderr_of(&write)
+    );
+    let written = std::fs::read_to_string(&inside)
+        .unwrap_or_else(|err| format!("cannot read the nested workspace marker: {err}"));
+    assert!(
+        written.contains(WRITTEN_MARK),
+        "{name}: the confined shell must have created the nested workspace marker, got: {written}"
+    );
+}
+
+/// The failure contract of the same chain: a workspace whose policy cannot be built — here a cwd
+/// that no longer names a directory — has to cost [`SANDBOX_REFUSE_EXIT_CODE`], run nothing, and say
+/// so with the marker, the step and the class a refusal is diagnosed by.
+#[test]
+fn test_windows_reentry_refuses_an_unresolvable_workspace_root_by_name() {
+    let name = "test_windows_reentry_refuses_an_unresolvable_workspace_root_by_name";
+    let gone = tempfile::tempdir().expect("workspace tempdir");
+    let gone_path = gone.path().to_path_buf();
+    drop(gone);
+
+    let refused = run_child(&gone_path, &format!("echo {E2E_MARK}"), None, false);
+    let refused_stderr = stderr_of(&refused);
+    assert_eq!(
+        refused.status.code(),
+        Some(SANDBOX_REFUSE_EXIT_CODE),
+        "{name}: an unresolvable workspace root must exit with the refusal code, stderr: {refused_stderr}"
+    );
+    assert!(
+        !stdout_of(&refused).contains(E2E_MARK),
+        "{name}: a refused run runs nothing, got: {}",
+        stdout_of(&refused)
+    );
+    assert!(
+        refused_stderr.contains(SANDBOX_REFUSAL_MARKER),
+        "{name}: the refusal line must carry the marker the harness looks for, got: {refused_stderr}"
+    );
+    assert!(
+        refused_stderr.contains("refusing to run the command")
+            && refused_stderr.contains("could not be resolved"),
+        "{name}: the refusal must name the workspace root it could not resolve, got: {refused_stderr}"
+    );
+    assert!(
+        refused_stderr.contains("step = sandbox attempt")
+            && refused_stderr.contains("class = rule-setup"),
+        "{name}: the refusal must carry the step and the class it is diagnosed by, got: {refused_stderr}"
+    );
+}
+
+/// The exit code a confined command reports back through the backend's own runner: verbatim, whether
+/// it is the success of a command that ran or the status of one that asked to fail. This is the leg
+/// the helper-level unit tests in `src/harness/sandbox_windows.rs` are not: a real `cmd.exe` process,
+/// launched inside a real AppContainer, over a real policy built for a fixture workspace.
+#[test]
+fn test_windows_runner_reports_the_exit_code_of_a_confined_command() {
+    let name = "test_windows_runner_reports_the_exit_code_of_a_confined_command";
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let setup = prepare_windows_policy(workspace.path(), &[])
+        .unwrap_or_else(|err| panic!("{name}: the policy pass must build a setup: {err}"));
+
+    for (payload, expected) in [("exit 0", 0), ("exit 7", 7)] {
+        let code = spawn_in_appcontainer(&setup, workspace.path(), payload)
+            .unwrap_or_else(|err| panic!("{name}: `{payload}` must launch confined: {err}"));
+        assert_eq!(
+            code, expected,
+            "{name}: `{payload}` must report exit code {expected}, got {code}"
+        );
+    }
+
+    // A command `cmd.exe` cannot resolve is reported as the failure it is, never as a success.
+    let missing =
+        spawn_in_appcontainer(&setup, workspace.path(), "this-command-is-not-on-the-path")
+            .unwrap_or_else(|err| {
+                panic!("{name}: an unknown command must still launch confined: {err}")
+            });
+    assert_ne!(
+        missing, 0,
+        "{name}: an unknown command must not look like a success, got exit code {missing}"
+    );
+}
+
+/// The confined-streams leg, in two halves: a confined child inherits and writes on the standard
+/// streams of the process that launched it, and no leg can read those back out of its own process, so
+/// this test drives **itself** as a worker — re-running this test binary with only itself selected
+/// (`--exact`) — and reads what the confined children wrote into the worker's own pipes.
+#[test]
+fn test_windows_runner_confined_child_writes_on_the_inherited_streams() {
+    let name = "test_windows_runner_confined_child_writes_on_the_inherited_streams";
+
+    // Half 1, the worker: this process launches the confined children, so its standard streams — the
+    // pipes the driving leg below owns and reads — are exactly the streams they write on.
+    if std::env::var_os(RUNNER_CHILD_ENV).is_some() {
+        let workspace = tempfile::tempdir().expect("worker workspace");
+        let setup = prepare_windows_policy(workspace.path(), &[])
+            .unwrap_or_else(|err| panic!("{name}: the worker must build a policy: {err}"));
+        for payload in [
+            format!("echo {RUNNER_STDOUT_MARK}"),
+            format!("echo {RUNNER_STDERR_MARK} 1>&2"),
+        ] {
+            let code = spawn_in_appcontainer(&setup, workspace.path(), &payload)
+                .unwrap_or_else(|err| panic!("{name}: {payload} must launch confined: {err}"));
+            assert_eq!(
+                code, 0,
+                "{name}: {payload} must exit 0 in the worker, got {code}"
+            );
+        }
+        return;
+    }
+
+    // Half 2, the driving leg: run the worker, and assert that the confined writes came back through
+    // the worker's own streams. `--nocapture` is what keeps the worker's own harness from capturing
+    // the very output this leg is reading, and `--exact` that only the worker leg runs there.
+    let worker = std::env::current_exe().expect("the test binary is the worker");
+    let out = Command::new(&worker)
+        .arg("--exact")
+        .arg(name)
+        .arg("--nocapture")
+        .env(RUNNER_CHILD_ENV, "1")
+        .env_remove(SANDBOX_OPTOUT_ENV)
+        .env_remove(SANDBOX_EXTRA_RO_PATHS_ENV)
+        .output()
+        .expect("the worker leg must be runnable");
+    let worker_stdout = stdout_of(&out);
+    let worker_stderr = stderr_of(&out);
+    assert!(
+        out.status.success(),
+        "{name}: the worker leg must finish green, exit: {:?}, stdout: {worker_stdout} stderr: {worker_stderr}",
+        out.status.code()
+    );
+    assert!(
+        worker_stdout.contains("running 1 test"),
+        "{name}: `--exact` must have selected exactly the worker leg, got: {worker_stdout}"
+    );
+    assert!(
+        worker_stdout.contains(RUNNER_STDOUT_MARK),
+        "{name}: the confined child must have written on the stdout it inherited, got: {worker_stdout}"
+    );
+    assert!(
+        worker_stderr.contains(RUNNER_STDERR_MARK),
+        "{name}: the confined child must have written on the stderr it inherited, got: {worker_stderr}"
+    );
+}
+
+/// A nested write inside the workspace, by a confined command launched straight through the runner:
+/// the workspace root is the one **required** entry of the policy, and the grant the policy applies
+/// for it is inherited over the tree, so a subdirectory has to be writable too. Proved with the
+/// workspace living outside every built-in grant, i.e. outside the temporary directories the policy
+/// grants read-write on its own.
+#[test]
+fn test_windows_runner_allows_a_nested_write_inside_the_workspace() {
+    let name = "test_windows_runner_allows_a_nested_write_inside_the_workspace";
+    let Some(workspace) = workspace_outside_temp(name) else {
+        return;
+    };
+    let nested = workspace.path().join("nested");
+    std::fs::create_dir_all(&nested).expect("nested directory inside the workspace fixture");
+    let inside = nested.join("inside-marker");
+
+    let setup = prepare_windows_policy(workspace.path(), &[])
+        .unwrap_or_else(|err| panic!("{name}: the policy pass must build a setup: {err}"));
+    let code = spawn_in_appcontainer(&setup, workspace.path(), &write_payload(&inside))
+        .unwrap_or_else(|err| panic!("{name}: the in-workspace write must launch confined: {err}"));
+
+    assert_eq!(
+        code, 0,
+        "{name}: a write into a subdirectory of the workspace must exit 0 confined, {name} saw the \
+         exit code {code}"
+    );
+    let written = std::fs::read_to_string(&inside)
+        .unwrap_or_else(|err| format!("cannot read the workspace marker: {err}"));
+    assert!(
+        written.contains(WRITTEN_MARK),
+        "{name}: the confined command must have written the marker it was asked to, got: {written}"
+    );
+}
+
+/// The temporary directories are read-write entries of the Windows policy (a toolchain puts its
+/// output there), and the runner has to honour them for a confined command too.
+#[test]
+fn test_windows_runner_allows_a_write_into_the_temporary_directories() {
+    let name = "test_windows_runner_allows_a_write_into_the_temporary_directories";
+    let Some(workspace) = workspace_outside_temp(name) else {
+        return;
+    };
+    // The write target is the one thing here that has to sit under a temporary directory: the leg is
+    // about that grant, so it needs no unlisted-scratch escape.
+    let temp_fixture = granted_temp_roots()
+        .into_iter()
+        .find(|root| root.is_dir())
+        .and_then(|root| tempfile::tempdir_in(root).ok());
+    let Some(temp_fixture) = temp_fixture else {
+        eprintln!("SKIP {name}: this host exposes no temporary directory to write into");
+        return;
+    };
+    let target = temp_fixture.path().join("runner-temp-marker");
+
+    let setup = prepare_windows_policy(workspace.path(), &[])
+        .unwrap_or_else(|err| panic!("{name}: the policy pass must build a setup: {err}"));
+    let code = spawn_in_appcontainer(&setup, workspace.path(), &write_payload(&target))
+        .unwrap_or_else(|err| {
+            panic!("{name}: the temporary-directory write must launch confined: {err}")
+        });
+
+    assert_eq!(
+        code, 0,
+        "{name}: a write into the temporary directories must exit 0 confined, got {code}"
+    );
+    assert!(
+        target.is_file(),
+        "{name}: the confined command must have created the temporary-directory marker"
+    );
+}
+
+/// A write outside every granted root is denied by the runner too, creates nothing, and says so on
+/// the confined child's own output — proved in two fixtures the policy never grants: one in the
+/// unlisted scratch directory, one inside the user profile, the directory the policy refuses to
+/// grant. Each denial is paired with the attribution leg: the very same payload, run unconfined by
+/// `cmd.exe`, writes the very same marker.
+#[test]
+fn test_windows_runner_denies_a_write_outside_the_granted_roots() {
+    let name = "test_windows_runner_denies_a_write_outside_the_granted_roots";
+    let Some(scratch) = unlisted_scratch(name) else {
+        return;
+    };
+    if under_granted_temp(&scratch) {
+        eprintln!(
+            "SKIP {name}: the scratch root {} sits inside a temporary directory the policy grants \
+             read-write on its own, so a denial there would prove nothing",
+            scratch.display()
+        );
+        return;
+    }
+    let workspace = match tempfile::tempdir_in(&scratch) {
+        Ok(workspace) => workspace,
+        Err(err) => {
+            eprintln!("SKIP {name}: the workspace fixture could not be created: {err}");
+            return;
+        }
+    };
+    let ungranted = tempfile::tempdir_in(&scratch).expect("ungranted fixture in the scratch root");
+    let stderr_file = workspace.path().join("runner-denied-stderr");
+
+    // The payloads: the confined one writes its denial text into the workspace, where this leg can
+    // read it; the unconfined one keeps the same output shape without an AppContainer in the picture.
+    let denied_marker = ungranted.path().join("runner-denied-marker");
+    let payload = format!(
+        "echo {WRITTEN_MARK} > {} 2> {}",
+        quoted(&denied_marker),
+        quoted(&stderr_file)
+    );
+
+    let setup = prepare_windows_policy(workspace.path(), &[])
+        .unwrap_or_else(|err| panic!("{name}: the policy pass must build a setup: {err}"));
+    let code = spawn_in_appcontainer(&setup, workspace.path(), &payload)
+        .unwrap_or_else(|err| panic!("{name}: the denied write must launch confined: {err}"));
+    assert_ne!(
+        code,
+        0,
+        "{name}: a write outside the granted roots must be denied, denial text: {}",
+        captured(&stderr_file)
+    );
+    assert!(
+        !denied_marker.exists(),
+        "{name}: the denied write must not have created a file"
+    );
+    let denial_text = captured(&stderr_file);
+    assert!(
+        names_denial_in(&denial_text),
+        "{name}: the denied leg must name the refusal on its own output, got: {denial_text}"
+    );
+
+    // Attribution: the same payload, unconfined, writes the very same marker.
+    let unconfined = run_unconfined(workspace.path(), &payload);
+    assert!(
+        unconfined.status.success() && denied_marker.is_file(),
+        "{name}: an unconfined run must be able to write where a confined one cannot, stdout: {} \
+         stderr: {}",
+        stdout_of(&unconfined),
+        stderr_of(&unconfined)
+    );
+
+    // The same leg inside the user profile — the one directory the policy refuses to grant — with the
+    // fixture created and removed by the leg itself, so nothing lands in the user's own files.
+    let Some(profile) = user_profile(name) else {
+        return;
+    };
+    let profile_fixture = match tempfile::tempdir_in(&profile) {
+        Ok(fixture) => fixture,
+        Err(err) => {
+            eprintln!(
+                "SKIP {name}: cannot create a probe fixture under {:?}: {err}",
+                profile
+            );
+            return;
+        }
+    };
+    let profile_marker = profile_fixture.path().join("runner-profile-marker");
+    if under_granted_temp(&profile_marker) || profile_marker.starts_with(workspace.path()) {
+        eprintln!(
+            "SKIP {name}: the profile fixture {} sits inside a directory the policy grants on its \
+             own, so a denial there would prove nothing",
+            profile_marker.display()
+        );
+        return;
+    }
+    let profile_payload = format!(
+        "echo {WRITTEN_MARK} > {} 2> {}",
+        quoted(&profile_marker),
+        quoted(&stderr_file)
+    );
+    let profile_code = spawn_in_appcontainer(&setup, workspace.path(), &profile_payload)
+        .unwrap_or_else(|err| panic!("{name}: the profile write must launch confined: {err}"));
+    assert_ne!(
+        profile_code,
+        0,
+        "{name}: a write inside the user profile must be denied, denial text: {}",
+        captured(&stderr_file)
+    );
+    assert!(
+        !profile_marker.exists(),
+        "{name}: the denied profile write must not have created a file"
+    );
+    let profile_denial = captured(&stderr_file);
+    assert!(
+        names_denial_in(&profile_denial),
+        "{name}: the denied profile leg must name the refusal, got: {profile_denial}"
+    );
+}
+
+/// A key in the sensitive `.ssh` directory is unreachable from the runner too: the confined read
+/// exits non-zero, produces nothing, and names the refusal, while the same payload read by an
+/// unconfined `cmd.exe` reads it fine. The leg never creates anything in the user's own profile:
+/// where the host has no key file to read, the same directory is probed by listing it.
+#[test]
+fn test_windows_runner_denies_a_key_in_the_sensitive_ssh_directory() {
+    let name = "test_windows_runner_denies_a_key_in_the_sensitive_ssh_directory";
+    let Some(scratch) = unlisted_scratch(name) else {
+        return;
+    };
+    let workspace = match tempfile::tempdir_in(&scratch) {
+        Ok(workspace) => workspace,
+        Err(err) => {
+            eprintln!("SKIP {name}: the workspace fixture could not be created: {err}");
+            return;
+        }
+    };
+    let Some(profile) = user_profile(name) else {
+        return;
+    };
+    let ssh = profile.join(".ssh");
+    if !ssh.is_dir() {
+        eprintln!(
+            "SKIP {name}: {} does not exist on this host, and this leg must not create it: writing \
+             into the real user profile is off limits, and a fixture under a temporary directory \
+             would be read-write granted on its own",
+            ssh.display()
+        );
+        return;
+    }
+    let key = ssh.join("id_ed25519");
+    // The subject depends on what the host has: a real key read **through** the sensitive directory —
+    // the read that matters for a confined `ssh`/`git` — or, when this host holds no key to read, the
+    // listing of the directory itself, which the policy denies for the same reason.
+    let subject = if key.is_file() {
+        read_payload(&[key.as_path()])
+    } else {
+        list_payload(&ssh)
+    };
+    let stdout_file = workspace.path().join("runner-ssh-stdout");
+    let stderr_file = workspace.path().join("runner-ssh-stderr");
+    let payload = runner_captured_payload(&subject, &stdout_file, &stderr_file);
+
+    let setup = prepare_windows_policy(workspace.path(), &[])
+        .unwrap_or_else(|err| panic!("{name}: the policy pass must build a setup: {err}"));
+    let code = spawn_in_appcontainer(&setup, workspace.path(), &payload).unwrap_or_else(|err| {
+        panic!("{name}: the sensitive-directory read must launch confined: {err}")
+    });
+    let denial_text = captured(&stderr_file);
+    assert_ne!(
+        code, 0,
+        "{name}: a read of the sensitive directory must be denied, denial text: {denial_text}"
+    );
+    assert!(
+        names_denial_in(&denial_text),
+        "{name}: the denied read must name the refusal on its own output, got: {denial_text}"
+    );
+    let body = captured(&stdout_file);
+    assert!(
+        body.trim().is_empty(),
+        "{name}: the denied read must not have produced anything, got: {body}"
+    );
+
+    // Attribution: the very same payload, run unconfined, reaches the same subject.
+    let unconfined = run_unconfined(workspace.path(), &payload);
+    assert!(
+        unconfined.status.success(),
+        "{name}: an unconfined run must be able to read where a confined one cannot, stdout: {} \
+         stderr: {}",
+        stdout_of(&unconfined),
+        stderr_of(&unconfined)
+    );
+    if key.is_file() {
+        let read_at_last = captured(&stdout_file);
+        assert!(
+            !read_at_last.trim().is_empty(),
+            "{name}: the unconfined leg must have read the key a confined leg cannot, got: {read_at_last}"
+        );
+    }
+}
+
+/// The read-only entries of the policy reach a real toolchain: a confined command reads the `PATH`
+/// the lookup is decided by, and `where cmd.exe` walks every entry and reads the file it finds. This
+/// is the leg a confined `cargo`, `cl` or `git` depends on, and it is the one that fails when a
+/// toolchain directory stops being granted.
+#[test]
+fn test_windows_runner_reads_a_system_binary_through_the_read_only_grant() {
+    let name = "test_windows_runner_reads_a_system_binary_through_the_read_only_grant";
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let setup = prepare_windows_policy(workspace.path(), &[])
+        .unwrap_or_else(|err| panic!("{name}: the policy pass must build a setup: {err}"));
+
+    // 1. The environment of the confined shell: what a toolchain lookup is decided by.
+    let path_file = workspace.path().join("runner-path.txt");
+    let path_stderr = workspace.path().join("runner-path-stderr.txt");
+    let env_code = spawn_in_appcontainer(
+        &setup,
+        workspace.path(),
+        &runner_captured_payload("set PATH", &path_file, &path_stderr),
+    )
+    .unwrap_or_else(|err| panic!("{name}: the PATH read must launch confined: {err}"));
+    assert_eq!(
+        env_code,
+        0,
+        "{name}: a confined command must be able to read its own PATH, stderr: {}",
+        captured(&path_stderr)
+    );
+    assert!(
+        captured(&path_file).to_lowercase().contains("path"),
+        "{name}: the confined shell must have printed its PATH"
+    );
+
+    // 2. The lookup itself: `where` probes every PATH entry, reading the file it is after.
+    let where_file = workspace.path().join("runner-where.txt");
+    let where_stderr = workspace.path().join("runner-where-stderr.txt");
+    let lookup_code = spawn_in_appcontainer(
+        &setup,
+        workspace.path(),
+        &runner_captured_payload("where cmd.exe", &where_file, &where_stderr),
+    )
+    .unwrap_or_else(|err| panic!("{name}: the toolchain lookup must launch confined: {err}"));
+    assert_eq!(
+        lookup_code,
+        0,
+        "{name}: a confined lookup of a system binary must succeed, stderr: {}",
+        captured(&where_stderr)
+    );
+    let found = captured(&where_file);
+    let found_lower = found.to_lowercase();
+    assert!(
+        found_lower.contains("cmd.exe"),
+        "{name}: the confined lookup must have resolved a system binary, got: {found}"
+    );
+    if let Some(system_root) = std::env::var_os("SystemRoot").filter(|value| !value.is_empty()) {
+        let system_root = PathBuf::from(system_root);
+        assert!(
+            found_lower.contains(&path_text_lower(&system_root)),
+            "{name}: the resolved system binary must live under the system root {system_root:?} \
+             this host reports, got: {found}"
+        );
+    }
+}
+
+/// The capability the launch declares, as the policy builds it: an AppContainer with no capabilities
+/// is a filesystem-only identity, and `internetClient` (`S-1-15-3-1`) is what lets a confined
+/// `cargo` or `curl` talk to the network. Asserted on the setup the policy pass built, and on the
+/// block the launch layer attaches — no outbound connection required, and none attempted.
+#[test]
+fn test_windows_policy_declares_the_internet_client_capability() {
+    let name = "test_windows_policy_declares_the_internet_client_capability";
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let setup = prepare_windows_policy(workspace.path(), &[])
+        .unwrap_or_else(|err| panic!("{name}: the policy pass must build a setup: {err}"));
+
+    let built = setup.profile.capabilities();
+    assert_eq!(
+        built.count(),
+        1,
+        "{name}: the capability list the policy built holds exactly one entry"
+    );
+    let strings = built
+        .strings()
+        .unwrap_or_else(|err| panic!("{name}: the capability SIDs must render as strings: {err}"));
+    assert_eq!(
+        strings,
+        vec!["S-1-15-3-1".to_string()],
+        "{name}: the capability the policy builds must be the documented `internetClient` SID"
+    );
+    // The list the policy built is the list the backend declares, not one the profile silently
+    // dropped: the declared capability, built on its own, has to read the same way.
+    let declared = CapabilitySids::internet_client()
+        .unwrap_or_else(|err| panic!("{name}: the declared capability must build: {err}"));
+    assert_eq!(
+        declared.strings().unwrap_or_else(|err| {
+            panic!("{name}: the declared capability must render as a string: {err}")
+        }),
+        strings,
+        "{name}: the capability list of the profile must be the capability list the backend declares"
+    );
+
+    // The block the launch layer attaches to `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`.
+    let block = setup.profile.security_capabilities();
+    assert_eq!(
+        block.CapabilityCount, 1,
+        "{name}: the launch block must declare the one capability the profile was created with, got \
+         {} capabilities",
+        block.CapabilityCount
+    );
+    assert!(
+        !block.Capabilities.is_null(),
+        "{name}: the capability array the launch block points at must be the one the profile owns"
+    );
+    assert_eq!(
+        block.AppContainerSid,
+        setup.sid(),
+        "{name}: the launch block must declare the AppContainer SID of this run's profile"
+    );
+}
+
+/// The regression guard for the shape of the desktop failure: on a **healthy** fixture workspace the
+/// attempt has to come back applied, and the command launched inside it has to run. This is the leg
+/// that turns "every command costs [`SANDBOX_REFUSE_EXIT_CODE`]" into a failing test on a plain
+/// desktop, because it asks for the verdict the dispatch asks for on every `run_command`, and then
+/// runs a pending command through the composite entry point that verdict is decided on.
+#[test]
+fn test_windows_a_healthy_fixture_yields_an_applied_attempt_and_a_running_command() {
+    let name = "test_windows_a_healthy_fixture_yields_an_applied_attempt_and_a_running_command";
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+
+    // 1. The verdict the dispatch asks the backend for. A verdict that is not *applied* is what costs
+    //    a host every command it runs, because the re-entry contract refuses on it.
+    let attempt = attempt_windows_sandbox(workspace.path(), &[]);
+    if let SandboxAttempt::PartiallyEnforced { reason } = &attempt {
+        eprintln!("NOTE {name}: the confinement this host produced is partial: {reason}");
+    }
+    assert!(
+        matches!(
+            attempt,
+            SandboxAttempt::FullyEnforced | SandboxAttempt::PartiallyEnforced { .. }
+        ),
+        "{name}: a healthy fixture workspace must produce an applied sandbox attempt, got: {attempt:?}"
+    );
+    sandbox_outcome(&attempt).unwrap_or_else(|err| {
+        panic!("{name}: the attempt must be accepted by the re-entry contract: {err}")
+    });
+
+    // 2. The command that verdict was made about: [`run_in_appcontainer`] picks the parked setup up —
+    //    the confinement the attempt just judged — and launches the pending command inside it,
+    //    releasing the guards only once the child is gone.
+    let inside = workspace.path().join("runner-probe-marker");
+    let code = run_in_appcontainer(
+        workspace.path(),
+        &[],
+        workspace.path(),
+        &write_payload(&inside),
+    )
+    .unwrap_or_else(|err| {
+        panic!("{name}: the pending command must be launchable inside the attempt: {err}")
+    });
+    assert_eq!(
+        code, 0,
+        "{name}: the confined command must exit 0, got {code}"
+    );
+    let written = std::fs::read_to_string(&inside)
+        .unwrap_or_else(|err| format!("cannot read the runner probe marker: {err}"));
+    assert!(
+        written.contains(WRITTEN_MARK),
+        "{name}: the confined command must have written the probe marker it was asked to, got: {written}"
+    );
+
+    // 3. And the same on the command's own output, so a confined child that ran but could not write
+    //    anywhere is not mistaken for a green run.
+    let echo = run_in_appcontainer(
+        workspace.path(),
+        &[],
+        workspace.path(),
+        &format!("echo {RUNNER_MARK}"),
+    )
+    .unwrap_or_else(|err| panic!("{name}: a second confined command must be launchable: {err}"));
+    assert_eq!(
+        echo, 0,
+        "{name}: the second confined command must exit 0, got {echo}"
     );
 }
