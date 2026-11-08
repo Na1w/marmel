@@ -2084,6 +2084,73 @@ fn test_one_shot_result_non_zero_exit_appends_the_status_line() {
     );
 }
 
+/// A sandbox refusal (exit `SANDBOX_REFUSE_EXIT_CODE`) must never reach the operator as a bare
+/// exit code: the reason the re-entry child printed stays in the composed output, and the notice
+/// repeats the escape hatch so there is something to act on.
+#[test]
+fn test_one_shot_result_sandbox_refusal_reports_the_reason() {
+    use crate::harness::sandbox::{SANDBOX_REFUSAL_MARKER, SANDBOX_REFUSE_EXIT_CODE};
+
+    let refusal = "error: sandbox refusal: refusing to run the command: the DACL of \
+                   C:\\work\\proj could not be changed: SetNamedSecurityInfoW failed: Access \
+                   is denied. (win32 code = 5) (step = sandbox attempt, class = rule-setup, \
+                   exit code = 73, path = C:\\work\\proj).";
+    let rendered = render_one_shot_result(
+        &format!("echo hi && crunched\r\n{refusal}\r\n"),
+        OneShotEnd::Exited(Some(SANDBOX_REFUSE_EXIT_CODE)),
+    );
+
+    // Every field the operator needs is in the text the tool result hands over.
+    assert!(rendered.contains("echo hi"), "{rendered}");
+    assert!(
+        rendered.contains(r"the DACL of C:\work\proj"),
+        "the reason must survive sanitisation: {rendered}"
+    );
+    assert!(rendered.contains("win32 code = 5"), "{rendered}");
+    assert!(rendered.contains("step = sandbox attempt"), "{rendered}");
+    assert!(rendered.contains("class = rule-setup"), "{rendered}");
+    assert!(rendered.contains(SANDBOX_REFUSAL_MARKER), "{rendered}");
+    // ... and the notice: the code, a pointer to the reason, and the way out.
+    assert!(
+        rendered.contains("[exit code: 73 sandbox refusal: the reason is above"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(SANDBOX_OPTOUT_ENV),
+        "the refusal notice must name the escape hatch: {rendered}"
+    );
+    assert!(
+        rendered.ends_with("run the command unsandboxed)]"),
+        "{rendered}"
+    );
+}
+
+/// The other half of the guarantee: when the child's reason never made it into the captured
+/// output (a pipe that did not drain, output trimmed by whoever displayed it), the notice says
+/// so out loud and points at the two places it can still be found — the log file and the
+/// opt-out variable.
+#[test]
+fn test_one_shot_result_sandbox_refusal_without_a_captured_reason() {
+    use crate::harness::sandbox::SANDBOX_REFUSE_EXIT_CODE;
+
+    let rendered = render_one_shot_result(
+        "echo hi\n",
+        OneShotEnd::Exited(Some(SANDBOX_REFUSE_EXIT_CODE)),
+    );
+
+    assert!(rendered.starts_with("echo hi\n"), "{rendered}");
+    assert!(
+        rendered.contains("no reason reached this output"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(".marmel/marmel.log"),
+        "the notice must name the log the reason is written to: {rendered}"
+    );
+    assert!(rendered.contains(SANDBOX_OPTOUT_ENV), "{rendered}");
+    assert!(rendered.contains("[exit code: 73"), "{rendered}");
+}
+
 /// Timeout: the partial output captured so far survives, followed by the existing timeout
 /// notice text.
 #[test]

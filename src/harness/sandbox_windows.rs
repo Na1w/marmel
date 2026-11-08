@@ -150,6 +150,66 @@ impl WindowsSandboxError {
             _ => false,
         }
     }
+
+    /// The machine-readable class of this failure, named after the stage it happened in.
+    ///
+    /// This is the backend's own vocabulary (`SandboxError` has the backend-neutral one); the
+    /// log record carries it as `kind`, because "the DACL write was refused" and "the probe did
+    /// not confirm" both reach the operator as the same `rule-setup`/`enforcement` class and are
+    /// not the same diagnosis.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            WindowsSandboxError::RuleSetup { .. } => "rule-setup",
+            WindowsSandboxError::AclRead { .. } => "acl-read",
+            WindowsSandboxError::AclMutate { .. } => "acl-mutate",
+            WindowsSandboxError::AclVerification { .. } => "acl-verification",
+            WindowsSandboxError::Profile { .. } => "profile",
+            WindowsSandboxError::Sid { .. } => "sid",
+            WindowsSandboxError::AttributeList { .. } => "attribute-list",
+            WindowsSandboxError::Probe { .. } => "probe",
+            WindowsSandboxError::Launch { .. } => "launch",
+        }
+    }
+
+    /// The Win32 error this failure carries, `0` when no Win32 error is involved.
+    ///
+    /// `AclMutate` and `Launch` keep one because they *are* the outcome of a Win32 call; the
+    /// other failures are decided before or without one, and reporting `0` as if it were a code
+    /// would be a lie.
+    #[must_use]
+    pub fn win32_code(&self) -> WIN32_ERROR {
+        match self {
+            WindowsSandboxError::AclMutate { code, .. }
+            | WindowsSandboxError::Launch { code, .. } => *code,
+            WindowsSandboxError::Profile { .. }
+            | WindowsSandboxError::Sid { .. }
+            | WindowsSandboxError::RuleSetup { .. }
+            | WindowsSandboxError::AclRead { .. }
+            | WindowsSandboxError::AclVerification { .. }
+            | WindowsSandboxError::AttributeList { .. }
+            | WindowsSandboxError::Probe { .. } => 0,
+        }
+    }
+
+    /// The object this failure is about, empty when the failure names none.
+    ///
+    /// A refused `SetNamedSecurityInfoW` is only actionable together with the path it names, so
+    /// the path is a log field in its own right (`path`), not only part of the prose.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            WindowsSandboxError::RuleSetup { path, .. }
+            | WindowsSandboxError::AclRead { path, .. }
+            | WindowsSandboxError::AclMutate { path, .. }
+            | WindowsSandboxError::AclVerification { path, .. } => path,
+            WindowsSandboxError::Profile { .. }
+            | WindowsSandboxError::Sid { .. }
+            | WindowsSandboxError::AttributeList { .. }
+            | WindowsSandboxError::Probe { .. }
+            | WindowsSandboxError::Launch { .. } => "",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2527,6 +2587,39 @@ fn probe_confined_launch(
     Ok(())
 }
 
+/// The reason text of a failure that carries a Win32 error, with the code spelled the way the
+/// operator and the log grep it: `win32 code = 5`.
+///
+/// The code survives into the verdict text (rather than only into a log record) because the
+/// reason string is the one channel a refusal has to the operator: the re-entry child prints
+/// it to stderr, and the harness folds that stderr into the `run_command` result. `0` means no
+/// Win32 error is involved, and is deliberately not spelled as a code.
+#[must_use]
+fn append_win32_code(reason: String, code: WIN32_ERROR) -> String {
+    if code == 0 {
+        reason
+    } else {
+        format!("{reason} (win32 code = {code})")
+    }
+}
+
+/// One log record per backend failure, with the fields a diagnosis needs: where in the chain it
+/// happened (`step`), what stage failed (`kind`), which object it is about (`path`) and the
+/// Win32 error the failing call reported (`code`).
+///
+/// Every refusal class has to appear in the log with its causal chain, because the operator can
+/// only be told to look there; the prose of the failure is kept in the message so the two views
+/// cannot disagree.
+fn log_windows_sandbox_failure(step: &str, err: &WindowsSandboxError) {
+    tracing::error!(
+        step = step,
+        kind = err.kind(),
+        path = err.path(),
+        code = err.win32_code(),
+        "sandbox refusal: {err}"
+    );
+}
+
 /// Map one backend failure onto the `SandboxAttempt` variant that describes it.
 #[must_use]
 fn attempt_from_windows_error(err: WindowsSandboxError) -> SandboxAttempt {
@@ -2536,10 +2629,13 @@ fn attempt_from_windows_error(err: WindowsSandboxError) -> SandboxAttempt {
         },
         WindowsSandboxError::Sid { reason } => SandboxAttempt::Unavailable { reason },
         WindowsSandboxError::RuleSetup { path, reason }
-        | WindowsSandboxError::AclRead { path, reason }
-        | WindowsSandboxError::AclMutate { path, reason, .. } => {
+        | WindowsSandboxError::AclRead { path, reason } => {
             SandboxAttempt::RuleFailed { path, reason }
         }
+        WindowsSandboxError::AclMutate { path, reason, code } => SandboxAttempt::RuleFailed {
+            path,
+            reason: append_win32_code(reason, code),
+        },
         WindowsSandboxError::AclVerification { path, reason } => {
             SandboxAttempt::EnforcementFailed {
                 reason: format!("{path}: {reason}"),
@@ -2547,11 +2643,12 @@ fn attempt_from_windows_error(err: WindowsSandboxError) -> SandboxAttempt {
         }
         // Launch-side failures say the same thing about the attempt: the policy was built, but
         // confining something with it did not work, which is an enforcement failure.
-        WindowsSandboxError::AttributeList { reason }
-        | WindowsSandboxError::Probe { reason }
-        | WindowsSandboxError::Launch { reason, .. } => {
+        WindowsSandboxError::AttributeList { reason } | WindowsSandboxError::Probe { reason } => {
             SandboxAttempt::EnforcementFailed { reason }
         }
+        WindowsSandboxError::Launch { reason, code } => SandboxAttempt::EnforcementFailed {
+            reason: append_win32_code(reason, code),
+        },
     }
 }
 
@@ -2570,10 +2667,17 @@ impl From<WindowsSandboxError> for SandboxError {
             WindowsSandboxError::RuleSetup { path, reason } => {
                 SandboxError::RuleSetup { path, reason }
             }
-            WindowsSandboxError::AclRead { path, reason }
-            | WindowsSandboxError::AclMutate { path, reason, .. } => {
+            // The Win32 code stays attached here too, exactly as in `attempt_from_windows_error`:
+            // the two mappings are one verdict rendered twice, and the operator who has to fix
+            // this is the one reading the code. `AclMutate` is a separate arm because it is the
+            // only one of the two that carries a code at all.
+            WindowsSandboxError::AclRead { path, reason } => {
                 SandboxError::RuleSetup { path, reason }
             }
+            WindowsSandboxError::AclMutate { path, reason, code } => SandboxError::RuleSetup {
+                path,
+                reason: append_win32_code(reason, code),
+            },
             // A verification failure is not a rule that could not be built: the rule is there, and
             // the object says the grant is not. The confinement in force is therefore not the one
             // the policy promised — which is what `Enforcement` spells, and what
@@ -2583,8 +2687,10 @@ impl From<WindowsSandboxError> for SandboxError {
                 reason: format!("{path}: {reason}"),
             },
             WindowsSandboxError::AttributeList { reason }
-            | WindowsSandboxError::Probe { reason }
-            | WindowsSandboxError::Launch { reason, .. } => SandboxError::Enforcement { reason },
+            | WindowsSandboxError::Probe { reason } => SandboxError::Enforcement { reason },
+            WindowsSandboxError::Launch { reason, code } => SandboxError::Enforcement {
+                reason: append_win32_code(reason, code),
+            },
         }
     }
 }
@@ -2796,7 +2902,13 @@ pub fn attempt_windows_sandbox_with_setup(
 ) -> (SandboxAttempt, Option<WindowsPolicySetup>) {
     let setup = match prepare_windows_policy(workspace_root, extra_readonly_paths) {
         Ok(setup) => setup,
-        Err(err) => return (attempt_from_windows_error(err), None),
+        Err(err) => {
+            // One record per failure stage, with the class, the object and the Win32 code the
+            // failing call reported: this is the only place the whole causal chain is written
+            // down, because the operator-facing reason line is one line of prose.
+            log_windows_sandbox_failure("sandbox attempt", &err);
+            return (attempt_from_windows_error(err), None);
+        }
     };
     // The probe is what turns "the profile exists and the ACEs are set" into "confinement is
     // enforceable": one confined process, launched under exactly the SECURITY_CAPABILITIES block
@@ -2804,6 +2916,7 @@ pub fn attempt_windows_sandbox_with_setup(
     // FullyEnforced while CreateProcessW would fail, or while the confined child cannot even reach
     // the workspace it was confined to.
     if let Err(err) = probe_confined_launch(&setup, workspace_root) {
+        log_windows_sandbox_failure("sandbox probe", &err);
         return (attempt_from_windows_error(err), None);
     }
     put_prepared_setup(setup);
@@ -2887,11 +3000,27 @@ pub fn run_in_appcontainer(
                 attempt_windows_sandbox_with_setup(workspace_root, extra_readonly_paths);
             match setup {
                 Some(setup) => setup,
-                None => return Err(attempt_error(attempt)),
+                None => {
+                    let err = attempt_error(attempt);
+                    // Nothing parked: the launch is refused without an attempt failure to point
+                    // at, and that has to be said out loud rather than only exits with it.
+                    tracing::warn!(
+                        step = "confined launch",
+                        kind = err.kind(),
+                        "sandbox refusal: no confined setup is available for this run: {err}"
+                    );
+                    return Err(err);
+                }
             }
         }
     };
-    let outcome = spawn_in_appcontainer(&setup, cwd, command).map_err(SandboxError::from);
+    let outcome = spawn_in_appcontainer(&setup, cwd, command).map_err(|err| {
+        // The second refusal site of a run: the attempt said the confinement was real, and
+        // launching the pending command inside it still failed. Same fields, so the two refusals
+        // are distinguishable in the log by their `step`.
+        log_windows_sandbox_failure("confined launch", &err);
+        SandboxError::from(err)
+    });
     // Release only now: the child has exited, so the ACEs and the profile are no longer in use, and
     // dropping the guards here is what puts the workspace DACLs back.
     drop(setup);
@@ -3900,6 +4029,81 @@ mod tests {
             SandboxError::from(broken_verification).kind(),
             "enforcement"
         );
+    }
+
+    /// The Win32 code a failing call reported has to survive **both** renderings of the same
+    /// verdict, because the refusal text is the operator's only channel to it: the log exists
+    /// only for whoever knows where to look, and `run_command` output is what the operator reads.
+    #[test]
+    fn test_the_win32_code_survives_both_renderings_of_a_failure() {
+        let refused = WindowsSandboxError::AclMutate {
+            path: r"C:\work\proj".to_string(),
+            reason: "SetNamedSecurityInfoW failed: Access is denied.".to_string(),
+            code: 5,
+        };
+        let from_attempt = match attempt_from_windows_error(refused.clone()) {
+            SandboxAttempt::RuleFailed { reason, .. } => reason,
+            other => panic!("expected RuleFailed, got {other:?}"),
+        };
+        let from_error = SandboxError::from(refused.clone()).to_string();
+        for rendered in [from_attempt, from_error] {
+            assert!(
+                rendered.contains("win32 code = 5"),
+                "the Win32 code must reach the operator text, got: {rendered}"
+            );
+        }
+
+        // A launch failure carries its code the same way, and a failure that is not the outcome
+        // of a Win32 call must not invent one.
+        let launch = WindowsSandboxError::Launch {
+            reason: "CreateProcessW of the confined probe failed".to_string(),
+            code: 2,
+        };
+        let rendered = match attempt_from_windows_error(launch.clone()) {
+            SandboxAttempt::EnforcementFailed { reason } => reason,
+            other => panic!("expected EnforcementFailed, got {other:?}"),
+        };
+        assert!(rendered.contains("win32 code = 2"), "{rendered}");
+        let probe = WindowsSandboxError::Probe {
+            reason: "the confined probe died with status 0xc0000005".to_string(),
+        };
+        let rendered = match attempt_from_windows_error(probe) {
+            SandboxAttempt::EnforcementFailed { reason } => reason,
+            other => panic!("expected EnforcementFailed, got {other:?}"),
+        };
+        assert_eq!(
+            rendered, "the confined probe died with status 0xc0000005",
+            "a probe failure involves no Win32 code: {rendered}"
+        );
+    }
+
+    /// The structured fields of the log record come from the failure itself: the class names the
+    /// stage, the path names the object, and the code is `0` exactly where no Win32 call failed.
+    #[test]
+    fn test_failure_fields_match_the_variant_that_carries_them() {
+        let refused = WindowsSandboxError::AclMutate {
+            path: r"C:\work\proj".to_string(),
+            reason: "no WRITE_DAC on that object".to_string(),
+            code: 5,
+        };
+        assert_eq!(refused.kind(), "acl-mutate");
+        assert_eq!(refused.win32_code(), 5);
+        assert_eq!(refused.path(), r"C:\work\proj");
+
+        let probe = WindowsSandboxError::Probe {
+            reason: "the confined probe exited with 1".to_string(),
+        };
+        assert_eq!(probe.kind(), "probe");
+        assert_eq!(probe.win32_code(), 0, "no Win32 error is involved");
+        assert_eq!(probe.path(), "", "the probe names no object");
+
+        let profile = WindowsSandboxError::Profile {
+            name: "marmel-sandbox-profile".to_string(),
+            reason: "CreateAppContainerProfile failed: Access is denied.".to_string(),
+        };
+        assert_eq!(profile.kind(), "profile");
+        assert_eq!(profile.win32_code(), 0, "the HRESULT is not a Win32 code");
+        assert_eq!(profile.path(), "", "a profile name is not an object path");
     }
 
     /// The hand-off is single-shot and per-thread: a thread that never prepared a policy has

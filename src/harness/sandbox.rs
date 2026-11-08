@@ -107,6 +107,19 @@ impl SandboxError {
             | SandboxError::Enforcement { reason } => reason,
         }
     }
+
+    /// The object this failure is about, when the failure names one.
+    ///
+    /// Only [`SandboxError::RuleSetup`] carries a path, and the object-level backends fill it for
+    /// every rule failure — which makes it the thing an operator acts on: an ACL failure reported
+    /// against `C:\work\proj` is fixed at that directory, not somewhere else. It is also the
+    /// `path` field of the log record.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            SandboxError::RuleSetup { path, .. } => Some(path),
+            SandboxError::Unavailable { .. } | SandboxError::Enforcement { .. } => None,
+        }
+    }
 }
 
 /// What one enforcement attempt actually achieved, step by step.
@@ -708,15 +721,88 @@ fn refuse(reason: String) -> ReentryAction {
     }
 }
 
+/// The marker every sandbox refusal line carries on its own output.
+///
+/// The re-entry child reports a refusal over stderr and nothing else, and the parent harness
+/// folds that stderr into the `run_command` result (see
+/// [`crate::harness::pty::render_one_shot_result`]). This token is what lets the harness tell a
+/// refusal line apart from the output of the command it was asked to run, so a refusal can be
+/// reported to the operator with its reason instead of as a bare exit code.
+pub const SANDBOX_REFUSAL_MARKER: &str = "sandbox refusal";
+
+/// Where in the re-entry chain a refusal happened, spelled once for the operator and for the
+/// `step` field of the log record.
+///
+/// The two differ in a way the operator has to see: an **attempt** failure means the sandbox
+/// could not be built at all, a **confined launch** failure means the attempt said OK and the
+/// launch of the real command still failed. Telling them apart is half of the diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalStep {
+    /// The enforcement attempt failed: policy, profile, verification or probe.
+    Attempt,
+    /// The confined launch of the pending command failed after the attempt said OK.
+    ConfinedLaunch,
+}
+
+impl RefusalStep {
+    /// The step name carried by the refusal line and by the `step` log field.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Attempt => "sandbox attempt",
+            Self::ConfinedLaunch => "confined launch",
+        }
+    }
+}
+
+/// The structured half of a refusal: the fields a machine needs, as one parenthetical.
+///
+/// It travels **inside** the reason string rather than only in the log record, because the
+/// reason string is the only part of a refusal that survives the re-entry decision
+/// ([`reentry_action`]) and reaches the operator. A refusal that lost its class and its step
+/// cannot be looked up in a log and is not actionable.
+#[must_use]
+fn structured_fields(step: RefusalStep, err: &SandboxError) -> String {
+    let path = err
+        .path()
+        .map(|path| format!(", path = {path}"))
+        .unwrap_or_default();
+    format!(
+        "step = {}, class = {}, exit code = {SANDBOX_REFUSE_EXIT_CODE}{path}",
+        step.name(),
+        err.kind(),
+    )
+}
+
+/// The refusal reason, with its structured fields appended: the backend's own text, then the
+/// step, the machine-readable class, the refusal exit code and (when the failure names one) the
+/// path it is about.
+///
+/// `step` is the caller's claim about where the failure happened; the backend cannot know it.
+#[must_use]
+pub fn refusal_detail(err: &SandboxError, step: RefusalStep) -> String {
+    format!("{err} ({})", structured_fields(step, err))
+}
+
 /// The stderr line printed when a refusal happens — kept here so the message is
 /// identical everywhere and assertable in tests.
 #[must_use]
 pub fn refusal_message(reason: &str) -> String {
     format!(
-        "error: refusing to run the command: {reason}. \
+        "error: {SANDBOX_REFUSAL_MARKER}: refusing to run the command: {reason}. \
          The sandbox is enabled by default on every platform that has a backend; \
          set {SANDBOX_OPTOUT_ENV}=1 to run it unsandboxed."
     )
+}
+
+/// The operator-facing refusal line for a refusal whose error object is still in hand.
+///
+/// The same composition as the re-entry path uses: [`refusal_detail`] then
+/// [`refusal_message`]. Every field — step, class, exit code, path, the backend's own reason and
+/// the opt-out escape hatch — is in this one line.
+#[must_use]
+pub fn refusal_line(step: RefusalStep, err: &SandboxError) -> String {
+    refusal_message(&refusal_detail(err, step))
 }
 
 /// The warning printed when an explicit opt-out is honoured. Running unsandboxed must
@@ -1127,6 +1213,48 @@ mod tests {
             message.contains(SANDBOX_OPTOUT_ENV) && message.contains("refusing"),
             "the refusal must name the only way out: {message}"
         );
+    }
+
+    /// The refusal line an operator reads has to carry everything needed to act on it: the
+    /// marker the harness looks for in captured output, the step that failed, the
+    /// machine-readable class, the refusal exit code, the path behind the failure, the code the
+    /// backend reported and the escape hatch. A line missing one of those is not diagnosable.
+    #[test]
+    fn test_refusal_line_carries_every_field_needed_to_diagnose_it() {
+        let err = SandboxError::RuleSetup {
+            path: r"C:\work\proj".to_string(),
+            reason: "SetNamedSecurityInfoW failed: Access is denied. (os error 5) (win32 code = 5)"
+                .to_string(),
+        };
+        let line = refusal_line(RefusalStep::Attempt, &err);
+
+        assert!(line.contains(SANDBOX_REFUSAL_MARKER), "{line}");
+        assert!(line.contains("step = sandbox attempt"), "{line}");
+        assert!(line.contains("class = rule-setup"), "{line}");
+        assert!(line.contains("path = C:\\work\\proj"), "{line}");
+        assert!(
+            line.contains(&format!("exit code = {SANDBOX_REFUSE_EXIT_CODE}")),
+            "{line}"
+        );
+        assert!(line.contains("win32 code = 5"), "the backend code: {line}");
+        assert!(line.contains("SetNamedSecurityInfoW"), "{line}");
+        assert!(line.contains(SANDBOX_OPTOUT_ENV), "{line}");
+        assert_eq!(RefusalStep::ConfinedLaunch.name(), "confined launch");
+    }
+
+    /// A failure that names no object gets no `path` field — the fields are only as complete as
+    /// the backend's verdict, and an invented path would be worse than none.
+    #[test]
+    fn test_refusal_detail_omits_the_path_when_no_object_is_named() {
+        let detail = refusal_detail(
+            &SandboxError::Unavailable {
+                reason: "no AppContainer identity could be made".to_string(),
+            },
+            RefusalStep::ConfinedLaunch,
+        );
+        assert!(!detail.contains("path ="), "{detail}");
+        assert!(detail.contains("step = confined launch"), "{detail}");
+        assert!(detail.contains("class = unavailable"), "{detail}");
     }
 
     /// The same contract on the macOS leg, where the failure arrives as a

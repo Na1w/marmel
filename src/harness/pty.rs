@@ -1238,8 +1238,12 @@ pub(crate) fn render_one_shot_result(captured: &str, end: OneShotEnd) -> String 
     let body = sanitize_terminal_output(captured)
         .trim_end_matches('\n')
         .to_string();
+    let refusal_code = crate::harness::sandbox::SANDBOX_REFUSE_EXIT_CODE;
     let notice = match end {
         OneShotEnd::Exited(Some(0)) => return body,
+        // A sandbox refusal gets its own notice, and the arm ordering is deliberate: the refusal
+        // code must be matched before the plain exit-code arm.
+        OneShotEnd::Exited(Some(code)) if code == refusal_code => sandbox_refusal_notice(&body),
         OneShotEnd::Exited(Some(code)) => format!("[exit code: {code}]"),
         OneShotEnd::Exited(None) => "[exit status unavailable]".to_string(),
         OneShotEnd::TimedOut(timeout) => format!(
@@ -1252,6 +1256,31 @@ pub(crate) fn render_one_shot_result(captured: &str, end: OneShotEnd) -> String 
         notice
     } else {
         format!("{body}\n{notice}")
+    }
+}
+
+/// The notice for a run whose sandboxing child refused to run the command (exit
+/// [`SANDBOX_REFUSE_EXIT_CODE`](crate::harness::sandbox::SANDBOX_REFUSE_EXIT_CODE)).
+///
+/// The reason for a refusal is the useful part, and it arrives on the **child's** stderr, folded
+/// into `captured` by the pipe readers. This notice is what guarantees it is never the exit code
+/// alone: when the captured text carries the refusal marker the notice points at the reason above
+/// it; when it does not (a pipe that never drained, output trimmed by whoever displayed it) the
+/// notice says so, names the log file where the same reason is recorded, and names the escape
+/// hatch. Both spellings are short by design: they ride along at the end of a tool result.
+#[cfg(any(windows, test))]
+fn sandbox_refusal_notice(body: &str) -> String {
+    let refusal_code = crate::harness::sandbox::SANDBOX_REFUSE_EXIT_CODE;
+    let marker = crate::harness::sandbox::SANDBOX_REFUSAL_MARKER;
+    let way_out = format!("set {SANDBOX_OPTOUT_ENV}=1 to run the command unsandboxed");
+    if body.contains(marker) {
+        format!("[exit code: {refusal_code} sandbox refusal: the reason is above ({way_out})]")
+    } else {
+        format!(
+            "[exit code: {refusal_code} sandbox refusal: the sandboxing child refused to run the \
+             command and no reason reached this output; the reason is logged in \
+             `.marmel/marmel.log` ({way_out})]"
+        )
     }
 }
 
@@ -1630,6 +1659,20 @@ fn run_command_windows_oneshot(command: &str, timeout: Duration) -> Result<Strin
             String::from_utf8_lossy(&poisoned.into_inner()).into_owned()
         }
     };
+    // A refusal by the sandboxing child is a parent-visible event this process would otherwise
+    // only report inside the tool result: the child logs its own verdict, but only the parent
+    // knows what was asked to run and where. One record, so the log answers "which command got 73".
+    if let OneShotEnd::Exited(Some(code)) = end
+        && code == crate::harness::sandbox::SANDBOX_REFUSE_EXIT_CODE
+    {
+        tracing::warn!(
+            exit_code = code,
+            cwd = %cwd.display(),
+            command = %crate::text_util::truncate_chars(command, ONESHOT_LOG_COMMAND_CHARS),
+            "run_command: the sandbox refused to run this command \
+             (the reason is in the tool result, and in the sandbox child's log record)"
+        );
+    }
     Ok(render_one_shot_result(&text, end))
 }
 

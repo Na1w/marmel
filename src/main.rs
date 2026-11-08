@@ -310,6 +310,12 @@ where
 fn main() -> Result<()> {
     let mut raw_args = std::env::args().skip(1);
     if is_sandbox_reentry(raw_args.next().as_deref()) {
+        // The re-entry child answers `exit 73` long before the run's own subscriber is installed
+        // (and this branch never reaches that install), so without a subscriber of its own the
+        // refusal reason it reports lands in no log file — only in the stderr the parent
+        // captures. Install the child's file subscriber first, so every refusal it makes is on
+        // disk with its causal chain.
+        install_reentry_log_subscriber();
         return run_sandbox_reentry(&mut raw_args);
     }
 
@@ -598,9 +604,18 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
             &extra_readonly_paths,
         ) {
             Ok(()) => harness::sandbox::Enforcement::Established,
-            Err(err) => harness::sandbox::Enforcement::Failed {
-                reason: err.to_string(),
-            },
+            Err(err) => {
+                // The structured fields travel with the reason, because only the reason string
+                // survives the re-entry decision ([`harness::sandbox::reentry_action`]) and the
+                // stderr line that carries it: a refusal that lost its step, class and path is
+                // not actionable for the person who hits it, and not findable in a log afterwards.
+                harness::sandbox::Enforcement::Failed {
+                    reason: harness::sandbox::refusal_detail(
+                        &err,
+                        harness::sandbox::RefusalStep::Attempt,
+                    ),
+                }
+            }
         },
     };
 
@@ -621,7 +636,14 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
             {
                 harness::sandbox_windows::discard_windows_policy_setup();
             }
-            tracing::error!("refusing sandbox re-entry: {reason}");
+            // The record spells the step and the workspace root the refusal was decided for; the
+            // class, the path and the backend's Win32 code are carried inside the reason text,
+            // which is the part the operator also sees on stderr.
+            tracing::error!(
+                step = harness::sandbox::RefusalStep::Attempt.name(),
+                workspace_root = %cwd.display(),
+                "sandbox refusal: re-entry refused to run the command: {reason}"
+            );
             eprintln!("{}", harness::sandbox::refusal_message(&reason));
             std::process::exit(exit_code)
         }
@@ -837,10 +859,18 @@ fn exec_pending_command(
                 // reason is the backend's own — and exit with the refusal code rather than
                 // running the command in the clear or reporting success.
                 tracing::error!(
+                    step = harness::sandbox::RefusalStep::ConfinedLaunch.name(),
                     kind = harness::sandbox::SandboxError::kind(&err),
-                    "sandbox re-entry: the confined launch failed: {err}"
+                    workspace_root = %cwd.display(),
+                    "sandbox refusal: the confined launch failed: {err}"
                 );
-                eprintln!("error: failed to run the command under the active sandbox: {err}");
+                eprintln!(
+                    "{}",
+                    harness::sandbox::refusal_line(
+                        harness::sandbox::RefusalStep::ConfinedLaunch,
+                        &err,
+                    )
+                );
                 std::process::exit(harness::sandbox::SANDBOX_REFUSE_EXIT_CODE);
             }
         }
@@ -941,6 +971,44 @@ fn session_flag_error(args: &CliArgs, cfg: &config::Config) -> Option<&'static s
 
 fn rotate_log(path: &std::path::Path, max_bytes: u64, backups: u32) {
     harness::workspace::rotate_log_file(path, max_bytes, backups);
+}
+
+/// The log subscriber of the **re-entry child** of every sandboxed command.
+///
+/// That child exists to do the sandbox handshake and hand the pending command over: `main`
+/// returns into [`run_sandbox_reentry`] before [`setup_panic_hook`] installs anything, and this
+/// branch never reaches that install. Every `tracing` call on the re-entry path — the backend's
+/// failure records, the refusal itself, the note about a partially enforced policy — was
+/// therefore a no-op, and the only copy of the refusal reason existed in the child's stderr.
+///
+/// This subscriber writes to the same log file the rest of the run uses
+/// ([`harness::workspace::Workspace::log_path`]), with the same filter the run uses (`RUST_LOG`,
+/// defaulting to `info`). The file is opened in append mode and deliberately **not** rotated
+/// here: the parent process owns the rotation it does at boot, and append-sharing is how the
+/// child's records reach the same file without either process holding it exclusive.
+///
+/// A log file that cannot be opened leaves the child with no subscriber rather than with an
+/// error: the refusal is still printed to stderr, and a diagnostic channel that is unavailable
+/// must never become a reason to refuse the run.
+fn install_reentry_log_subscriber() {
+    let log_path = harness::workspace::Workspace::new()
+        .map(|ws| ws.log_path())
+        .unwrap_or_else(|_| std::path::PathBuf::from(".marmel/marmel.log"));
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(file)
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tui_markdown=error")),
+        )
+        .try_init();
 }
 
 /// Report the shared HTTP client's construction verdict exactly once, at startup.
