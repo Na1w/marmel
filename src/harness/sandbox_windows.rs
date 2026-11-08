@@ -3568,6 +3568,7 @@ pub fn run_in_appcontainer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Security::Authorization::DENY_ACCESS;
     use windows_sys::Win32::Security::{
         CopySid, GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor,
@@ -4278,8 +4279,10 @@ mod tests {
         let secured = match duplicate_for_security(handle) {
             Ok(duplicated) => duplicated,
             Err(code) => panic!(
-                "the DACL of the test object must be readable through a handle holding \
-                 READ_CONTROL (win32 error {code}): {}",
+                "DuplicateHandle(READ_CONTROL | WRITE_DAC) on the test handle {handle:p} was \
+                 refused (win32 error {code}): the object's DACL has to concede READ_CONTROL for \
+                 this DACL read and WRITE_DAC for the grant under test; the refusal said: {} — \
+                 duplication can only narrow what that DACL already concedes, never add to it",
                 last_win32_error()
             ),
         };
@@ -4308,7 +4311,9 @@ mod tests {
                 CloseHandle(secured);
             }
             panic!(
-                "reading the DACL of the test object failed (win32 error {code}): {}",
+                "GetSecurityInfo(DACL_SECURITY_INFORMATION) through the READ_CONTROL duplicate \
+                 {secured:p} of the test handle {handle:p} could not read the DACL (win32 error \
+                 {code}): {}",
                 last_win32_error()
             );
         }
@@ -4382,12 +4387,32 @@ mod tests {
     /// does not enable.
     const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 
-    /// What a fixture object concedes to the process that created it: `READ_CONTROL` for
-    /// `GetSecurityInfo`, `WRITE_DAC` for `SetSecurityInfo`, and the data, attribute and ownership
-    /// rights the access request `CreatePipe` makes for each end maps onto. The two security rights are
-    /// the point — without them the object's DACL is out of reach whatever the handle does — and the
-    /// rest is there so that the create itself passes the same access check.
-    const FIXTURE_CALLER_ACCESS: u32 = READ_CONTROL
+    /// What a fixture object concedes to the process that created it, and why every one of these
+    /// bits is there, which is one Windows rule: a caller-supplied `SECURITY_ATTRIBUTES` is not a
+    /// suggestion. `CreatePipe` creates the pipe **with** the descriptor this test wrote, and the
+    /// object manager then runs the create-time access check **against that DACL**, for the access
+    /// the creating process asks of the two ends it is handed. A DACL that is present but does not
+    /// concede one of those rights answers `ERROR_ACCESS_DENIED` (5) and no object comes into being
+    /// at all: present-but-insufficient is a refusal, and only a **NULL** DACL means "grant
+    /// everything". The mask therefore has to concede the creator's own request — in the spelling
+    /// that request is made in — next to the rights the calls under test ask for afterwards.
+    ///
+    /// * `GENERIC_READ | GENERIC_WRITE` — the data rights of a stream in the generic spelling the
+    ///   stream APIs ask of the read end and the write end with. Drop them and the **create** is
+    ///   what fails, one call before the code under test is reached.
+    /// * `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES |
+    ///   SYNCHRONIZE` — the same data rights spelled specifically, which is how a later access
+    ///   check against the object names them: the byte the companion test pushes through the pipe,
+    ///   and the read and write of the child that inherits the handle.
+    /// * `READ_CONTROL | WRITE_DAC` — the two rights the grant path is built on. `GetSecurityInfo`
+    ///   asks `READ_CONTROL` and `SetSecurityInfo` asks `WRITE_DAC` of the handle they work
+    ///   through, and [`duplicate_for_security`] can only carry rights this DACL concedes, because
+    ///   `DuplicateHandle` with an explicit `dwDesiredAccess` re-runs this same access check and
+    ///   can narrow access, never invent it.
+    /// * `WRITE_OWNER` — the ownership right of the process that rewrote the descriptor.
+    const FIXTURE_CALLER_ACCESS: u32 = GENERIC_READ
+        | GENERIC_WRITE
+        | READ_CONTROL
         | WRITE_DAC
         | WRITE_OWNER
         | SYNCHRONIZE
@@ -4396,9 +4421,13 @@ mod tests {
         | FILE_READ_ATTRIBUTES
         | FILE_WRITE_ATTRIBUTES;
 
-    /// The contrast object's mask: everything a stream handle really carries, and none of what the
-    /// security calls need — the shape of the std handles this process is *given*.
-    const FIXTURE_DATA_ONLY_ACCESS: u32 = SYNCHRONIZE
+    /// The contrast object's mask: everything a stream handle really carries — the data rights in
+    /// both spellings, so that what the companion test measures is the refused security read and
+    /// not the create that had to succeed before it — and none of what the security calls need.
+    /// That is the shape of the std handles this process is *given*.
+    const FIXTURE_DATA_ONLY_ACCESS: u32 = GENERIC_READ
+        | GENERIC_WRITE
+        | SYNCHRONIZE
         | FILE_READ_DATA
         | FILE_WRITE_DATA
         | FILE_READ_ATTRIBUTES
@@ -4436,6 +4465,45 @@ mod tests {
         // back, and `LocalFree(NULL)` is defined to do nothing.
         unsafe { LocalFree(sd) };
         code
+    }
+
+    /// Create the fixture's anonymous pipe with `attrs`, and answer a refusal with the precondition
+    /// it broke rather than with a bare Win32 code.
+    ///
+    /// `conceded` is the mask the fixture's own DACL grants this process, and it belongs in the
+    /// message because a create refused by the descriptor the test wrote can only mean one thing:
+    /// that mask withholds a right the **creator** asked for. The create runs the same access check
+    /// as everything else here, against the supplied descriptor, for the data rights of a stream
+    /// (`GENERIC_READ` for the read end, `GENERIC_WRITE` for the write end) — so
+    /// `ERROR_ACCESS_DENIED` on this call names a fixture whose mask forgot its own creator, not a
+    /// Windows the grant path cannot work on.
+    ///
+    /// `Err` carries the code so that the companion test can accept the denial it provokes on
+    /// purpose.
+    fn create_fixture_pipe(
+        attrs: &SECURITY_ATTRIBUTES,
+        conceded: u32,
+    ) -> Result<(HANDLE, HANDLE), (WIN32_ERROR, String)> {
+        let mut read: HANDLE = std::ptr::null_mut();
+        let mut write: HANDLE = std::ptr::null_mut();
+        // SAFETY: two out-parameters, plus a security-attributes block naming a live descriptor the
+        // caller owns and keeps alive across the call.
+        let made = unsafe { CreatePipe(&mut read, &mut write, attrs, 0) };
+        if made == 0 {
+            let code = unsafe { GetLastError() };
+            return Err((
+                code,
+                format!(
+                    "CreatePipe refused the object it was creating (win32 error {code}): {detail}; \
+                     the create-time access check runs against the descriptor the fixture wrote, \
+                     whose DACL concedes 0x{conceded:08X} to this process — the data rights of the \
+                     two ends it hands back (GENERIC_READ on the read end, GENERIC_WRITE on the \
+                     write end) are part of that request",
+                    detail = last_win32_error(),
+                ),
+            ));
+        }
+        Ok((read, write))
     }
 
     /// One SID owned by this test: `CopySid` wrote it into a `u32`-aligned buffer, which is the
@@ -4561,6 +4629,15 @@ mod tests {
         /// Grant `allow` to this process, and — when `deny` is not `0` — refuse it `deny` as well, with
         /// nobody else on the list. `SetEntriesInAclW` orders a deny ACE ahead of the allow ACEs, so the
         /// refused rights stay refused.
+        ///
+        /// The ACE has the shape a non-container object needs, which is also the shape the production
+        /// grant uses: `GRANT_ACCESS` — access is conceded, never implicit; a trustee in SID form
+        /// (`TRUSTEE_IS_SID` with `TRUSTEE_IS_UNKNOWN`) naming the **token's user**, because that is
+        /// the principal both the create-time check and the handle-based checks run for (an
+        /// AppContainer SID here would name a principal this process is not); and `NO_INHERITANCE`,
+        /// which on an object that supports no inheritance leaves a plain `ACCESS_ALLOWED_ACE` with no
+        /// `INHERIT_ONLY_ACE` bit — so the ACE counts for the object it is written on, which is the
+        /// only object this fixture has.
         fn for_caller(
             allow: u32,
             deny: u32,
@@ -4676,9 +4753,11 @@ mod tests {
     }
 
     /// A real handle, a real DACL, a real grant — on an object this test created with a descriptor it
-    /// wrote itself: `CreatePipe` with a [`TestDescriptor`] that concedes `READ_CONTROL`, `WRITE_DAC`,
-    /// `SYNCHRONIZE` and the data rights to this process. The grant puts the AppContainer ACE on that
-    /// object, and dropping the guard puts the original DACL back.
+    /// wrote itself: `CreatePipe` with a [`TestDescriptor`] whose DACL concedes this process the data
+    /// rights of the two ends (in both spellings, see [`FIXTURE_CALLER_ACCESS`], because the create is
+    /// checked against that very descriptor) and the two security rights the grant works through. The
+    /// grant puts the AppContainer ACE on that object, and dropping the guard puts the original DACL
+    /// back.
     ///
     /// Why the fixture has to own the descriptor: `grant_std_handle` works through
     /// [`duplicate_for_security`], and `DuplicateHandle` with an explicit desired-access mask re-runs
@@ -4706,21 +4785,23 @@ mod tests {
         let caller = caller_sid()?;
         let mut descriptor = TestDescriptor::for_caller(FIXTURE_CALLER_ACCESS, 0, &caller)?;
         let attrs = descriptor.attributes();
-        let mut read: HANDLE = std::ptr::null_mut();
-        let mut write: HANDLE = std::ptr::null_mut();
-        // SAFETY: two out-parameters plus a security-attributes block naming a live descriptor this
-        // test owns.
-        let made = unsafe { CreatePipe(&mut read, &mut write, &attrs, 0) };
-        if made == 0 {
-            return Err(WindowsSandboxError::Launch {
-                reason: format!("CreatePipe failed: {}", last_win32_error()),
-                code: unsafe { GetLastError() },
-            });
-        }
+        let (read, write) =
+            create_fixture_pipe(&attrs, FIXTURE_CALLER_ACCESS).map_err(|(code, detail)| {
+                WindowsSandboxError::Launch {
+                    reason: format!(
+                        "the fixture could not create the object its own descriptor is meant to \
+                         make possible: {detail}"
+                    ),
+                    code,
+                }
+            })?;
         let app_sid = allocate_app_package_sid(&[2, 2])?;
         assert!(
             !handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
-            "the DACL this test wrote names this process, not the AppContainer identity"
+            "before the grant runs, the DACL of the write end {write:p} must not yet name the \
+             AppContainer SID (mask 0x{:08X}) — it is the one this test wrote, which names only \
+             this process",
+            STD_HANDLE_ACCESS
         );
         let grant = grant_std_handle(write, app_sid)?;
         let Some(grant) = grant else {
@@ -4732,22 +4813,33 @@ mod tests {
             }
             return Err(WindowsSandboxError::AclMutate {
                 path: "the test pipe".to_string(),
-                reason: "expected the grant to apply an ACE, and it reported none".to_string(),
+                reason: format!(
+                    "the write end {write:p} of the fixture pipe concedes this process \
+                     READ_CONTROL | WRITE_DAC, so the grant had to add the AppContainer ACE (mask \
+                     0x{:08X}) to its DACL and reported none instead",
+                    STD_HANDLE_ACCESS
+                ),
                 code: 0,
             });
         };
         assert!(
             handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
-            "the ACE this run applied must be visible on the object"
+            "the DACL read through the READ_CONTROL duplicate of the write end {write:p} must show \
+             the ACE this run applied (AppContainer SID, mask 0x{:08X})",
+            STD_HANDLE_ACCESS
         );
         drop(grant);
         assert!(
             !handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
-            "the guard restores the DACL it read: the AppContainer ACE must be gone"
+            "the guard restores the DACL it read: the AppContainer ACE (mask 0x{:08X}) must be \
+             gone from the write end {write:p}",
+            STD_HANDLE_ACCESS
         );
         assert!(
             handle_names_sid(write, caller.sid(), FIXTURE_CALLER_ACCESS),
-            "the restored DACL is the one this test wrote: the grant's own ACE must survive the restore"
+            "the restored DACL is the one this test wrote: the ACE granting this process the \
+             fixture mask 0x{:08X} must survive the restore on the write end {write:p}",
+            FIXTURE_CALLER_ACCESS
         );
         // SAFETY: the SID was allocated by `AllocateAndInitializeSid`, and the two pipe ends were
         // created by this test.
@@ -4789,29 +4881,27 @@ mod tests {
     fn test_a_foreign_handle_refuses_the_security_read_and_duplication_cannot_repair_it()
     -> Result<(), WindowsSandboxError> {
         let caller = caller_sid()?;
-        // One right of difference from the fixture of the grant test: the data rights stay, the two
-        // security rights are explicitly refused.
+        // One right of difference from the fixture of the grant test: the data rights stay — in both
+        // spellings, so that the create is not what fails here — and the two security rights are
+        // explicitly refused.
         let mut descriptor =
             TestDescriptor::for_caller(FIXTURE_DATA_ONLY_ACCESS, FIXTURE_SECURITY_ACCESS, &caller)?;
         let attrs = descriptor.attributes();
-        let mut read: HANDLE = std::ptr::null_mut();
-        let mut write: HANDLE = std::ptr::null_mut();
-        // SAFETY: two out-parameters plus a security-attributes block naming a live descriptor.
-        let made = unsafe { CreatePipe(&mut read, &mut write, &attrs, 0) };
-        if made == 0 {
-            let code = unsafe { GetLastError() };
-            // The access check behind the create is the same access check as the one behind the
-            // security calls, so a descriptor that refuses the security rights can also refuse the
-            // create outright. That is the fact this test pins, one call earlier than expected.
-            assert_eq!(
-                code,
-                ERROR_ACCESS_DENIED,
-                "CreatePipe must either yield an object with a refused security read or refuse the \
-                 access request itself, got: {}",
-                last_win32_error()
-            );
-            return Ok(());
-        }
+        let (read, write) = match create_fixture_pipe(&attrs, FIXTURE_DATA_ONLY_ACCESS) {
+            Ok((read, write)) => (read, write),
+            Err((code, detail)) => {
+                // The access check behind the create is the same access check as the one behind the
+                // security calls, so a descriptor that refuses the security rights can also refuse
+                // the create outright. That is the fact this test pins, one call earlier than
+                // expected, and the denial is still accepted for exactly that reason.
+                assert_eq!(
+                    code, ERROR_ACCESS_DENIED,
+                    "the fixture pipe must either be created, so that its refused security read can \
+                     be measured, or refuse the access request itself, got: {detail}"
+                );
+                return Ok(());
+            }
+        };
         // The object is perfectly usable for data: what is out of reach is its descriptor, not the
         // stream. One byte proves the pipe works, so the refusals below cannot be blamed on an object
         // that never came into being.
@@ -4821,7 +4911,8 @@ mod tests {
             unsafe { WriteFile(write, b"x".as_ptr(), 1, &mut written, std::ptr::null_mut()) };
         assert!(
             wrote != 0 && written == 1,
-            "the data rights the fixture descriptor grants must still work: {}",
+            "WriteFile on the write end {write:p} must still work: the fixture DACL concedes it the \
+             data rights of a stream, {}",
             last_win32_error()
         );
         let mut buffer = [0u8; 1];
@@ -4831,7 +4922,7 @@ mod tests {
             unsafe { ReadFile(read, buffer.as_mut_ptr(), 1, &mut got, std::ptr::null_mut()) };
         assert!(
             read_ok != 0 && got == 1 && buffer == *b"x",
-            "the byte written through the data rights must come back: {}",
+            "ReadFile on the read end {read:p} must return the byte the data rights wrote: {}",
             last_win32_error()
         );
         // (i) the security read through the handle the create returned is refused: that handle carries
@@ -4839,15 +4930,17 @@ mod tests {
         assert_eq!(
             security_read_code(write),
             ERROR_ACCESS_DENIED,
-            "GetSecurityInfo through a data-rights handle must be refused"
+            "GetSecurityInfo(DACL_SECURITY_INFORMATION) through the data-rights handle {write:p} \
+             must be refused: the fixture DACL denies this process READ_CONTROL"
         );
         // (ii) and duplicating the handle asking for exactly the rights the security calls need does
         // not repair it: the copy is granted what the object's descriptor concedes, and nothing more.
         match duplicate_for_security(write) {
             Err(code) => assert_eq!(
                 code, ERROR_ACCESS_DENIED,
-                "DuplicateHandle(READ_CONTROL | WRITE_DAC) is judged against the object's DACL, which \
-                 refuses both rights to this process"
+                "DuplicateHandle(READ_CONTROL | WRITE_DAC) on the data-rights handle {write:p} is \
+                 judged against the object's DACL, which denies both of those rights to this \
+                 process"
             ),
             Ok(duplicated) => {
                 // Even where the copy itself is granted, the read through it still answers the same
@@ -4855,7 +4948,8 @@ mod tests {
                 assert_eq!(
                     security_read_code(duplicated),
                     ERROR_ACCESS_DENIED,
-                    "a duplicate of a foreign handle reads no more of its DACL than the handle did"
+                    "the READ_CONTROL | WRITE_DAC duplicate {duplicated:p} of the data-rights handle \
+                     {write:p} reads no more of the object's DACL than the handle did"
                 );
                 // SAFETY: this test created the duplicate, so this test closes it.
                 unsafe { CloseHandle(duplicated) };
