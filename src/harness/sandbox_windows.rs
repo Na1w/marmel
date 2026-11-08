@@ -4416,10 +4416,11 @@ mod tests {
     /// one-shot path hands over are pipes this process did not create: the re-entry plumbing's own
     /// pipes and the ones behind `Stdio::piped()` / `Stdio::null()`, whose descriptors concede the
     /// rights of a stream and not the security rights. So `grant_std_handle` may legitimately answer
-    /// `ERROR_ACCESS_DENIED`, and `grant_std_handles` (`src/harness/sandbox_windows.rs:2444`, the
-    /// `tracing::warn!` and `eprintln!` pair at `:2455`-`:2456` in this commit — the same two lines at
-    /// `:2328`-`:2329` of `697d7b2`) downgrades exactly that to a warning plus the operator note on
-    /// stderr, instead of failing the run or pretending the stream works. The confined child does not
+    /// `ERROR_ACCESS_DENIED`, and `grant_std_handles` — the `tracing::warn!` and `eprintln!` pair that
+    /// closes its `Err(err)` arm, at `:2462`-`:2463` of this commit, the same two lines at
+    /// `:2455`-`:2456` of `494ec78` and `:2328`-`:2329` of `697d7b2` — downgrades exactly that to a
+    /// warning plus the operator note on stderr, instead of failing the run or pretending the stream
+    /// works. The confined child does not
     /// depend on that grant to have a terminal: commit `0ff93f5` introduced the inherited-handle
     /// capability — the `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` that hands the child precisely these
     /// std handles (`launch_confined`, `stdio_state`) together with the best-effort ACE above — and the
