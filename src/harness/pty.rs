@@ -711,7 +711,9 @@ fn unresolved_exe_error(command: &str) -> ToolError {
 /// * **the command slot is the payload verbatim.** The `stty`/`ulimit` preamble of the unix
 ///   wrapper is a pair of POSIX shell builtins with no `cmd.exe` equivalent, so it is not
 ///   re-introduced here: rule R5 of [`windows_shell_argv`] survives the re-entry, and the
-///   confined launch passes the payload to `%COMSPEC% /C` byte for byte.
+///   confined launch takes the payload byte for byte. What it *does* with it is the
+///   hand-off's decision, not this one: `reentry_handoff` keeps a normal payload behind
+///   `/C` and an R1 interactive-shell request as the bare shell it already is.
 ///
 /// A `Skip` decision never carries [`SANDBOX_EXEC_ARG`]: it runs the plain
 /// [`windows_shell_argv`] argv instead (R1-R5, i.e. the interactive-shell form too), and is
@@ -822,6 +824,28 @@ impl SpawnFamily {
 /// [`windows_shell_argv`]), compared ASCII-case-insensitively against the trimmed input.
 const WINDOWS_INTERACTIVE_SHELLS: &[&str] = &["cmd", "cmd.exe", "powershell", "powershell.exe"];
 
+/// Rule R1 read back from the other side of the re-entry: whether `command` is exactly an
+/// interactive-shell request.
+///
+/// The Windows backend asks this instead of restating the list, so the spawn side and the
+/// confined launch can never disagree about what "an interactive shell request" means — which is
+/// exactly what the `<comspec> /C cmd` hazard was: a rule one half of the re-entry knew and the
+/// other half did not ask about.
+pub(crate) fn is_windows_interactive_shell(command: &str) -> bool {
+    let trimmed = command.trim();
+    WINDOWS_INTERACTIVE_SHELLS
+        .iter()
+        .any(|shell| trimmed.eq_ignore_ascii_case(shell))
+}
+
+/// Whether an interactive-shell request names the `cmd` family (rule R2) rather than another
+/// shell (rule R3). The two have to be resolved differently by the confined launch, which needs
+/// an absolute program path for the `cmd` family and the caller's own token for anything else.
+pub(crate) fn is_windows_cmd_shell(command: &str) -> bool {
+    let trimmed = command.trim();
+    trimmed.eq_ignore_ascii_case("cmd") || trimmed.eq_ignore_ascii_case("cmd.exe")
+}
+
 /// The `cmd.exe` program token of R2: a non-empty trimmed `%COMSPEC%`, else the literal
 /// `cmd.exe`. An empty or whitespace-only `comspec` never wins.
 fn windows_cmd_program(comspec: Option<&str>) -> String {
@@ -846,7 +870,9 @@ fn windows_cmd_program(comspec: Option<&str>) -> String {
 ///   payload-less shell can only sit at its prompt until the timeout kills it. Removing
 ///   that hazard belongs to the one-shot rewrite (t-009); [`build_sandboxed_command`]
 ///   keeps the interactive form because it serves both callers and cannot tell them
-///   apart.
+///   apart. The sandbox re-entry honours the same rule: the confined launch runs the
+///   bare shell instead of putting `/C` back in front of it, so `pty_spawn("cmd")`
+///   stays an interactive `cmd.exe` inside the AppContainer (`reentry_handoff`).
 /// * **R2 — `cmd` is always extension-qualified.** `CreateProcessW` does not append
 ///   `.exe` to `lpApplicationName` and cannot launch a `.CMD`/`.BAT` at all, so a bare
 ///   `cmd` token is a latent `ERROR_FILE_NOT_FOUND` (or a wrongly resolved `.CMD`). The
@@ -863,13 +889,8 @@ fn windows_cmd_program(comspec: Option<&str>) -> String {
 ///   no backslash escape) is deliberately out of scope here and belongs to t-009.
 pub(crate) fn windows_shell_argv(command: &str, comspec: Option<&str>) -> (String, Vec<String>) {
     let trimmed = command.trim();
-    if WINDOWS_INTERACTIVE_SHELLS
-        .iter()
-        .any(|shell| trimmed.eq_ignore_ascii_case(shell))
-    {
-        let is_cmd_family =
-            trimmed.eq_ignore_ascii_case("cmd") || trimmed.eq_ignore_ascii_case("cmd.exe");
-        let program = if is_cmd_family {
+    if is_windows_interactive_shell(command) {
+        let program = if is_windows_cmd_shell(command) {
             windows_cmd_program(comspec)
         } else {
             trimmed.to_string()
@@ -880,6 +901,57 @@ pub(crate) fn windows_shell_argv(command: &str, comspec: Option<&str>) -> (Strin
         windows_cmd_program(comspec),
         vec!["/C".to_string(), command.to_string()],
     )
+}
+
+/// How the sandbox re-entry child hands one payload to a shell, as the **value** the platform is
+/// dispatched on rather than a `cfg!` branch, so the rule can be asserted on a Linux host.
+///
+/// THE INTERACTIVE SHELL UNDER THE RE-ENTRY (the rule, decided once here). On unix the re-entry
+/// child execs `sh -c <payload>` with the payload wrapped in the `stty`/`ulimit` preamble, and a
+/// payload that is just `sh` therefore becomes a **nested** shell reading the stdin it inherited:
+/// the confinement applies and the session stays interactive — the unix path neither refuses nor
+/// skips an interactive-shell request, it confines it. The Windows re-entry has to reach that same
+/// outcome, so rule R1 of [`windows_shell_argv`] survives the re-entry: an interactive-shell
+/// request is handed to the confined launch as `InteractiveShell` (launch the bare shell, no
+/// `/C`) instead of being turned into `<comspec> /C cmd`, which would start `cmd.exe` looking for
+/// a program called `cmd` and end the session. Normal payloads keep `Execute` on both families.
+/// The one-shot path is untouched either way: it refuses a payload-less shell for every decision
+/// ([`windows_oneshot_sandbox_argv`]), so an interactive request can only ever arrive from a PTY
+/// run, and a `Skip` decision never reaches the confined launch at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(windows, test))]
+pub(crate) enum ReentryHandoff {
+    /// The payload is executed as a shell command: `sh -c <payload>` on unix,
+    /// `<program> /C <payload>` in the Windows confined launch.
+    Execute,
+    /// The payload is an interactive-shell request (rule R1): the confined child **is** the shell,
+    /// reading the stdin it inherits, and no `/C` is added in front of it.
+    InteractiveShell,
+}
+
+/// The hand-off one payload gets, for the spawn family that runs it.
+///
+/// Production passes [`SpawnFamily::current`]; a host test passes each variant explicitly, which
+/// is why the family is a parameter and not a `cfg!` read here. The `cfg(any(windows, test))`
+/// gate matches the rest of the Windows-only decision surface in this file: the only production
+/// caller is the Windows confined launch (`sandbox_windows::confined_command_line`), so on a
+/// non-Windows production build nothing can call it, and the `unused`/`dead_code` lints this
+/// crate denies would say so.
+#[cfg(any(windows, test))]
+#[must_use]
+pub(crate) fn reentry_handoff(command: &str, family: SpawnFamily) -> ReentryHandoff {
+    match family {
+        // The unix payload is always executed by `sh -c`, and the interactive-ness of a bare
+        // `sh` request comes from the nested shell that request runs, not from the hand-off.
+        SpawnFamily::Unix => ReentryHandoff::Execute,
+        SpawnFamily::Windows => {
+            if is_windows_interactive_shell(command) {
+                ReentryHandoff::InteractiveShell
+            } else {
+                ReentryHandoff::Execute
+            }
+        }
+    }
 }
 
 /// Drop `prefix` from `raw` when it matches ASCII-case-insensitively, else `None`.

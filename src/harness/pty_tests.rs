@@ -1883,6 +1883,113 @@ fn test_windows_oneshot_sandbox_argv_confines_and_still_refuses_a_bare_shell() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// The interactive shell under the sandbox re-entry (t-014)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The hand-off the sandbox re-entry performs, asserted for **both** spawn families through the
+/// `SpawnFamily` value dispatch, so the Windows rule is checked on a Linux host.
+///
+/// What the rule set says an interactive-shell request gets: the unix re-entry confines it and
+/// leaves it interactive (`sh -c <payload>`, where a bare `sh` payload runs a nested shell reading
+/// the stdin it inherited), and a `Skip` decision never goes through the re-entry at all. Nothing
+/// in the existing rules says a required interactive shell is refused or skipped — the refusal
+/// belongs to the **one-shot** path (`windows_oneshot_sandbox_argv`, pinned by
+/// `test_windows_oneshot_sandbox_argv_confines_and_still_refuses_a_bare_shell`) — so the Windows
+/// re-entry must confine it and keep it interactive, which is what `ReentryHandoff` spells out and
+/// what the confined launch implements (`sandbox_windows::confined_command_line`: the bare shell,
+/// no `/C`).
+#[test]
+fn test_reentry_handoff_confines_an_interactive_shell_on_both_families() {
+    // A normal command: executed behind the shell's command flag on either family.
+    for family in [SpawnFamily::Unix, SpawnFamily::Windows] {
+        for payload in ["cargo test --all-targets", "dir", "echo hi"] {
+            assert_eq!(
+                reentry_handoff(payload, family),
+                ReentryHandoff::Execute,
+                "`{payload}` is a command, not an interactive-shell request ({family:?})"
+            );
+        }
+    }
+
+    // An R1 request on Windows: the shell **is** the payload, so the hand-off keeps it bare.
+    for shell in [
+        "cmd",
+        "CMD",
+        "cmd.exe",
+        "  CMD.EXE  ",
+        "powershell",
+        "POWERSHELL.EXE",
+        " powershell ",
+    ] {
+        assert_eq!(
+            reentry_handoff(shell, SpawnFamily::Windows),
+            ReentryHandoff::InteractiveShell,
+            "`{shell:?}` is an interactive-shell request on the Windows family"
+        );
+    }
+
+    // The same request on the unix family stays an `sh -c` payload: the interactive-ness of a
+    // bare `sh` comes from the nested shell that payload runs, so the hand-off is `Execute` and
+    // the confinement is applied exactly as for any other command.
+    for shell in ["sh", "bash", "cmd", "powershell"] {
+        assert_eq!(
+            reentry_handoff(shell, SpawnFamily::Unix),
+            ReentryHandoff::Execute,
+            "the unix re-entry never hands over a bare shell: it hands over `sh -c <payload>`"
+        );
+    }
+
+    // A command that merely mentions a shell is not an R1 request: only the bare token is one,
+    // and anything with an argument attached is executed like any other payload.
+    for payload in [
+        "cmd /C echo hi",
+        "powershell -NoProfile",
+        "/bin/sh",
+        "sh -c pwd",
+    ] {
+        assert_eq!(
+            reentry_handoff(payload, SpawnFamily::Windows),
+            ReentryHandoff::Execute,
+            "`{payload}` is not the bare token R1 matches on"
+        );
+    }
+
+    // The rule is decided once: the classification the confined launch reads is the same rule
+    // `windows_shell_argv` applies, so neither half can hold a different shell list.
+    assert!(is_windows_cmd_shell("CMD.EXE"));
+    assert!(is_windows_cmd_shell(" cmd "));
+    assert!(!is_windows_cmd_shell("powershell"));
+    assert!(is_windows_interactive_shell("  PowerShell.Exe  "));
+    assert!(!is_windows_interactive_shell(
+        "powershell -Command Get-Location"
+    ));
+
+    // And the re-entry argv itself is untouched by the choice: an `Apply` decision keeps the
+    // three slots, payload verbatim, for an interactive request too — the confinement happens in
+    // the launch, not by dropping the request.
+    let exe = Path::new(r"C:\Program Files\marmel\marmel-dev.exe");
+    let apply = should_apply_sandbox(&production_inputs(exe));
+    for payload in ["cmd", "powershell", "cargo test"] {
+        let (program, args) = windows_sandbox_command_argv(
+            &apply,
+            payload,
+            Path::new(r"C:\work"),
+            Some(TEST_COMSPEC),
+        )
+        .expect("an interactive-shell request is confined, never refused");
+        assert_eq!(program, exe.to_string_lossy());
+        assert_eq!(
+            args.len(),
+            3,
+            "three slots for an interactive request too: {args:?}"
+        );
+        assert_eq!(args[0], SANDBOX_EXEC_ARG);
+        assert_eq!(args[1], r"C:\work");
+        assert_eq!(args[2], payload, "the payload stays verbatim: {args:?}");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // One-shot outcome reporting and the Windows one-shot argv (t-009)
 // ──────────────────────────────────────────────────────────────────────────
 //

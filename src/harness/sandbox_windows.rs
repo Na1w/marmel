@@ -160,15 +160,16 @@ use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS, GetLastError,
-    HANDLE, INVALID_HANDLE_VALUE, LocalFree, STATUS_ACCESS_DENIED, STATUS_ACCESS_VIOLATION,
-    STATUS_DLL_NOT_FOUND, STATUS_ENTRYPOINT_NOT_FOUND, STATUS_IN_PAGE_ERROR, STILL_ACTIVE,
-    WAIT_OBJECT_0, WIN32_ERROR,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_NO_SECURITY_ON_OBJECT, ERROR_PRIVILEGE_NOT_HELD,
+    ERROR_SUCCESS, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, STATUS_ACCESS_DENIED,
+    STATUS_ACCESS_VIOLATION, STATUS_DLL_NOT_FOUND, STATUS_ENTRYPOINT_NOT_FOUND,
+    STATUS_IN_PAGE_ERROR, STILL_ACTIVE, WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SetEntriesInAclW,
-    SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    BuildTrusteeWithSidW, ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W,
+    GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
+    SE_KERNEL_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -176,11 +177,13 @@ use windows_sys::Win32::Security::Isolation::{
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, AllocateAndInitializeSid,
     DACL_SECURITY_INFORMATION, EqualSid, FreeSid, GetAce, GetAclInformation, INHERIT_ONLY_ACE,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_APP_PACKAGE_AUTHORITY, SECURITY_CAPABILITIES,
-    SID_AND_ATTRIBUTES, SID_IDENTIFIER_AUTHORITY, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SECURITY_APP_PACKAGE_AUTHORITY,
+    SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, SID_IDENTIFIER_AUTHORITY,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, SYNCHRONIZE,
 };
 // The launch half of the backend: the process-attribute list that carries the confinement
 // declaration, `CreateProcessW` and the wait for the child, and the std-handle inspection that
@@ -1608,16 +1611,43 @@ fn quote_command_token(value: &str) -> String {
     out
 }
 
-/// The complete `lpCommandLine` of one confined launch: `<program> /C <command>`.
+/// The complete `lpCommandLine` of one confined launch: `<program> /C <command>`, or — when the
+/// payload *is* an interactive-shell request — the bare shell on its own.
 ///
-/// The program token is quoted per [`quote_command_token`]; the payload is appended **verbatim**,
-/// which is what `windows_shell_argv` rule R5 promises: what follows `/C` is `cmd.exe`'s own
-/// command line, and `cmd.exe` re-parses it with its own metacharacters (`&`, `|`, `>`, `^`, `"`).
-/// Passing that payload through the MSVCRT escaping a real argv would need (what portable-pty's
-/// `append_quoted` does) would change what the confined shell reads — `echo "hi there"` included —
-/// so the command reaches it byte for byte.
+/// HOW THE INTERACTIVE SHELL SURVIVES THE RE-ENTRY (the decision, in one paragraph). The unix
+/// re-entry child runs its payload through `sh -c <payload>` and a payload that is just `sh`
+/// therefore ends up as a nested shell reading the stdin it inherited: the confinement applies and
+/// the session stays interactive; the unix path neither refuses nor skips such a request. The
+/// Windows re-entry has to land on the same rule, so rule R1 of `pty::windows_shell_argv` is
+/// carried through rather than lost: `pty::reentry_handoff` classifies the payload, an interactive
+/// shell request is launched as the bare shell (no `/C` and no payload), and a normal payload
+/// keeps `<program> /C <payload>`. The alternative — adding `/C` back — is what the gap was: confined
+/// `cmd.exe /C cmd` starts `cmd.exe` looking for a program named `cmd`, ends the session, and
+/// leaves an interactive request looking like a failure. The one-shot path keeps refusing a
+/// payload-less shell for every decision, so only a PTY run can reach this branch.
 #[must_use]
 fn confined_command_line(program: &str, payload: &str) -> String {
+    // The program token is quoted per [`quote_command_token`]; the payload is appended
+    // **verbatim**, which is what `windows_shell_argv` rule R5 promises: what follows `/C` is
+    // `cmd.exe`'s own command line, and `cmd.exe` re-parses it with its own metacharacters
+    // (`&`, `|`, `>`, `^`, `"`). Passing that payload through the MSVCRT escaping a real argv
+    // would need (what portable-pty's `append_quoted` does) would change what the confined shell
+    // reads — `echo "hi there"` included — so the command reaches it byte for byte.
+    if crate::harness::pty::reentry_handoff(payload, crate::harness::pty::SpawnFamily::Windows)
+        == crate::harness::pty::ReentryHandoff::InteractiveShell
+    {
+        // The bare form decides *which* shell runs by the same two rules the spawn side uses:
+        // R2 (`cmd`/`cmd.exe`) takes the program token the launch already resolved, which is an
+        // absolute path because a confined child cannot count on a PATH search; R3
+        // (`powershell`/`powershell.exe`) is the caller's own token, trimmed, because
+        // substituting `%COMSPEC%` here would run a different shell than the one asked for.
+        let token = if crate::harness::pty::is_windows_cmd_shell(payload) {
+            program.to_owned()
+        } else {
+            payload.trim().to_owned()
+        };
+        return quote_command_token(&token);
+    }
     let quoted = quote_command_token(program);
     format!("{quoted} /C {payload}")
 }
@@ -1852,6 +1882,240 @@ fn stdio_state() -> StdioState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// handle capability: an ACE on the object the child inherits, not just on the directories
+// ---------------------------------------------------------------------------
+
+/// The rights a confined child asks of a standard stream it inherits: read and write on the
+/// object itself, its attributes, and the right a reader or writer waits on.
+const STD_HANDLE_ACCESS: u32 =
+    FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
+
+/// One trustee naming a SID, built by the API rather than spelled by hand:
+/// `BuildTrusteeWithSidW` fills the SID form (`TRUSTEE_IS_SID`, name = the SID pointer) that an
+/// AppContainer identity needs, because the name lookup a `TRUSTEE_IS_NAME` trustee would run
+/// cannot resolve one.
+fn trustee_for_sid(sid: PSID) -> TRUSTEE_W {
+    let mut trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: std::ptr::null_mut(),
+    };
+    // SAFETY: the trustee block is owned by this call and the SID is an allocated identity; the
+    // API writes the name/form fields of the block and allocates nothing else.
+    unsafe { BuildTrusteeWithSidW(&mut trustee, sid) };
+    trustee
+}
+
+/// The principals a std object has to name before a confined child may use it.
+///
+/// The AppContainer SID of this run's profile is the precise identity of the confined child, and
+/// is what the file half of the policy grants too. The built-in `ALL APPLICATION PACKAGES`
+/// collection SID (`S-1-15-2-2`, the same group the read-only file coverage check accepts as
+/// already covering a toolchain directory) is added alongside it because a std handle is inherited
+/// by the **whole** confined tree rather than by one process, and any derived AppContainer identity
+/// below it — a restricted AppContainer child, or a nested re-entry — belongs to that group rather
+/// to this profile. That is the one coarse principal this path accepts, and it is bounded to
+/// handles this process already owns: unlike a directory grant, it does not widen what any other
+/// process on the machine may open.
+#[must_use]
+fn std_handle_trustees(app_sid: PSID, all_packages_sid: PSID) -> Vec<EXPLICIT_ACCESS_W> {
+    [app_sid, all_packages_sid]
+        .into_iter()
+        .map(|sid| EXPLICIT_ACCESS_W {
+            grfAccessPermissions: STD_HANDLE_ACCESS,
+            grfAccessMode: GRANT_ACCESS,
+            // A standard stream is an object, not a container: an ACE names what it gives this
+            // object, and nothing below a handle can inherit it.
+            grfInheritance: NO_INHERITANCE,
+            Trustee: trustee_for_sid(sid),
+        })
+        .collect()
+}
+
+/// One inherited std object, the DACL this run added to it, and the handle to put that back.
+struct StdHandleGrant {
+    /// The object whose DACL changed.
+    handle: HANDLE,
+    /// The security descriptor `GetSecurityInfo` handed back; its DACL is what the restore writes
+    /// back, so the descriptor is kept alive until then and released by the same API the read
+    /// documented (`LocalFree`).
+    saved_sd: PSECURITY_DESCRIPTOR,
+    saved_dacl: *mut ACL,
+    /// The ACL `SetEntriesInAclW` built for this grant, released on drop.
+    applied: *mut ACL,
+    /// Non-`Sync` marker: the saved descriptor is read and written on one thread only.
+    _single_thread: PhantomData<*mut ()>,
+}
+
+impl Drop for StdHandleGrant {
+    fn drop(&mut self) {
+        // Restore the DACL exactly as it was read. `SetSecurityInfo` treats a null `pdacl` as "do
+        // not touch the DACL", which is why the no-DACL case never produces a guard at all (see
+        // [`grant_std_handle`]): a NULL DACL already grants everything, and a guard would then
+        // have nothing to write.
+        //
+        // The child may well have exited before this runs — that is expected and harmless. The
+        // confined launch waits for its child, and a std handle the child left behind is read by
+        // the parent, which never needed the AppContainer ACE at all.
+        let code = unsafe {
+            SetSecurityInfo(
+                self.handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                self.saved_dacl as *const ACL,
+                std::ptr::null(),
+            )
+        };
+        if code != ERROR_SUCCESS {
+            tracing::warn!(
+                win32_error = code,
+                "failed to restore the DACL of an inherited standard stream: the AppContainer ACE may still be set"
+            );
+        }
+        // SAFETY: `SetEntriesInAclW` allocated the applied ACL, and the saved descriptor came from
+        // `GetSecurityInfo`; `LocalFree` is the release both document.
+        unsafe {
+            LocalFree(self.applied as *mut c_void);
+            LocalFree(self.saved_sd);
+        }
+    }
+}
+
+/// Grant one inherited std handle the rights the confined child needs, and hand back the guard
+/// that puts the original DACL back.
+///
+/// Three cases produce no guard, and none of them is a failure: a handle that is not a real object
+/// (`null` or `INVALID_HANDLE_VALUE`, i.e. a std stream this process does not have), an object with
+/// **no DACL at all** (a NULL DACL already grants every principal everything, so adding an ACE
+/// would change nothing — and the restore would have nothing to write), and an object with no
+/// security at all, which answers `ERROR_NO_SECURITY_ON_OBJECT` and is likewise reported as "no
+/// grant was possible, and none is needed" rather than as an error.
+fn grant_std_handle(
+    handle: HANDLE,
+    app_sid: PSID,
+) -> Result<Option<StdHandleGrant>, WindowsSandboxError> {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Ok(None);
+    }
+    let label = format!("standard stream object {handle:p}");
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the handle names one live object handle, and every out-parameter is a valid pointer
+    // the API writes into.
+    let read = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    let _ = sacl; // the SACL is not part of this policy
+    if read == ERROR_NO_SECURITY_ON_OBJECT {
+        return Ok(None);
+    }
+    if read != ERROR_SUCCESS {
+        return Err(WindowsSandboxError::AclRead {
+            path: label,
+            reason: format!(
+                "GetSecurityInfo failed (win32 error {read}): {}",
+                last_win32_error()
+            ),
+        });
+    }
+    if dacl.is_null() {
+        // SAFETY: the descriptor came from `GetSecurityInfo`, whose documented release is
+        // `LocalFree`; nothing references it, because no grant is applied to a NULL DACL.
+        unsafe { LocalFree(sd) };
+        return Ok(None);
+    }
+    let all_packages = ApplicationPackagesSid::all()?;
+    let entries = std_handle_trustees(app_sid, all_packages.sid());
+    let mut applied: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `entries` is owned by this call for its whole duration, and the old ACL belongs to
+    // the descriptor the guard keeps alive.
+    let built =
+        unsafe { SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), dacl, &mut applied) };
+    if built != ERROR_SUCCESS {
+        // SAFETY: the descriptor is the only object read here, and it is released unchanged.
+        unsafe { LocalFree(sd) };
+        return Err(WindowsSandboxError::AclMutate {
+            path: label,
+            reason: format!("SetEntriesInAclW failed: {}", last_win32_error()),
+            code: built,
+        });
+    }
+    // SAFETY: the handle names the object, and `applied` is the freshly built ACL.
+    let set = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            applied,
+            std::ptr::null(),
+        )
+    };
+    if set != ERROR_SUCCESS {
+        // SAFETY: neither the ACL that was built nor the descriptor reached the object, so both
+        // are released here rather than handed to a guard.
+        unsafe {
+            LocalFree(applied as *mut c_void);
+            LocalFree(sd);
+        };
+        return Err(WindowsSandboxError::AclMutate {
+            path: label,
+            reason: format!("SetSecurityInfo failed: {}", last_win32_error()),
+            code: set,
+        });
+    }
+    Ok(Some(StdHandleGrant {
+        handle,
+        saved_sd: sd,
+        saved_dacl: dacl,
+        applied,
+        _single_thread: PhantomData,
+    }))
+}
+
+/// Grant every inherited std handle, keeping only the warnings.
+///
+/// A std stream whose grant was refused stays unusable by the confined child, and that is reported
+/// the way every other capability this backend cannot have is reported: a `tracing::warn!` plus the
+/// note on stderr, in the shape of the `extra_path_skip_note` precedent, because the re-entry child
+/// has no log subscriber yet. The launch is not failed over it, and it is not treated as a success
+/// either: the confined command still runs under the policy it was given, and the lost stream is
+/// what the operator is told about.
+fn grant_std_handles(handles: &[HANDLE; 3], app_sid: PSID) -> Vec<StdHandleGrant> {
+    let mut grants = Vec::new();
+    for (index, handle) in handles.iter().enumerate() {
+        match grant_std_handle(*handle, app_sid) {
+            Ok(Some(guard)) => grants.push(guard),
+            Ok(None) => {}
+            Err(err) => {
+                let note = format!(
+                    "warning: could not give the confined child access to standard stream {}: {err}",
+                    index + 1
+                );
+                tracing::warn!("{note}");
+                eprintln!("{note}");
+            }
+        }
+    }
+    grants
+}
+
 /// Create the confined process, wait for it, and report the exit code it left behind, as the raw
 /// `u32` `GetExitCodeProcess` wrote.
 ///
@@ -1906,19 +2170,21 @@ fn launch_confined(
     //   handles, `bInheritHandles = TRUE`, and `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming exactly
     //   them, which also keeps every *other* inheritable handle of this process out of the sandbox.
     //
-    // HANDLE-CAPABILITY CAVEAT (documented, not faked): making a handle visible to an AppContainer
-    // child is not the same as letting the child use the object behind it. The access check for an
-    // inherited kernel object is re-run in the child's token context, and the anonymous pipes this
-    // process creates carry the default DACL of this process's token, which names the user and not
-    // the AppContainer SID (nor the app-capability SID). A confined child in that shape can
-    // therefore be created and run while still failing to write to its own standard streams, and
-    // that shows up as a lost write and an exit status rather than as a hidden success. Granting the
-    // std objects an explicit ACE for the AppContainer identity is the fix, and is deliberately not
-    // attempted here: it would mean rewriting standard streams this module does not own.
+    // Making a handle visible to the AppContainer child is not the same as letting the child use
+    // the object behind it: the access check for an inherited kernel object is re-run in the
+    // child's token context, and the anonymous pipes the one-shot path creates carry the default
+    // DACL of this process's token, which names the user and not the AppContainer identity. So the
+    // std objects are granted that identity before the launch (see [`grant_std_handles`]), and the
+    // guards returned here are what put the original DACLs back — only after the child has exited,
+    // which is the whole point of binding them here rather than in the call.
     let inherited: Option<[HANDLE; 3]> = if stdio.all_console {
         None
     } else {
         Some(stdio.handles)
+    };
+    let std_grants = match &inherited {
+        Some(handles) => grant_std_handles(handles, setup.profile.sid()),
+        None => Vec::new(),
     };
 
     let capabilities = setup.profile.security_capabilities();
@@ -2037,6 +2303,11 @@ fn launch_confined(
             code: 0,
         });
     }
+    // The std-handle grants go back only now, after the wait and the read of the exit code: a DACL
+    // restored while the child was still writing would take its write access away mid-stream. Once
+    // the wait has ended the child is gone, so releasing here is late enough to be safe and early
+    // enough that a launch that never happened still restores what it changed.
+    drop(std_grants);
     Ok(raw)
 }
 
@@ -2386,6 +2657,7 @@ pub fn run_in_appcontainer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
     /// The fixture host: one temporary directory playing the role of `%USERPROFILE%`, with the
     /// sensitive directories, the toolchain directories, a temporary directory and a
@@ -2806,6 +3078,242 @@ mod tests {
             r"C:\Windows\System32\cmd.exe"
         );
         assert_eq!(shell_program(None, None), r"C:\Windows\System32\cmd.exe");
+    }
+
+    /// The interactive-shell rule as the confined launch applies it: an R1 request runs the bare
+    /// shell (no `/C`, no payload), and every other payload still goes behind `/C`.
+    ///
+    /// This is the Windows half of what the unix re-entry already does — confine the request and
+    /// leave it interactive — pinned at the seam that used to turn `cmd` into `cmd.exe /C cmd`.
+    #[test]
+    fn test_confined_command_line_keeps_an_interactive_shell_bare() {
+        let comspec = r"C:\Windows\System32\cmd.exe";
+        // R2: the `cmd` family takes the program token the launch resolved (absolute, so the
+        // confined child needs no PATH search), and nothing else.
+        for shell in ["cmd", "CMD", "cmd.exe", "  CMD.EXE  "] {
+            assert_eq!(
+                confined_command_line(comspec, shell),
+                "\"C:\\Windows\\System32\\cmd.exe\"",
+                "`{shell:?}` is an interactive-shell request: the bare shell, no payload"
+            );
+        }
+        // R3: `powershell` is used as the caller wrote it, so the bare form names that token and
+        // never substitutes the `cmd` program.
+        assert_eq!(
+            confined_command_line(comspec, "powershell"),
+            "powershell",
+            "the requested shell stays the requested shell"
+        );
+        assert_eq!(
+            confined_command_line(comspec, "  powershell.exe "),
+            "powershell.exe"
+        );
+        // A payload with an argument attached is not an R1 request, and keeps `/C`.
+        assert_eq!(
+            confined_command_line(comspec, "cmd /C echo hi"),
+            "\"C:\\Windows\\System32\\cmd.exe\" /C cmd /C echo hi"
+        );
+        assert_eq!(
+            confined_command_line("cmd.exe", "echo hi"),
+            "cmd.exe /C echo hi",
+            "a normal command is unaffected by the rule"
+        );
+    }
+
+    /// The std-handle grant, asserted through the value the launch builds rather than through a
+    /// live launch: the two AppContainer principals, the rights they are handed, the SID form the
+    /// trustee has to take, and the absence of inheritance on an object that is not a container.
+    #[test]
+    fn test_std_handle_trustees_name_the_appcontainer_identity_readwrite_and_without_inheritance()
+    -> Result<(), WindowsSandboxError> {
+        // A capability SID of the app-package authority stands in for the profile SID the launch
+        // passes in production; the collection SID is the real `S-1-15-2-2`.
+        let stand_in_app_sid = allocate_app_package_sid(&[3, 1])?;
+        let all_packages = ApplicationPackagesSid::all()?;
+        let entries = std_handle_trustees(stand_in_app_sid, all_packages.sid());
+        assert_eq!(
+            entries.len(),
+            2,
+            "the precise profile identity first, the collection SID second"
+        );
+        for entry in &entries {
+            assert_eq!(
+                entry.grfAccessPermissions, STD_HANDLE_ACCESS,
+                "one mask for every trustee: read and write on the object"
+            );
+            assert_eq!(entry.grfAccessMode, GRANT_ACCESS);
+            assert_eq!(
+                entry.grfInheritance, NO_INHERITANCE,
+                "a standard stream is an object, not a container: nothing inherits from a handle"
+            );
+            assert_eq!(
+                entry.Trustee.TrusteeForm, TRUSTEE_IS_SID,
+                "an AppContainer SID is a name the lookup of a `TRUSTEE_IS_NAME` trustee would miss"
+            );
+            assert_eq!(entry.Trustee.TrusteeType, TRUSTEE_IS_UNKNOWN);
+            assert_eq!(
+                entry.Trustee.MultipleTrusteeOperation, NO_MULTIPLE_TRUSTEE,
+                "one principal per entry"
+            );
+        }
+        assert_eq!(
+            entries[0].Trustee.ptstrName, stand_in_app_sid as *mut u16,
+            "the first trustee names the precise AppContainer identity, by pointer"
+        );
+        assert_eq!(
+            entries[1].Trustee.ptstrName,
+            all_packages.sid() as *mut u16,
+            "the second trustee is `ALL APPLICATION PACKAGES`"
+        );
+        // The mask is read **and** write, not one of them: a confined child has to be able to read
+        // its own stdin and write its own stdout.
+        assert_eq!(
+            STD_HANDLE_ACCESS & (FILE_READ_DATA | FILE_WRITE_DATA),
+            FILE_READ_DATA | FILE_WRITE_DATA,
+            "the mask must cover both directions"
+        );
+        // SAFETY: the SID was allocated by `AllocateAndInitializeSid`, whose documented release is
+        // `FreeSid`, and the trustee entries only ever pointed at it.
+        unsafe { FreeSid(stand_in_app_sid) };
+        Ok(())
+    }
+
+    /// Whether `handle` names an object whose DACL already carries an allow ACE for `sid` covering
+    /// `mask` — the read side of the handle grant, spelled once for the test below.
+    fn handle_names_sid(handle: HANDLE, sid: PSID, mask: u32) -> bool {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle names one live object, and each out-parameter is a valid pointer.
+        let code = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                &mut sacl,
+                &mut sd,
+            )
+        };
+        let _ = sacl;
+        if code != ERROR_SUCCESS || dacl.is_null() {
+            if !sd.is_null() {
+                // SAFETY: the descriptor came from `GetSecurityInfo`.
+                unsafe { LocalFree(sd) };
+            }
+            return false;
+        }
+        let mut size = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        // SAFETY: the ACL and the information buffer belong to this call.
+        let sized = unsafe {
+            GetAclInformation(
+                dacl,
+                std::ptr::from_mut(&mut size).cast::<c_void>(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        };
+        let mut found = false;
+        if sized != 0 {
+            for index in 0..size.AceCount {
+                if found {
+                    break;
+                }
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                // SAFETY: `GetAce` reads the ACL it is given and writes one pointer.
+                if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                    continue;
+                }
+                let typed: *const ACCESS_ALLOWED_ACE = ace.cast();
+                // SAFETY: an access-allowed ACE begins with its header, and `GetAce` guarantees
+                // the pointer for the ACE's own size.
+                let allowed = unsafe { &*typed };
+                if allowed.Header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                    || u32::from(allowed.Header.AceFlags) & INHERIT_ONLY_ACE != 0
+                {
+                    continue;
+                }
+                let ace_sid = std::ptr::from_ref(&allowed.SidStart)
+                    .cast::<c_void>()
+                    .cast_mut();
+                // SAFETY: both SID arguments are valid: the ACE's SID starts at `SidStart`, and
+                // the compared SID is one this test allocated.
+                found = unsafe { EqualSid(sid, ace_sid) } != 0 && (allowed.Mask & mask) == mask;
+            }
+        }
+        // SAFETY: the descriptor was allocated by `GetSecurityInfo`.
+        unsafe { LocalFree(sd) };
+        found
+    }
+
+    /// A real handle, real DACL, real grant: `CreatePipe` gives an object with the default DACL of
+    /// this process, which is exactly the object the confined child could not write to. The grant
+    /// puts the AppContainer ACE on it, and dropping the guard puts the original back.
+    ///
+    /// This test is only compiled where the Windows backend is compiled — the module is behind
+    /// `#[cfg(target_os = "windows")]` in `mod.rs`, so it runs on the native Windows CI job.
+    #[test]
+    fn test_a_real_std_handle_grant_is_applied_and_then_restored() -> Result<(), WindowsSandboxError>
+    {
+        let mut read: HANDLE = std::ptr::null_mut();
+        let mut write: HANDLE = std::ptr::null_mut();
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        // SAFETY: two out-parameters plus a security-attributes block the API reads.
+        let made = unsafe {
+            windows_sys::Win32::System::Pipes::CreatePipe(&mut read, &mut write, &attrs, 0)
+        };
+        if made == 0 {
+            return Err(WindowsSandboxError::Launch {
+                reason: format!("CreatePipe failed: {}", last_win32_error()),
+                code: 0,
+            });
+        }
+        let app_sid = allocate_app_package_sid(&[2, 2])?;
+        assert!(
+            !handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
+            "the default DACL of a fresh pipe names the user, not the AppContainer identity"
+        );
+        let grant = grant_std_handle(write, app_sid)?;
+        let Some(grant) = grant else {
+            // SAFETY: the two pipe ends and the SID are this test's to release.
+            unsafe {
+                FreeSid(app_sid);
+                CloseHandle(read);
+                CloseHandle(write);
+            }
+            return Err(WindowsSandboxError::AclMutate {
+                path: "the test pipe".to_string(),
+                reason: "expected the grant to apply an ACE, and it reported none".to_string(),
+                code: 0,
+            });
+        };
+        assert!(
+            handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
+            "the ACE this run applied must be visible on the object"
+        );
+        drop(grant);
+        assert!(
+            !handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
+            "the guard restores the DACL it read: the AppContainer ACE must be gone"
+        );
+        // SAFETY: the SID was allocated by `AllocateAndInitializeSid`, and the two pipe ends were
+        // created by this test.
+        unsafe {
+            FreeSid(app_sid);
+            CloseHandle(read);
+            CloseHandle(write);
+        }
+        Ok(())
     }
 
     /// The attribute list is sized by the API, in two passes; the extended startup block is the
