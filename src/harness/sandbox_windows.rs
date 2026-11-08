@@ -1651,7 +1651,19 @@ impl AclGrantGuard {
         // `SANDBOX_REFUSE_EXIT_CODE` on every command the host ran, while an empty fixture root
         // stayed green. A handle has no name to resolve and nothing below it to walk: it writes
         // exactly one object's security descriptor, which is the grant this entry asks for.
-        let handle = open_security_handle(path)?;
+        // The handle open can fail — the object may refuse `WRITE_DAC`, or it may no longer be
+        // there at all — and at this point the ACL already exists. Ownership of `applied` moves
+        // into the guard further below, so a refusal here has to release it on the spot, or the
+        // ACL `SetEntriesInAclW` just allocated is stranded (t-040).
+        let handle = match open_security_handle(path) {
+            Ok(handle) => handle,
+            Err(error) => {
+                // SAFETY: `applied` is the ACL `SetEntriesInAclW` allocated above, it has not been
+                // handed to any object or guard, and `LocalFree` is its documented release.
+                unsafe { LocalFree(applied as *mut c_void) };
+                return Err(error);
+            }
+        };
         // SAFETY: `handle` is the handle just opened on this object, and `applied` is the ACL the
         // guard takes ownership of from here on.
         let set = unsafe {
