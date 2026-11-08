@@ -1052,8 +1052,9 @@ fn test_sandbox_gate_opt_out_value_must_be_unambiguous() {
     }
 }
 
-/// No sandbox backend on this platform ⇒ skipped, but never silently. Linux (Landlock)
-/// and macOS (Seatbelt) both have one, so only Windows and friends take this branch.
+/// No sandbox backend on this platform ⇒ skipped, but never silently. Linux (Landlock),
+/// macOS (Seatbelt) and Windows (AppContainer) all have one, so only the remaining hosts —
+/// the BSDs and friends — take this branch.
 #[test]
 fn test_sandbox_gate_unsupported_platform_skips_with_warning() {
     let exe = Path::new("/Users/fredrik/target/debug/marmel");
@@ -1077,8 +1078,9 @@ fn test_sandbox_gate_unsupported_platform_skips_with_warning() {
 }
 
 /// The gate no longer asks "am I on Linux": both of its sites ask the one capability flag
-/// in `harness::sandbox`, so a host with a Landlock **or** a Seatbelt backend reaches the
-/// re-entry child. Asserted with the flag as production feeds it, on the current build.
+/// in `harness::sandbox`, so a host with a Landlock **or** a Seatbelt **or** an AppContainer
+/// backend reaches the re-entry child. Asserted with the flag as production feeds it, on the
+/// current build.
 #[test]
 fn test_sandbox_gate_platform_answer_comes_from_the_shared_capability_flag() {
     let flag = crate::harness::sandbox::backend_supports_current_platform();
@@ -1090,13 +1092,17 @@ fn test_sandbox_gate_platform_answer_comes_from_the_shared_capability_flag() {
     });
     assert_eq!(
         flag,
-        cfg!(any(target_os = "linux", target_os = "macos")),
-        "the shared flag must answer true for both backends and false for every other host"
+        cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )),
+        "the shared flag must answer true for all three backends and false for every other host"
     );
     if flag {
         assert!(
             matches!(decision, SandboxDecision::Apply { .. }),
-            "a host that compiles Landlock or Seatbelt must re-enter, got {decision:?}"
+            "a host that compiles Landlock, Seatbelt or AppContainer must re-enter, got {decision:?}"
         );
         assert_eq!(decision.mode(), "sandbox-re-entry");
     } else {
@@ -1227,24 +1233,21 @@ fn test_build_sandboxed_command_logs_its_choice_and_keeps_the_wrapper() {
     let argv = cmd.get_argv();
     assert!(!argv.is_empty(), "the builder must have a program");
 
-    // In a test binary the re-entry is skipped, so unix builds `sh -c <wrapped>`;
-    // Windows has no Landlock at all and takes its own `cmd /C <command>` branch.
+    // In a test binary the re-entry is skipped, so unix builds `sh -c <wrapped>`; Windows
+    // builds its own `%COMSPEC% /C <command>` form from the very same decision object (it has
+    // an AppContainer backend, but a test-harness binary cannot speak the re-entry protocol).
     // Either way the command was chosen by a decision that was logged.
     if cfg!(test) {
         let (program, shell_flag) = expected_sandbox_shell();
         assert_eq!(argv[0].to_string_lossy(), program);
         assert_eq!(argv[1].to_string_lossy(), shell_flag);
-        // Both platforms warn, but from different call sites: the unix skip runs through
-        // `log_sandbox_decision` (the `pty sandbox decision` debug line plus the `SKIPPED`
-        // warn), while the Windows branch warns directly from `build_sandboxed_command` and
-        // never emits that debug line. Only the shared wording is asserted on Windows.
-        let marker = if cfg!(windows) {
-            "SKIPPED"
-        } else {
-            "pty sandbox decision"
-        };
+        // Both platforms log the decision the same way now: `log_sandbox_decision` emits the
+        // `pty sandbox decision` debug line and the matching `SKIPPED` warn on unix and on
+        // Windows alike, so the skip is never silent on either of them.
         assert!(
-            logs.contains("WARN") && logs.contains(marker),
+            logs.contains("WARN")
+                && logs.contains("SKIPPED")
+                && logs.contains("pty sandbox decision"),
             "every skip must leave a visible trace, got {logs:?}"
         );
     }
@@ -1603,6 +1606,280 @@ fn test_windows_child_cwd_strips_only_the_verbatim_prefix() {
         r"C:\no\such\dir",
         "the requested directory is never swapped for a different one"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// The Windows re-entry argv (t-010)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// The Windows spawn side and the Windows re-entry child meet on one argv: the resolved exe,
+// the sentinel, the cwd the child is asked to run in, and the command payload. The builders
+// below are pure and take the decision as a value, so every rule here is asserted on a Linux
+// host with literal Windows inputs — the same reason `windows_shell_argv` and
+// `windows_child_cwd` are pinned here rather than behind `#[cfg(windows)]`, which CI only
+// ever compiles. The confined launch itself is exercised by the Windows integration suite.
+
+/// An `Apply` decision on Windows is the same three-slot contract as on unix — resolved exe,
+/// sentinel, cwd, command — and the two platform-specific differences are exactly the two
+/// that platform demands: the cwd slot loses the `\\?\` verbatim prefix that
+/// `canonicalize()` produces (R C1/C2 of [`windows_child_cwd`], because `cmd.exe` refuses a
+/// verbatim current directory), and the command slot is the payload **verbatim**, because the
+/// unix wrapper's `stty`/`ulimit` preamble is a pair of POSIX builtins with no `cmd.exe`
+/// equivalent.
+#[test]
+fn test_windows_sandbox_reentry_argv_is_three_slots_with_the_payload_verbatim() {
+    // A verbatim resolved exe is passed through untouched: `CreateProcessW` accepts that
+    // spelling in `lpApplicationName`, unlike the current directory.
+    let exe = Path::new(r"C:\Program Files\marmel\marmel-dev.exe");
+    let decision = should_apply_sandbox(&production_inputs(exe));
+    assert!(
+        matches!(decision, SandboxDecision::Apply { .. }),
+        "a resolved exe on a host with a backend must reach the re-entry, got {decision:?}"
+    );
+
+    for payload in [
+        "cargo test --all-targets",
+        r#"git commit -m "fix: route Windows through the re-entry""#,
+        r#"dir "C:\Program Files\a b" & echo %PATH% ^& type a.txt"#,
+        "   ",
+    ] {
+        let (program, args) = windows_sandbox_command_argv(
+            &decision,
+            payload,
+            Path::new(r"\\?\C:\work\proj"),
+            Some(TEST_COMSPEC),
+        )
+        .expect("an Apply decision builds the re-entry argv");
+
+        assert_eq!(program, exe.to_string_lossy());
+        assert_eq!(
+            args.len(),
+            3,
+            "the re-entry contract is three slots: {args:?}"
+        );
+        assert_eq!(args[0], SANDBOX_EXEC_ARG);
+        assert_eq!(args[1], r"C:\work\proj");
+        assert_eq!(
+            args[2], payload,
+            "the payload must reach the re-entry child byte for byte, got {args:?}"
+        );
+        // Not the unix preamble: there is no `stty`/`ulimit` on `cmd.exe`, and re-introducing
+        // it would rewrite a command line nobody asked to rewrite.
+        for posix_builtin in ["stty", "ulimit"] {
+            assert!(
+                !args[2].contains(posix_builtin),
+                "the Windows re-entry must not add the {posix_builtin} preamble, got {:?}",
+                args[2]
+            );
+        }
+    }
+}
+
+/// The cwd slot of the Windows re-entry is the directory the confined command is launched in,
+/// so it must never carry a verbatim prefix — the very rule that keeps `cmd.exe` from quietly
+/// running elsewhere. Asserted for every cwd spelling, including a plain UNC one.
+#[test]
+fn test_windows_reentry_cwd_slot_never_carries_a_verbatim_prefix() {
+    let decision = SandboxDecision::Apply {
+        resolved_exe: PathBuf::from(r"C:\Program Files\marmel\marmel-dev.exe"),
+    };
+    for (given, expected) in [
+        (r"\\?\C:\work\proj", r"C:\work\proj"),
+        (r"\\?\C:\work\proj with space", r"C:\work\proj with space"),
+        (r"\\?\UNC\srv\share\p", r"\\srv\share\p"),
+        (r"\\?\c:\work", r"c:\work"),
+        (r"C:\work\proj", r"C:\work\proj"),
+        ("/tmp/work", "/tmp/work"),
+    ] {
+        let (_, args) = windows_sandbox_command_argv(
+            &decision,
+            "cargo test",
+            Path::new(given),
+            Some(TEST_COMSPEC),
+        )
+        .expect("an Apply decision builds the re-entry argv");
+        assert_eq!(args.len(), 3, "three slots: {args:?}");
+        assert_eq!(
+            args[1], expected,
+            "the cwd slot must be the de-verbatimised directory for {given:?}"
+        );
+        assert!(
+            !args[1].starts_with(r"\\?"),
+            "a verbatim cwd in argv is what `cmd.exe` refuses, got {:?}",
+            args[1]
+        );
+    }
+}
+
+/// A `Skip` decision never emits the sentinel: it runs the plain [`windows_shell_argv`] form
+/// (the interactive-shell spelling of R1 included), so a skipped command is confined by
+/// nothing but is still the command the platform requires — and it is warned about by
+/// [`log_sandbox_decision`] at the call site.
+#[test]
+fn test_windows_skip_decision_never_emits_the_reentry_sentinel() {
+    let exe = Path::new(r"C:\Program Files\marmel\marmel-dev.exe");
+    let skips = [
+        should_apply_sandbox(&SandboxInputs {
+            opt_out: OptOut::Explicit {
+                setting: "marmel.toml: sandbox_disabled = true".to_string(),
+            },
+            ..production_inputs(exe)
+        }),
+        should_apply_sandbox(&SandboxInputs {
+            test_harness_exe: true,
+            ..production_inputs(exe)
+        }),
+        should_apply_sandbox(&SandboxInputs {
+            backend_supported: false,
+            ..production_inputs(exe)
+        }),
+    ];
+    for decision in &skips {
+        assert!(
+            matches!(decision, SandboxDecision::Skip { .. }),
+            "these three legs are the skip cases, got {decision:?}"
+        );
+        for payload in ["cargo test", "cmd", "powershell"] {
+            let (program, args) = windows_sandbox_command_argv(
+                decision,
+                payload,
+                Path::new(r"C:\work"),
+                Some(TEST_COMSPEC),
+            )
+            .expect("a skip decision still produces a spawnable argv");
+            let expected = windows_shell_argv(payload, Some(TEST_COMSPEC));
+            assert_eq!(
+                (program.clone(), args.clone()),
+                expected,
+                "a Windows skip must run exactly the plain shell argv, not a modified one"
+            );
+            assert!(
+                !args.iter().any(|arg| arg == SANDBOX_EXEC_ARG)
+                    && !program.contains(SANDBOX_EXEC_ARG),
+                "a skipped argv must never carry the re-entry sentinel: {args:?}"
+            );
+        }
+    }
+}
+
+/// Both Windows builders refuse to run a required command unsandboxed when the executable
+/// path is unavailable: the same fail-closed message as on unix, naming the sentinel and the
+/// explicit opt-out.
+#[test]
+fn test_windows_unresolved_exe_fails_closed_in_both_windows_builders() {
+    let inputs = SandboxInputs {
+        backend_supported: true,
+        test_harness_exe: false,
+        resolved_exe: None,
+        opt_out: OptOut::None,
+    };
+    let decision = should_apply_sandbox(&inputs);
+    assert_eq!(decision, SandboxDecision::UnresolvedExe);
+
+    let decision = should_apply_sandbox(&inputs);
+    assert_eq!(decision, SandboxDecision::UnresolvedExe);
+
+    let mut refusals = Vec::new();
+    let err = windows_sandbox_command_argv(
+        &decision,
+        "echo hi",
+        Path::new(r"C:\work"),
+        Some(TEST_COMSPEC),
+    )
+    .err();
+    refusals.push(
+        err.expect("an unresolved exe must refuse to build the PTY re-entry argv")
+            .to_string(),
+    );
+    refusals.push(
+        windows_oneshot_sandbox_argv(
+            &decision,
+            "echo hi",
+            Path::new(r"C:\work"),
+            Some(TEST_COMSPEC),
+        )
+        .expect_err("an unresolved exe must refuse to build the one-shot argv")
+        .to_string(),
+    );
+    for text in refusals {
+        assert!(
+            text.contains(SANDBOX_EXEC_ARG) && text.contains(SANDBOX_OPTOUT_ENV),
+            "the refusal must explain both the requirement and the opt-out, got {text}"
+        );
+    }
+}
+
+/// The one-shot form gets the same re-entry, and keeps its own hazard guard: a payload-less
+/// interactive shell is refused for **every** decision, because the re-entry child hands the
+/// payload to `%COMSPEC% /C` just the same and a bare shell would sit at its prompt until the
+/// timeout killed it.
+#[test]
+fn test_windows_oneshot_sandbox_argv_confines_and_still_refuses_a_bare_shell() {
+    let exe = Path::new(r"C:\Program Files\marmel\marmel-dev.exe");
+    let apply = should_apply_sandbox(&production_inputs(exe));
+
+    // Apply: the one-shot command is confined by the re-entry child.
+    let (program, args) = windows_oneshot_sandbox_argv(
+        &apply,
+        "cargo test",
+        Path::new(r"\\?\C:\work\proj"),
+        Some(TEST_COMSPEC),
+    )
+    .expect("a one-shot Apply decision builds the re-entry argv");
+    assert_eq!(program, exe.to_string_lossy());
+    assert_eq!(args.len(), 3, "three slots: {args:?}");
+    assert_eq!(args[0], SANDBOX_EXEC_ARG);
+    assert_eq!(args[1], r"C:\work\proj");
+    assert_eq!(args[2], "cargo test");
+    // No `/C` slot: the confined launch inside the re-entry child adds that itself.
+    assert!(
+        !args.contains(&"/C".to_string()),
+        "the payload is handed over as one slot, got {args:?}"
+    );
+
+    // Skip: the plain one-shot argv, byte for byte as before.
+    let skip = should_apply_sandbox(&SandboxInputs {
+        opt_out: OptOut::Explicit {
+            setting: "MARMEL_DISABLE_SANDBOX".to_string(),
+        },
+        ..production_inputs(exe)
+    });
+    let (program, args) =
+        windows_oneshot_sandbox_argv(&skip, "dir", Path::new(r"C:\work"), Some(TEST_COMSPEC))
+            .expect("a skip decision produces the plain argv");
+    assert_eq!(
+        (program, args),
+        (
+            TEST_COMSPEC.to_string(),
+            vec!["/C".to_string(), "dir".to_string()]
+        ),
+        "a skipped one-shot run is the plain shell command"
+    );
+
+    // The interactive-shell refusal survives both decisions.
+    for decision in [
+        SandboxDecision::Apply {
+            resolved_exe: exe.to_path_buf(),
+        },
+        SandboxDecision::Skip {
+            resolved_exe: Some(exe.to_path_buf()),
+            skip: SandboxSkip::TestHarnessExe,
+        },
+    ] {
+        for shell in ["cmd", "CMD.EXE", "powershell"] {
+            let err = windows_oneshot_sandbox_argv(
+                &decision,
+                shell,
+                Path::new(r"C:\work"),
+                Some(TEST_COMSPEC),
+            )
+            .expect_err("`{shell:?}` is an interactive shell request, not a command");
+            assert!(
+                err.contains("interactive shell"),
+                "the refusal must say why a bare shell cannot be one-shot, got {err}"
+            );
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

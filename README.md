@@ -51,7 +51,7 @@ Marmel is built for autonomous, multi-step software development with continuous 
 - **Real-Time Steering & Live Dialogue:** You can type into the prompt at any point. Active subagents pause to answer questions, explain reasoning, incorporate feedback, or adjust the plan on the fly.
 - **Isolated Per-Task Git Worktrees:** Subagents work in isolated git worktrees (`.worktrees/<task_id>`) on dedicated task branches, commit their changes as `"Marmel Coder"`, and merge back cleanly to avoid file conflicts.
 - **Offline Reference Search (MCP):** Connect external tool servers via Model Context Protocol (stdio or SSE), including the bundled `zim-search` engine for lightning-fast offline querying of multi-gigabyte Kiwix/ZIM dumps (such as Wikipedia or Stack Overflow).
-- **Workspace Sandboxing:** File operations are strictly confined to the workspace. Terminal commands are isolated by a platform sandbox — Linux Landlock LSM on Linux, a Seatbelt (SBPL) profile enforced by Marmel itself on macOS — to protect sensitive directories like `~/.ssh` and `~/.gnupg`.
+- **Workspace Sandboxing:** File operations are strictly confined to the workspace. Terminal commands are isolated by a platform sandbox — Linux Landlock LSM on Linux, a Seatbelt (SBPL) profile enforced by Marmel itself on macOS, a Windows AppContainer on Windows — to protect sensitive directories like `~/.ssh` and `~/.gnupg`.
 
 ```text
                            ┌───────────────────────────┐
@@ -145,7 +145,7 @@ For a solo developer, rigorously testing an autonomous coding assistant across t
 
 - **Rust toolchain 1.98+** (edition 2024).
 - An **OpenAI-compatible LLM backend** reachable over HTTP (e.g. Ollama at `http://localhost:11434/v1`, vLLM, or OpenRouter).
-- **Platform support:** Marmel is developed primarily on **Linux** (which also provides kernel-enforced Landlock command sandboxing) and tested extensively on **macOS**, where the same command policy is enforced by a Seatbelt (SBPL) profile that Marmel applies itself in the sandbox re-entry child. **Windows** support is maintained on a best-effort basis.
+- **Platform support:** Marmel is developed primarily on **Linux** (which also provides kernel-enforced Landlock command sandboxing) and tested extensively on **macOS**, where the same command policy is enforced by a Seatbelt (SBPL) profile that Marmel applies itself in the sandbox re-entry child. **Windows** support is maintained on a best-effort basis, where the same policy is enforced by a Windows AppContainer that the command is launched inside.
 
 ### Installation & Build
 
@@ -225,7 +225,7 @@ Marmel loads the first configuration file found from this list (files are not me
 | `reasoning_effort` | _unset_ | Optional reasoning-effort hint forwarded to backend (`none`, `minimal`, `low`, `medium`, `high`). |
 | `preserve_thinking` | `true` | Retain thinking blocks in the session transcript. |
 | `command_timeout_secs` | `60` | Timeout in seconds for a single `run_command` invocation (clamped to `1..=300`). |
-| `sandbox_disabled` | `false` | Disable the command sandbox (`true` runs unsandboxed; Landlock on Linux, Seatbelt on macOS). |
+| `sandbox_disabled` | `false` | Disable the command sandbox (`true` runs unsandboxed; Landlock on Linux, Seatbelt on macOS, AppContainer on Windows). |
 | `sandbox_extra_readonly_paths` | `[]` | Additional absolute paths granted read+execute access in the sandbox. |
 | `enable_xml_rescue` | `true` | Attempt to parse pseudo-XML tool calls when a model emits malformed JSON. |
 | `ui_mode` | `"tui"` | Interface mode: `"tui"` (Ratatui) or `"raw"` (streaming stdout). Automatically degrades to raw if stdout is redirected. |
@@ -417,7 +417,7 @@ Raw mode streams structured, parseable event lines:
 Specialists execute shell commands via `run_command` (bounded by `command_timeout_secs`) or interactive PTY sessions (`pty_spawn`, `pty_write`, `pty_read`):
 
 - **Linux & macOS:** Commands execute inside `/bin/sh` with command sandboxing (Landlock on Linux, Seatbelt on macOS).
-- **Windows:** Commands execute via `%COMSPEC%` (`cmd.exe`).
+- **Windows:** Commands execute via `%COMSPEC%` (`cmd.exe`), sandboxed in a Windows AppContainer that the sandbox re-entry child launches the command inside.
 - Clean exit codes and command outputs are preserved even when timeouts or cancellations occur.
 
 ### Runtime Directory (`.marmel/`)
@@ -534,8 +534,8 @@ args = ["mcp", "--kiwix-dir", "/path/to/kiwix", "--index", "/path/to/index"]
 Marmel enforces layered security boundaries to protect your host system:
 
 1. **Path Confinement:** All file access tools (`read_file`, `write_file`, `replace`, etc.) strictly validate paths against the workspace boundary in-process on all platforms. Traversal attempts (`../../`) are blocked.
-2. **Process Sandboxing (Linux Landlock & macOS Seatbelt):** Terminal commands execute within an unprivileged kernel-enforced sandbox (Landlock LSM on Linux, Seatbelt/SBPL on macOS). Read/write access is restricted to the workspace, temporary directories (`/tmp`), and language caches (`~/.cargo`, `~/.cache`). Sensitive directories (`~/.ssh`, `~/.gnupg`) are strictly inaccessible. A host with no sandbox backend, or an enforcement failure, refuses the command rather than running it unsandboxed.
-3. **Windows:** Command-level process sandboxing is currently unsupported; file access tools remain strictly confined to the workspace via in-process path validation.
+2. **Process Sandboxing (Linux Landlock, macOS Seatbelt, Windows AppContainer):** Terminal commands execute within an unprivileged platform sandbox (Landlock LSM on Linux, Seatbelt/SBPL on macOS, a Windows AppContainer on Windows). Read/write access is restricted to the workspace, temporary directories (`/tmp`), and language caches (`~/.cargo`, `~/.cache`). Sensitive directories (`~/.ssh`, `~/.gnupg`) are strictly inaccessible. A host with no sandbox backend, or an enforcement failure, refuses the command rather than running it unsandboxed.
+3. **Windows:** The sandbox is a Windows AppContainer. An AppContainer identity is carried by a process only at creation, so the command sandbox is applied in a re-entry child: Marmel starts a second copy of itself, which prepares the AppContainer (its profile, and the grants on the workspace and toolchain directories) and launches the pending command **inside** it. The confined command therefore sees the workspace, the temporary directories and the configured toolchains, and no user profile directories. A refused attempt exits non-zero rather than running the command unsandboxed.
 
 ### Extra Sandbox Read-Only Paths (`sandbox_extra_readonly_paths`)
 

@@ -412,7 +412,11 @@ pub struct PtySession {
 
 /// argv sentinel understood by `src/main.rs`: re-executing the **same resolved
 /// binary** with it applies the backend this host has (Landlock on Linux, Seatbelt on
-/// macOS) in the child and then execs `sh -c <cmd>`.
+/// macOS, AppContainer on Windows) and then runs the pending command under it: on unix
+/// by `exec()`-ing `sh -c <cmd>` in this process, on Windows by launching the command
+/// **inside** the prepared AppContainer (an AppContainer identity is carried by a process
+/// at creation, so the re-entry child is the confinement site there — see
+/// `harness::sandbox_windows::run_in_appcontainer`).
 /// `main.rs` matches it through [`SANDBOX_EXEC_ARG`], so the two ends of the
 /// protocol cannot drift apart.
 pub const SANDBOX_EXEC_ARG: &str = "--internal-sandbox-exec";
@@ -451,7 +455,8 @@ pub enum OptOut {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxInputs<'a> {
     /// `true` when this platform has a sandbox backend at all: Landlock on Linux,
-    /// Seatbelt on macOS. Every production call site takes it from
+    /// Seatbelt on macOS, AppContainer on Windows. Every production call site takes it
+    /// from
     /// [`crate::harness::sandbox::backend_supports_current_platform`], never from a
     /// `target_os` test of its own, so a backend that exists cannot be gated out twice.
     pub backend_supported: bool,
@@ -469,8 +474,9 @@ pub struct SandboxInputs<'a> {
 pub enum SandboxSkip {
     /// The operator opted out explicitly (attributable via `setting`).
     OptOut { setting: String },
-    /// This platform has no sandbox backend (Windows, the BSDs, …): not a choice, but
-    /// it must still be visible. macOS and Linux both have one, so they never skip here.
+    /// This platform has no sandbox backend (the BSDs, and anything that is not Linux,
+    /// macOS or Windows): not a choice, but it must still be visible. Linux, macOS and
+    /// Windows each have one (Landlock, Seatbelt, AppContainer), so they never skip here.
     UnsupportedPlatform,
     /// Running inside a Cargo test-harness binary, which cannot re-enter.
     TestHarnessExe,
@@ -495,16 +501,18 @@ impl SandboxSkip {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxDecision {
     /// Apply the sandbox re-entry by exec-ing `resolved_exe` with
-    /// [`SANDBOX_EXEC_ARG`]: the child enforces Landlock on Linux and Seatbelt on macOS.
+    /// [`SANDBOX_EXEC_ARG`]: the child enforces the backend this host has (Landlock on
+    /// Linux, Seatbelt on macOS, AppContainer on Windows).
     Apply { resolved_exe: std::path::PathBuf },
-    /// Run the command through plain `sh -c` — **never silently**: always
-    /// accompanied by a `WARN` from [`log_sandbox_decision`].
+    /// Run the command through the plain shell of the platform — `sh -c` on unix,
+    /// `%COMSPEC% /C` on Windows — **never silently**: always accompanied by a `WARN`
+    /// from [`log_sandbox_decision`].
     Skip {
         resolved_exe: Option<std::path::PathBuf>,
         skip: SandboxSkip,
     },
     /// The sandbox is required here but the executable could not be resolved, so
-    /// the command must **hard-fail** instead of degrading to `sh -c`.
+    /// the command must **hard-fail** instead of degrading to the plain shell.
     UnresolvedExe,
 }
 
@@ -540,8 +548,8 @@ pub fn should_apply_sandbox(inputs: &SandboxInputs<'_>) -> SandboxDecision {
         };
     }
 
-    // 2. No sandbox backend on this platform (Landlock and Seatbelt are both absent, so
-    //    there is nothing for the re-entry child to apply).
+    // 2. No sandbox backend on this platform (Landlock, Seatbelt and AppContainer are all
+    //    absent, so there is nothing for the re-entry child to apply).
     if !inputs.backend_supported {
         return SandboxDecision::Skip {
             resolved_exe,
@@ -615,7 +623,7 @@ pub fn log_sandbox_decision(decision: &SandboxDecision) {
             tracing::info!(
                 resolved_exe = %&resolved_exe,
                 mode = decision.mode(),
-                "terminal commands are sandboxed via the re-entry child (Landlock on Linux, Seatbelt on macOS)"
+                "terminal commands are sandboxed via the re-entry child (Landlock on Linux, Seatbelt on macOS, AppContainer confinement on Windows)"
             );
         }
         SandboxDecision::Skip { skip, .. } => {
@@ -657,8 +665,8 @@ fn sandbox_decision_for_current_process() -> SandboxDecision {
 /// Pure, so the re-entry argv is unit-testable without a PTY.
 ///
 /// [`SandboxDecision::UnresolvedExe`] is a **hard error**: an unresolved exe never falls
-/// back to a plain `sh -c`, because that would run the command unsandboxed without saying
-/// so.
+/// back to a plain shell, because that would run the command unsandboxed without saying
+/// so. The message is shared with the Windows branch through [`unresolved_exe_error`].
 fn sandbox_command_argv(
     decision: &SandboxDecision,
     command: &str,
@@ -677,9 +685,55 @@ fn sandbox_command_argv(
             ],
         )),
         SandboxDecision::Skip { .. } => Ok(("sh".to_string(), vec!["-c".to_string(), wrapped])),
-        SandboxDecision::UnresolvedExe => Err(ToolError::Execution(anyhow::anyhow!(
-            "refusing to run `{command}` unsandboxed: the sandbox re-entry ({SANDBOX_EXEC_ARG}) needs a resolved executable path, but `current_exe()` is unavailable on this host. Run `marmel` from a resolvable path, or opt out explicitly with {SANDBOX_OPTOUT_ENV}=1."
-        ))),
+        SandboxDecision::UnresolvedExe => Err(unresolved_exe_error(command)),
+    }
+}
+
+/// The fail-closed answer of both spawn families when the sandbox is required but the
+/// executable could not be resolved: one message, so the unix and Windows branches cannot
+/// start spelling the requirement differently.
+fn unresolved_exe_error(command: &str) -> ToolError {
+    ToolError::Execution(anyhow::anyhow!(
+        "refusing to run `{command}` unsandboxed: the sandbox re-entry ({SANDBOX_EXEC_ARG}) needs a resolved executable path, but `current_exe()` is unavailable on this host. Run `marmel` from a resolvable path, or opt out explicitly with {SANDBOX_OPTOUT_ENV}=1."
+    ))
+}
+
+/// The Windows half of the re-entry argv: the same three slots as [`sandbox_command_argv`]
+/// (`[SANDBOX_EXEC_ARG, cwd, command]`), decided from its inputs only so every rule here is
+/// assertable with literal Windows inputs on a Linux host. The two Windows-specific
+/// differences are the ones that platform demands:
+///
+/// * **the cwd slot is de-verbatimised.** It is the string the re-entry child hands to the
+///   confined command as its current directory, and `cmd.exe` refuses a `\\?\`-verbatim cwd
+///   (it reads a leading `\\` as a UNC location and quietly runs elsewhere), so the prefix
+///   `canonicalize()` produces is stripped by [`windows_child_cwd`] before it reaches argv —
+///   the same sanitising [`build_sandboxed_command`] applies to the builder's own `cwd`.
+/// * **the command slot is the payload verbatim.** The `stty`/`ulimit` preamble of the unix
+///   wrapper is a pair of POSIX shell builtins with no `cmd.exe` equivalent, so it is not
+///   re-introduced here: rule R5 of [`windows_shell_argv`] survives the re-entry, and the
+///   confined launch passes the payload to `%COMSPEC% /C` byte for byte.
+///
+/// A `Skip` decision never carries [`SANDBOX_EXEC_ARG`]: it runs the plain
+/// [`windows_shell_argv`] argv instead (R1-R5, i.e. the interactive-shell form too), and is
+/// warned about by [`log_sandbox_decision`] at the call site. [`SandboxDecision::UnresolvedExe`]
+/// hard-fails exactly as on unix.
+fn windows_sandbox_command_argv(
+    decision: &SandboxDecision,
+    command: &str,
+    cwd: &std::path::Path,
+    comspec: Option<&str>,
+) -> Result<(String, Vec<String>), ToolError> {
+    match decision {
+        SandboxDecision::Apply { resolved_exe } => Ok((
+            resolved_exe.to_string_lossy().into_owned(),
+            vec![
+                SANDBOX_EXEC_ARG.to_string(),
+                windows_child_cwd(cwd).to_string_lossy().into_owned(),
+                command.to_string(),
+            ],
+        )),
+        SandboxDecision::Skip { .. } => Ok(windows_shell_argv(command, comspec)),
+        SandboxDecision::UnresolvedExe => Err(unresolved_exe_error(command)),
     }
 }
 
@@ -694,7 +748,10 @@ fn sandbox_command_argv(
 ///
 /// This is the **only** source of that value: the config list decides what the sandbox
 /// trusts, and [`wire_extra_readonly_paths_env`] makes sure nothing else can reach the
-/// child under the same name.
+/// child under the same name. The encoding itself — in particular the entry separator,
+/// which cannot be the same on every platform this sandbox runs on — is decided by
+/// [`crate::harness::sandbox::extra_readonly_paths_to_env`]; both ends of the channel read
+/// that one definition, so the publisher here never spells the separator itself.
 fn extra_readonly_paths_env_value() -> Option<String> {
     crate::config::get_active().and_then(|cfg| {
         crate::harness::sandbox::extra_readonly_paths_to_env(&cfg.sandbox_extra_readonly_paths)
@@ -884,11 +941,16 @@ pub(crate) fn windows_child_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
 /// Build the shell command for one `run_command`/PTY execution.
 ///
 /// The sandbox is applied through [`SANDBOX_EXEC_ARG`] re-entry decided by [`should_apply_sandbox`] —
-/// from the resolved exe path, the backend the host has (Landlock on Linux, Seatbelt on macOS) and an
-/// explicit opt-out, **never** from the executable's name.
-/// `Err` is returned when the sandbox is required but cannot be applied (fail-closed). On Windows there
-/// is no backend at all: the skip is logged and the command is built by [`windows_shell_argv`] in the
-/// [`windows_child_cwd`]-sanitised directory (see both for the rule set).
+/// from the resolved exe path, the backend the host has (Landlock on Linux, Seatbelt on macOS,
+/// AppContainer on Windows) and an explicit opt-out, **never** from the executable's name.
+/// `Err` is returned when the sandbox is required but cannot be applied (fail-closed).
+///
+/// Both spawn families go through the very same decision object. On Windows an `Apply`
+/// decision produces the re-entry invocation built by [`windows_sandbox_command_argv`]
+/// (resolved exe, sentinel, de-verbatimised cwd, payload verbatim), and only a `Skip`
+/// decision runs the plain [`windows_shell_argv`] argv — never silently, because
+/// [`log_sandbox_decision`] warns about every skip. In both cases the current directory
+/// handed to the child is the [`windows_child_cwd`]-sanitised one.
 pub fn build_sandboxed_command(
     command: &str,
     cwd: &std::path::Path,
@@ -911,25 +973,27 @@ pub fn build_sandboxed_command(
         return Ok(cmd);
     }
 
-    // Windows has no sandbox backend at all, so the skip is never silent.
-    tracing::warn!(
-        resolved_exe = %resolved_exe_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<unresolved>".to_string()),
-        mode = "unsandboxed",
-        reason = "platform has no sandbox backend",
-        "pty sandbox SKIPPED: Windows has no sandbox backend, this command runs unsandboxed"
-    );
+    // Windows has an AppContainer backend, so this branch consults the very same decision
+    // object the unix branch uses: `Apply` re-enters through the sentinel, and only a `Skip`
+    // runs the plain `%COMSPEC% /C` command. A skip is never silent — [`log_sandbox_decision`]
+    // has already warned about it, with the reason that actually applies on this host.
+    let decision = sandbox_decision_for_current_process();
     // The program token is decided here and never left as a bare `cmd`: portable-pty
     // resolves argv[0] through PATH+PATHEXT but passes the result to `CreateProcessW` as
-    // `lpApplicationName`, which does not append `.exe`.
+    // `lpApplicationName`, which does not append `.exe`. For a re-entry the token is the
+    // resolved exe, so this only decides the program of the skip branch.
     let comspec = std::env::var("COMSPEC").ok();
-    let (program, args) = windows_shell_argv(command, comspec.as_deref());
+    let (program, args) =
+        windows_sandbox_command_argv(&decision, command, cwd, comspec.as_deref())?;
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
+    // The extras channel is decision-scoped on Windows exactly as on unix: published only
+    // for the re-entry child that reads it, cleared for everything else.
+    wire_extra_readonly_paths_env(&mut cmd, &decision, extra_readonly_paths_env_value());
     // `cmd.exe` treats a `\\`-prefixed path as UNC and refuses it as its current
     // directory, so the canonicalised (verbatim) workspace root is de-verbatimised before
-    // it reaches `CreateProcessW`.
+    // it reaches `CreateProcessW`. The cwd slot of the re-entry argv gets the same
+    // sanitising treatment, for the same reason.
     cmd.cwd(windows_child_cwd(cwd));
     Ok(cmd)
 }
@@ -1139,6 +1203,34 @@ pub(crate) fn windows_oneshot_argv(
     Ok((program, args))
 }
 
+/// The argv of a one-shot Windows spawn, with the sandbox decision folded in — decided from
+/// its inputs only, so it is assertable on a Linux host with literal Windows inputs.
+///
+/// The interactive-shell refusal of [`windows_oneshot_argv`] is applied **first**, and to
+/// every decision: a one-shot `run_command` has no terminal, and the re-entry child hands
+/// the payload to `%COMSPEC% /C` just the same, so a payload-less shell request would sit at
+/// its prompt until the timeout killed it whether or not it is confined. Then:
+///
+/// * `Apply` → the three re-entry slots of [`windows_sandbox_command_argv`], so the one-shot
+///   command runs inside the AppContainer the re-entry child prepares;
+/// * `Skip` → the plain [`windows_oneshot_argv`] argv, byte for byte as before;
+/// * `UnresolvedExe` → the shared fail-closed message, reported as the same kind of refusal.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_oneshot_sandbox_argv(
+    decision: &SandboxDecision,
+    command: &str,
+    cwd: &std::path::Path,
+    comspec: Option<&str>,
+) -> Result<(String, Vec<String>), String> {
+    let plain = windows_oneshot_argv(command, comspec)?;
+    if matches!(decision, SandboxDecision::Skip { .. }) {
+        return Ok(plain);
+    }
+    // `Apply` builds the re-entry triple; `UnresolvedExe` contributes the fail-closed
+    // message, which reaches the caller as a one-shot refusal either way.
+    windows_sandbox_command_argv(decision, command, cwd, comspec).map_err(|err| err.to_string())
+}
+
 /// What one iteration of the one-shot poll loop decides.
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1322,18 +1414,26 @@ fn run_command_windows_oneshot(command: &str, timeout: Duration) -> Result<Strin
 
     let cwd = windows_child_cwd(&crate::harness::get_workspace_root());
     let comspec = std::env::var("COMSPEC").ok();
-    let (program, args) = windows_oneshot_argv(command, comspec.as_deref()).map_err(|detail| {
-        ToolError::BadArguments {
-            tool: TOOL_RUN_COMMAND.into(),
-            detail,
-        }
-    })?;
+    // The same decision object the PTY path consults: this path is sandboxed by re-entering
+    // this program with the sentinel, exactly like a PTY spawn, so `run_command` on Windows
+    // is confined too instead of running in the clear. `windows_oneshot_sandbox_argv` keeps
+    // the interactive-shell refusal for every decision, and a `Skip` returns the plain argv.
+    let decision = sandbox_decision_for_current_process();
+    let confined = matches!(decision, SandboxDecision::Apply { .. });
+    let (program, args) =
+        windows_oneshot_sandbox_argv(&decision, command, &cwd, comspec.as_deref()).map_err(
+            |detail| ToolError::BadArguments {
+                tool: TOOL_RUN_COMMAND.into(),
+                detail,
+            },
+        )?;
 
     // One line, so the next Windows report is diagnosable from the log alone.
     tracing::debug!(
         platform = std::env::consts::OS,
         shell = %program,
         cwd = %cwd.display(),
+        mode = decision.mode(),
         command = %crate::text_util::truncate_chars(command, ONESHOT_LOG_COMMAND_CHARS),
         "run_command one-shot spawn (std::process::Command, no ConPTY)"
     );
@@ -1343,10 +1443,35 @@ fn run_command_windows_oneshot(command: &str, timeout: Duration) -> Result<Strin
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // `raw_arg` for both `/C` and the payload: the argument reaches the child as written,
-    // which is the whole point of not going through `args()`.
-    for arg in &args {
-        cmd.raw_arg(arg);
+    // The extras channel is decision-scoped here too, and this builder starts from the
+    // **inherited** environment (plain `std::process::Command`), so an ambient value would
+    // otherwise reach the re-entry child and widen its ruleset without the config saying so.
+    match &decision {
+        SandboxDecision::Apply { .. } => {
+            if let Some(paths) = extra_readonly_paths_env_value() {
+                cmd.env(crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV, paths);
+            } else {
+                cmd.env_remove(crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV);
+            }
+        }
+        SandboxDecision::Skip { .. } | SandboxDecision::UnresolvedExe => {
+            cmd.env_remove(crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV);
+        }
+    }
+    // `raw_arg` for the plain shell argv (`/C` plus the payload): the argument reaches
+    // `cmd.exe` as written, which is the whole point of not going through `args()`.
+    //
+    // For the re-entry triple that is the wrong encoding: argv is then re-parsed by the
+    // child's C runtime into three slots, and a cwd containing a space (a normal thing under
+    // `C:\Program Files\...`) must survive as **one** slot. `args()` applies exactly that
+    // MSVCRT quoting, and the payload slot round-trips through it unchanged, so the confined
+    // launch inside the re-entry child still gets the payload byte for byte.
+    if confined {
+        cmd.args(&args);
+    } else {
+        for arg in &args {
+            cmd.raw_arg(arg);
+        }
     }
     let mut child = cmd.spawn().map_err(|err| {
         // A spawn failure is a real error, never a notice string: name the shell, the

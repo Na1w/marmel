@@ -257,19 +257,52 @@ pub fn opt_out_from_value(raw: Option<&str>) -> crate::harness::pty::OptOut {
 /// The environment channel carrying the operator's extra read-only sandbox paths
 /// from the spawning process to the re-entry child, which never loads a config file.
 ///
-/// The value is the configured list joined by `SANDBOX_EXTRA_RO_PATHS_SEP` in the
-/// configured order, published by `crate::harness::pty::build_sandboxed_command` and
-/// read back by [`extra_readonly_paths_from_env`]. Unset or empty means "no
-/// additions", so a run without the key sees no variable at all. The argv contract is
-/// deliberately untouched: it stays the sentinel, the cwd and the wrapped command,
-/// because a new slot would change the arity both ends of the protocol depend on.
-/// Note the separator limitation: a configured path that itself contains `:` cannot
-/// be transported intact — it arrives split into two entries.
+/// The value is the configured list joined by the separator of this platform's encoding
+/// ([`extra_readonly_paths_sep_in_family`]) in the configured order, published by
+/// `crate::harness::pty::build_sandboxed_command` and read back by
+/// [`extra_readonly_paths_from_env`]. Unset or empty means "no additions", so a run without
+/// the key sees no variable at all. The argv contract is deliberately untouched: it stays the
+/// sentinel, the cwd and the wrapped command, because a new slot would change the arity both
+/// ends of the protocol depend on.
+///
+/// The separator is a platform decision, not a free choice (see
+/// [`SANDBOX_EXTRA_RO_PATHS_SEP`] and [`SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS`] for why a
+/// Windows list cannot be joined with `:` at all), and the publisher and the reader both take
+/// it from the one definition below, so the two ends cannot disagree about it.
 pub const SANDBOX_EXTRA_RO_PATHS_ENV: &str = "MARMEL_SANDBOX_EXTRA_RO_PATHS";
 
-/// Separator between the entries of [`SANDBOX_EXTRA_RO_PATHS_ENV`]: the same one
-/// `PATH` uses on every platform this sandbox runs on.
+/// Separator between the entries of [`SANDBOX_EXTRA_RO_PATHS_ENV`] in the **unix** encoding:
+/// the same one `PATH` uses, unchanged from the first version of this channel, because a unix
+/// path cannot contain a `:`, so a `:`-joined unix list is unambiguous.
+///
+/// On Windows the same character is part of every absolute path (`C:\Users\x\.cargo`), so
+/// joining a Windows list with `:` splits *inside* the drive letter and the re-entry child is
+/// handed `C` and `\Users\x\.cargo` as two entries — a ruleset derived from a path nobody
+/// configured. [`SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS`] is the Windows answer.
 const SANDBOX_EXTRA_RO_PATHS_SEP: &str = ":";
+
+/// The entry separator of the **Windows** encoding: a line feed. It has to be a character
+/// that cannot occur in a Windows path, and the Win32 file namespace rejects the control
+/// characters below `0x20` (LF included) in a name — so LF never appears in one. Neither end
+/// of this channel hands the value to a shell that could rewrite it either: the builder and
+/// `std::env::var` pass it over verbatim.
+const SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS: &str = "\n";
+
+/// The entry separator of one spawn family, as a **value** — the [`SpawnFamily`]
+/// value-dispatch idiom of `pty.rs`: it lets the pure halves below encode and decode the
+/// **Windows** form on a Linux host with literal `C:\…` inputs, instead of hiding the
+/// difference behind a `#[cfg(windows)]` body that CI only ever compiles.
+///
+/// [`SpawnFamily`]: crate::harness::pty::SpawnFamily
+#[must_use]
+pub(crate) const fn extra_readonly_paths_sep_in_family(
+    family: crate::harness::pty::SpawnFamily,
+) -> &'static str {
+    match family {
+        crate::harness::pty::SpawnFamily::Unix => SANDBOX_EXTRA_RO_PATHS_SEP,
+        crate::harness::pty::SpawnFamily::Windows => SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS,
+    }
+}
 
 /// The extra read-only paths published by the spawning process, read from the
 /// environment. Call sites must use this instead of re-reading the variable.
@@ -278,14 +311,26 @@ pub fn extra_readonly_paths_from_env() -> Vec<String> {
     extra_readonly_paths_from_value(std::env::var(SANDBOX_EXTRA_RO_PATHS_ENV).ok().as_deref())
 }
 
-/// Pure half of [`extra_readonly_paths_from_env`]: split on
-/// `SANDBOX_EXTRA_RO_PATHS_SEP`, trim each entry and drop the empty ones, keeping
-/// the configured order. Unset, empty or a value made only of separators and blanks
-/// yields no paths at all.
+/// Pure half of [`extra_readonly_paths_from_env`]: split on the separator of the platform
+/// doing the reading ([`SANDBOX_EXTRA_RO_PATHS_SEP`] for unix,
+/// [`SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS`] for Windows), trim each entry and drop the empty
+/// ones, keeping the configured order. Unset, empty or a value made only of separators and
+/// blanks yields no paths at all.
 #[must_use]
 pub fn extra_readonly_paths_from_value(raw: Option<&str>) -> Vec<String> {
+    extra_readonly_paths_from_value_in_family(raw, crate::harness::pty::SpawnFamily::current())
+}
+
+/// Family-pinned half of [`extra_readonly_paths_from_value`]: decode `raw` with the
+/// separator of `family`, so the Windows encoding (`C:\Users\x\.cargo` + LF + `D:\tools`)
+/// round-trips on any host.
+#[must_use]
+pub(crate) fn extra_readonly_paths_from_value_in_family(
+    raw: Option<&str>,
+    family: crate::harness::pty::SpawnFamily,
+) -> Vec<String> {
     raw.unwrap_or_default()
-        .split(SANDBOX_EXTRA_RO_PATHS_SEP)
+        .split(extra_readonly_paths_sep_in_family(family))
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(str::to_string)
@@ -296,14 +341,36 @@ pub fn extra_readonly_paths_from_value(raw: Option<&str>) -> Vec<String> {
 /// the value to publish for `paths`, trimmed and with empty entries dropped, or `None`
 /// when there is nothing to publish — the common case, in which the variable must stay
 /// unset so the child behaves exactly as it did before this channel existed.
+///
+/// The separator is the one this platform's encoding needs, taken from
+/// [`extra_readonly_paths_sep_in_family`] — the same definition
+/// [`extra_readonly_paths_from_value`] splits on, so the two ends of the channel cannot
+/// disagree about it.
 #[must_use]
 pub fn extra_readonly_paths_to_env(paths: &[String]) -> Option<String> {
+    extra_readonly_paths_to_env_in_family(paths, crate::harness::pty::SpawnFamily::current())
+}
+
+/// Family-pinned half of [`extra_readonly_paths_to_env`]: encode `paths` with the separator
+/// of `family`, so the Windows form (LF between `C:\Users\x\.cargo` and `D:\tools`) is
+/// produced and asserted on any host.
+#[must_use]
+pub(crate) fn extra_readonly_paths_to_env_in_family(
+    paths: &[String],
+    family: crate::harness::pty::SpawnFamily,
+) -> Option<String> {
+    render_entries(paths, extra_readonly_paths_sep_in_family(family))
+}
+
+/// The shared body of both publish halves: trim each entry, drop the empty ones and join
+/// with `sep`. `None` when nothing is left to publish.
+fn render_entries(paths: &[String], sep: &str) -> Option<String> {
     let joined = paths
         .iter()
         .map(|path| path.trim())
         .filter(|path| !path.is_empty())
         .collect::<Vec<&str>>()
-        .join(SANDBOX_EXTRA_RO_PATHS_SEP);
+        .join(sep);
     (!joined.is_empty()).then_some(joined)
 }
 
@@ -659,7 +726,8 @@ pub fn refusal_message(reason: &str) -> String {
 pub fn optout_warning(setting: &str) -> String {
     format!(
         "warning: sandbox DISABLED by {setting}: this command runs WITHOUT the sandbox backend \
-         this platform would otherwise use (Landlock on Linux, Seatbelt on macOS)."
+         this platform would otherwise use (Landlock on Linux, Seatbelt on macOS, the \
+         AppContainer on Windows)."
     )
 }
 
@@ -1292,6 +1360,110 @@ mod tests {
             extra_readonly_paths_from_value(Some(&encoded)),
             paths,
             "the value must parse back to exactly the list that produced it"
+        );
+    }
+
+    /// The Windows encoding, family-pinned so it is assertable on a Linux host. A Windows
+    /// path contains a `:` in every absolute path (`C:\Users\x`), so the separator unix paths
+    /// use would split a Windows list *inside* the drive letter and hand the re-entry child a
+    /// ruleset nobody configured. A line feed cannot occur in a Win32 path name (the namespace
+    /// rejects the control characters below `0x20`), so it is the separator that keeps a list
+    /// of `C:\…` entries unambiguous — and the unix encoding is untouched, so every unix test
+    /// above stays valid.
+    #[test]
+    fn test_extra_readonly_paths_windows_encoding_round_trips_drive_letter_paths() {
+        use crate::harness::pty::SpawnFamily;
+
+        // The separators are genuinely different per family, and each end takes them from the
+        // one definition.
+        assert_eq!(extra_readonly_paths_sep_in_family(SpawnFamily::Unix), ":");
+        assert_eq!(
+            extra_readonly_paths_sep_in_family(SpawnFamily::Windows),
+            "\n",
+            "a Windows path cannot contain a LF, so it cannot collide with the separator"
+        );
+
+        let paths = vec![r"C:\Users\x\.cargo".to_string(), r"D:\tools".to_string()];
+        let encoded = extra_readonly_paths_to_env_in_family(&paths, SpawnFamily::Windows)
+            .expect("a non-empty list is published");
+        assert_eq!(
+            encoded,
+            format!("{}\n{}", r"C:\Users\x\.cargo", r"D:\tools"),
+            "the Windows value joins with a LF, never with a colon"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(&encoded), SpawnFamily::Windows),
+            paths,
+            "the Windows value must parse back to exactly the two paths that produced it"
+        );
+
+        // The same value decoded with the *unix* separator is the bug this fixes: the drive
+        // letter becomes its own entry, and the LF survives inside the next one. Asserted so
+        // the ambiguity is documented, not guessed.
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(&encoded), SpawnFamily::Unix),
+            vec![
+                "C".to_string(),
+                "\\Users\\x\\.cargo\nD".to_string(),
+                r"\tools".to_string()
+            ],
+            "a colon-split Windows list breaks inside the drive letter — which is why the \
+             reader takes the separator of the family that encoded it"
+        );
+
+        // The unix family keeps its historical separator, and round-trips a unix list.
+        let unix_paths = vec!["/nix/store".to_string(), "/gnu/store".to_string()];
+        let unix_encoded = extra_readonly_paths_to_env_in_family(&unix_paths, SpawnFamily::Unix)
+            .expect("published");
+        assert_eq!(unix_encoded, "/nix/store:/gnu/store");
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(&unix_encoded), SpawnFamily::Unix),
+            unix_paths
+        );
+
+        // Each family's two halves agree, whichever separator that family uses, and the
+        // entries are the paths that family's platform actually has: a Windows list
+        // round-trips on any host through the Windows encoding, a unix list through the unix
+        // encoding.
+        for (family, list) in [
+            (
+                SpawnFamily::Unix,
+                vec!["/nix/store".to_string(), "/gnu/store".to_string()],
+            ),
+            (
+                SpawnFamily::Windows,
+                vec![r"C:\Users\x\.cargo".to_string(), r"D:\tools".to_string()],
+            ),
+        ] {
+            let encoded =
+                extra_readonly_paths_to_env_in_family(&list, family).expect("a list is published");
+            assert_eq!(
+                extra_readonly_paths_from_value_in_family(Some(&encoded), family),
+                list,
+                "the two halves of one family round-trip with that family's separator"
+            );
+        }
+
+        // The two production halves take the separator from the same one definition, so a
+        // spawn side and a re-entry child of the same build cannot disagree about it. The
+        // entries are the ones this build's own family can express.
+        let built = SpawnFamily::current();
+        let list = if built == SpawnFamily::Windows {
+            vec![r"C:\Users\x\.cargo".to_string(), r"D:\tools".to_string()]
+        } else {
+            vec!["/nix/store".to_string(), "/gnu/store".to_string()]
+        };
+        let encoded = extra_readonly_paths_to_env(&list).expect("a list is published");
+        assert_eq!(
+            encoded,
+            extra_readonly_paths_to_env_in_family(&list, built).expect("published"),
+            "the production encoder is the encoder of the family this build was made for"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value(Some(&encoded)),
+            list,
+            "the production decoder splits with the separator the production encoder joined \
+             with: a build's own halves always agree"
         );
     }
 

@@ -2306,19 +2306,29 @@ pub fn attempt_windows_sandbox_with_setup(
     (SandboxAttempt::FullyEnforced, take_windows_policy_setup())
 }
 
-/// What one Windows sandbox attempt achieved, guards released.
+/// What one Windows sandbox attempt achieved, with the policy it built parked for the launch
+/// half rather than released.
 ///
 /// This is the judgement surface the dispatch (`sandbox::attempt_backend`) calls: it prepares the
-/// policy, checks it with the probe and reports. The setup it built is released here — which
-/// restores the DACLs and deletes the profile — because this surface owns no child to keep it alive
-/// for; the launch layer takes the same setup from [`attempt_windows_sandbox_with_setup`] instead.
+/// policy, checks it with the probe and reports. The [`WindowsPolicySetup`] it built is parked in
+/// the `PREPARED_SETUP` hand-off, because the confinement it judged is the confinement the pending
+/// command has to be launched inside: the ACEs and the profile must survive until that command has
+/// exited, which is what [`run_in_appcontainer`] does when it picks the setup up. A run that
+/// decides **not** to launch anything confined — a refusal, for instance — must release the parked
+/// setup itself with [`discard_windows_policy_setup`], or the AppContainer SID stays written into
+/// the DACLs of the workspace until exit.
 #[must_use]
 pub fn attempt_windows_sandbox(
     workspace_root: &Path,
     extra_readonly_paths: &[String],
 ) -> SandboxAttempt {
     let (attempt, setup) = attempt_windows_sandbox_with_setup(workspace_root, extra_readonly_paths);
-    drop(setup);
+    // Park what the judgement accepted for the launch half. Nothing is parked behind a failed
+    // attempt, which is the documented shape of the hand-off ("every failure comes back with
+    // `None`"), so a `Some` here is exactly the policy that was accepted.
+    if let Some(setup) = setup {
+        put_prepared_setup(setup);
+    }
     attempt
 }
 
@@ -2346,8 +2356,9 @@ fn attempt_error(attempt: SandboxAttempt) -> SandboxError {
 /// re-entry process inherits its AppContainer membership whether or not it was launched with the
 /// attribute list, so confining the command this way is what the re-entry's own confinement means.
 ///
-/// Not yet called in this crate: the re-entry plumbing (`main.rs`) is what references it, in the
-/// follow-up task that wires the re-entry command line to this layer.
+/// Called from the re-entry child in `main.rs` as the Windows launch half: the policy pass parks
+/// the setup, this call runs the pending command inside it, and the exit code it returns is the
+/// exit code of that child process.
 pub fn run_in_appcontainer(
     workspace_root: &Path,
     extra_readonly_paths: &[String],
@@ -2988,6 +2999,37 @@ mod tests {
             !discard_windows_policy_setup(),
             "the failed attempt must have left nothing parked"
         );
+    }
+
+    /// The judgement surface must park the setup it accepted rather than release it: the confined
+    /// launch has to happen inside that very policy, so the profile and the verified ACEs have to
+    /// survive the judgement. Dropping the setup here would leave [`run_in_appcontainer`] to
+    /// prepare a **second** AppContainer profile over the same objects while the first one's ACEs
+    /// are restored in the middle of the run — the hand-off is what makes it one policy.
+    ///
+    /// Exactly one answer is expected per verdict: a `FullyEnforced` judgement parked a setup, and
+    /// every other verdict parked nothing (a failed preparation cannot hand over what it never
+    /// built).
+    #[test]
+    fn test_the_judgement_surface_parks_its_setup_for_the_launch_layer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+
+        let attempt = attempt_windows_sandbox(&workspace, &[]);
+        let parked = take_windows_policy_setup().is_some();
+        assert_eq!(
+            parked,
+            matches!(attempt, SandboxAttempt::FullyEnforced),
+            "the policy the judgement accepted must reach the launch half, got {attempt:?} with \
+             parked={parked}"
+        );
+        assert!(
+            !discard_windows_policy_setup(),
+            "picking the setup up leaves nothing parked: one profile per run"
+        );
+        Ok(())
     }
 
     /// A confined command in a temporary workspace: what the composite entry point answers.
