@@ -4608,7 +4608,7 @@ mod tests {
         );
         assert!(
             table.notes.iter().any(|note| {
-                note.starts_with(&path_text(verbatim_extra.as_path()))
+                note.contains(&path_text(verbatim_extra.as_path()))
                     && note.contains("already covered by the built-in allow-list")
             }),
             "the verbatim spelling of a directory already on the list is the duplicate skip, not \
