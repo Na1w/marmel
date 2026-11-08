@@ -35,6 +35,7 @@ A terminal-driven autonomous coding assistant in Rust. Marmel connects to any Op
 - [Offline Reference Search (zim-search + kiwix MCP)](#offline-reference-search-zim-search--kiwix-mcp)
   - [Build, Index, Register](#build-index-register)
 - [Security & Sandboxing](#security--sandboxing)
+  - [Diagnosing Sandbox Refusals (Exit 73)](#diagnosing-sandbox-refusals-exit-73)
   - [Extra Sandbox Read-Only Paths (`sandbox_extra_readonly_paths`)](#extra-sandbox-read-only-paths-sandbox_extra_readonly_paths)
 - [Testing](#testing)
 - [License](#license)
@@ -538,6 +539,50 @@ Marmel enforces layered security boundaries to protect your host system:
 2. **Command Sandboxing (Linux Landlock, macOS Seatbelt, Windows AppContainer):** Terminal commands run inside an unprivileged platform sandbox — the Landlock LSM on Linux, a Seatbelt (SBPL) profile on macOS, a Windows AppContainer on Windows. The workspace root is read-write, temporary directories (`/tmp` and `/var/tmp` on Unix, `%TEMP%` and `%TMP%` on Windows) are read-write, system and toolchain directories are read-only, and build caches (`~/.cargo`, `~/.cache`, `~/.npm`) are writable on Linux and macOS. Sensitive directories (`~/.ssh`, `~/.gnupg`) are strictly inaccessible on every platform, and a write outside the workspace is refused rather than allowed. The network is not part of the sandbox: sandboxed commands still reach it, so `cargo`, `npm`, `pip` and `git` keep working.
 3. **Windows:** The sandbox is a Windows AppContainer. An AppContainer identity is carried by a process only at creation, so the command sandbox is applied in a re-entry child: Marmel starts a second copy of itself, which prepares a throwaway AppContainer for the run (its profile, and the grants on the workspace, temporary and toolchain directories) and launches the pending command **inside** it. The confined command therefore sees the workspace read-write, the temporary directories read-write and the toolchain directories (`CARGO_HOME`, `RUSTUP_HOME`, the Windows directory and the program-files directories) read-only, and nothing else. The user profile itself is never granted, so `%USERPROFILE%\.ssh` and `%USERPROFILE%\.gnupg` are never reachable.
 4. **Fail-Closed:** If confinement cannot be established — a host with no sandbox backend, or an enforcement failure — the command is not run at all and the run exits with code `73` rather than running it unconfined. The only legitimate way to run unsandboxed is an explicit opt-out (`sandbox_disabled = true` in `marmel.toml`, or `MARMEL_DISABLE_SANDBOX=1` in the environment), which also runs the command unconfined on Windows and is always warned about.
+
+### Diagnosing Sandbox Refusals (Exit 73)
+
+Exit `73` means the **sandbox** refused to run the command, not that the command itself failed. The
+refusal line carries its reason everywhere the operator can see it — in the `run_command` tool
+result and in the log file (`.marmel/marmel.log`, which both the parent process and the sandboxing
+child write to):
+
+```text
+error: sandbox refusal: refusing to run the command: the DACL of C:\work\proj could not be
+changed: SetNamedSecurityInfoW failed: Access is denied. (win32 code = 5)
+(step = sandbox attempt, class = rule-setup, exit code = 73, path = C:\work\proj).
+The sandbox is enabled by default on every platform that has a backend;
+set MARMEL_DISABLE_SANDBOX=1 to run it unsandboxed.
+```
+
+Every line names the step that failed (`sandbox attempt`: the confinement itself; `confined launch`:
+launching the real command inside a confinement that had been accepted), the failure class, the
+object it is about and, for a Windows ACL or launch failure, the Win32 error the failing call
+reported. A `run_command` result ends with a matching notice, and when a refusal happens the same
+records are written to the log with `step`, `kind`, `path` and `code` as structured fields.
+
+To read the reason for yourself, drive one re-entry leg by hand (the same invocation the Windows
+behaviour tests drive) and redirect the streams so nothing is lost:
+
+```powershell
+& .\target\release\marmel.exe --internal-sandbox-exec "$PWD" "echo SANDBOX-OK" > out.txt 2> err.txt; $LASTEXITCODE; Get-Content .\err.txt
+```
+
+`$LASTEXITCODE` is the refusal code (`73`), and `err.txt` holds the step, class, path and Win32 code
+of the failure. To confirm the sandbox is the only variable, re-run it with the documented escape
+hatch:
+
+```powershell
+$env:MARMEL_DISABLE_SANDBOX = "1"
+& .\target\release\marmel.exe --internal-sandbox-exec "$PWD" "echo OPT-OUT-OK"; $LASTEXITCODE
+```
+
+which must answer `0` and warns that the backend was skipped. The usual culprits on Windows, in the
+order they are worth checking: the ACL of the workspace root (`icacls "$PWD"` — the user must hold
+write/modify rights there, or the policy cannot grant the AppContainer its required grant), the token
+the process runs with (`whoami /groups` — an elevated, masked or restricted token cannot rewrite
+that DACL), and third-party enforcement (Defender / attack-surface-reduction / "Controlled folder
+access" terminating the confined probe process).
 
 ### Extra Sandbox Read-Only Paths (`sandbox_extra_readonly_paths`)
 
