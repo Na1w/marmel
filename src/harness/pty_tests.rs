@@ -1298,6 +1298,11 @@ fn test_sandbox_gate_reentry_argv_uses_the_resolved_exe() {
 /// need the env lock for no added rigour. `ACTIVE_CONFIG` **is** process-global, so the
 /// config legs run under the same serialization lock the config tests use, and the
 /// previously active config (including "none") is restored on the way out.
+///
+/// The published value is encoded with the separator of the spawn family — `:` for unix,
+/// a line feed for Windows, see
+/// [`crate::harness::sandbox::extra_readonly_paths_sep_in_family`] — so the expected value
+/// is spelled out per family instead of assuming one separator for every platform.
 #[test]
 fn test_sandbox_gate_extras_channel_follows_the_config_and_the_decision() {
     let key = crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV;
@@ -1333,16 +1338,45 @@ fn test_sandbox_gate_extras_channel_follows_the_config_and_the_decision() {
     );
 
     // 1. A configured list travels verbatim — trimmed, empty entries dropped — and it
-    //    overwrites whatever the parent's environment happened to carry.
+    //    overwrites whatever the parent's environment happened to carry. The joining
+    //    character between the entries is the separator of the spawn family this build was
+    //    made for (`extra_readonly_paths_sep_in_family`), so the expected value is spelled
+    //    out per family instead of being hard-coded to one separator.
     crate::config::set_active(with_paths(&[" /opt/toolchain-a ", "", "/opt/toolchain-b"]));
     let mut cmd = seeded();
     wire_extra_readonly_paths_env(&mut cmd, &reentry, extra_readonly_paths_env_value());
+    let expected = match SpawnFamily::current() {
+        SpawnFamily::Unix => "/opt/toolchain-a:/opt/toolchain-b",
+        SpawnFamily::Windows => "/opt/toolchain-a\n/opt/toolchain-b",
+    };
     assert_eq!(
         cmd.get_env(key)
             .map(|raw| raw.to_string_lossy().into_owned()),
-        Some("/opt/toolchain-a:/opt/toolchain-b".to_string()),
-        "the configured list must be the value the re-entry child sees"
+        Some(expected.to_string()),
+        "the configured list must be the value the re-entry child sees, joined with the \
+         separator this build's family encodes with"
     );
+
+    // 1b. Both spellings are pinned with literal values, whichever platform compiles this
+    //     file, so a change to either half of the channel shows up as a failing assertion
+    //     rather than as a changed encoder. The `paths` list is the one set above.
+    for (family, want) in [
+        (SpawnFamily::Unix, "/opt/toolchain-a:/opt/toolchain-b"),
+        (SpawnFamily::Windows, "/opt/toolchain-a\n/opt/toolchain-b"),
+    ] {
+        assert_eq!(
+            crate::harness::sandbox::extra_readonly_paths_to_env_in_family(
+                &["/opt/toolchain-a", "/opt/toolchain-b"]
+                    .iter()
+                    .map(|path| (*path).to_string())
+                    .collect::<Vec<String>>(),
+                family
+            )
+            .map(|raw| raw.to_string()),
+            Some(want.to_string()),
+            "the channel is joined with the separator of the family that publishes it"
+        );
+    }
 
     // 2. Key present but empty: the variable is REMOVED from the child environment, so
     //    the inherited value cannot widen the child's ruleset.

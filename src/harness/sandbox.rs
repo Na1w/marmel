@@ -1277,37 +1277,90 @@ mod tests {
     /// The extra read-only path list survives the environment channel unchanged:
     /// nothing in is nothing out, and separators, blanks and padding never invent an
     /// entry.
+    ///
+    /// Every leg below is pinned to one spawn family, because the separator — and with it
+    /// the question "which characters count as separator noise" — is a per-family decision
+    /// ([`extra_readonly_paths_sep_in_family`]). A leg that just calls the
+    /// current-family half is a leg that silently changes meaning when the file is
+    /// compiled for the other platform, which is exactly how the unix fixtures below once
+    /// failed on `windows-latest`.
     #[test]
     fn test_extra_readonly_paths_parsing_of_an_absent_or_empty_value_yields_nothing() {
+        use crate::harness::pty::SpawnFamily;
+
+        // The unix encoding: `:` joins entries, so a value made of separators, blanks or
+        // both carries no entry at all.
         for raw in [None, Some(""), Some("   "), Some(":"), Some(":: :")] {
             assert_eq!(
-                extra_readonly_paths_from_value(raw),
+                extra_readonly_paths_from_value_in_family(raw, SpawnFamily::Unix),
                 Vec::<String>::new(),
-                "{raw:?} must not produce a single path"
+                "{raw:?} must not produce a single path in the unix encoding"
             );
         }
+
+        // The Windows encoding: a line feed joins entries, so the same shapes stay empty
+        // there too, and the LF spellings that family publishes must be empty as well.
+        for raw in [None, Some(""), Some("   "), Some("\n"), Some("\n \n\n")] {
+            assert_eq!(
+                extra_readonly_paths_from_value_in_family(raw, SpawnFamily::Windows),
+                Vec::<String>::new(),
+                "{raw:?} must not produce a single path in the windows encoding"
+            );
+        }
+
+        // The separator of one family is ordinary path content in the other, which is why
+        // the decoding half must be told which family it is reading for rather than
+        // guessing: a lone `:` is the drive-letter prefix of a Windows entry, while a bare
+        // LF is padding in the unix encoding.
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(":"), SpawnFamily::Windows),
+            vec![":".to_string()],
+            "a colon is a Windows path character, not the Windows separator"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some("\n"), SpawnFamily::Unix),
+            Vec::<String>::new(),
+            "a bare line feed is padding once the separator is the unix one"
+        );
     }
 
     /// One entry, several entries, and the order the operator wrote them in.
+    ///
+    /// Both families are pinned explicitly: the same fixture decoded by the wrong family
+    /// is a list of the wrong size (a `:`-joined unix list decoded by the Windows family is
+    /// **one** entry, a LF-joined Windows list decoded by the unix family is a list of
+    /// path fragments), so the separator belongs in the fixture, not in the platform.
     #[test]
     fn test_extra_readonly_paths_parsing_keeps_every_entry_in_order() {
+        use crate::harness::pty::SpawnFamily;
+
+        // The unix encoding, byte-for-byte the expectations published by the spawn side.
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/nix/store")),
+            extra_readonly_paths_from_value_in_family(Some("/nix/store"), SpawnFamily::Unix),
             vec!["/nix/store".to_string()],
             "a single entry is a single path"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/nix/store:/gnu/store")),
+            extra_readonly_paths_from_value_in_family(
+                Some("/nix/store:/gnu/store"),
+                SpawnFamily::Unix
+            ),
             vec!["/nix/store".to_string(), "/gnu/store".to_string()],
             "entries must keep their order, not be sorted"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/gnu/store:/nix/store")),
+            extra_readonly_paths_from_value_in_family(
+                Some("/gnu/store:/nix/store"),
+                SpawnFamily::Unix
+            ),
             vec!["/gnu/store".to_string(), "/nix/store".to_string()],
             "order must follow the value, whatever it is"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/opt/a:/opt/b:/opt/c")),
+            extra_readonly_paths_from_value_in_family(
+                Some("/opt/a:/opt/b:/opt/c"),
+                SpawnFamily::Unix
+            ),
             vec![
                 "/opt/a".to_string(),
                 "/opt/b".to_string(),
@@ -1315,24 +1368,73 @@ mod tests {
             ],
             "no entry may be dropped between the first and the last"
         );
+
+        // The Windows encoding, joined with a line feed: everything between two LF is
+        // entry content, so a drive-letter colon and every backslash survive verbatim.
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(r"C:\Toolchain A"),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string()],
+            "a single entry is a single path, colon and backslashes intact"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(r"C:\Toolchain A", "\n", r"C:\Toolchain B")),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string(), r"C:\Toolchain B".to_string()],
+            "a LF-joined list must decode to exactly the two configured paths"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(
+                    r"D:\tools",
+                    "\n",
+                    r"C:\tools",
+                    "\n",
+                    r"\\server\share\tools"
+                )),
+                SpawnFamily::Windows
+            ),
+            vec![
+                r"D:\tools".to_string(),
+                r"C:\tools".to_string(),
+                r"\\server\share\tools".to_string()
+            ],
+            "the order of the value wins over any alphabetical guess, and a UNC prefix \
+             is content like any other"
+        );
     }
 
     /// Padding, a leading or trailing separator and an empty middle entry are all
     /// tolerated without producing an empty path that the ruleset would choke on.
+    ///
+    /// Pinned per family, for the same reason as the two tests above.
     #[test]
     fn test_extra_readonly_paths_parsing_trims_and_drops_empty_entries() {
+        use crate::harness::pty::SpawnFamily;
+
+        // The unix encoding.
         assert_eq!(
-            extra_readonly_paths_from_value(Some("  /nix/store  :  /gnu/store  ")),
+            extra_readonly_paths_from_value_in_family(
+                Some("  /nix/store  :  /gnu/store  "),
+                SpawnFamily::Unix
+            ),
             vec!["/nix/store".to_string(), "/gnu/store".to_string()],
             "surrounding blanks are padding, not part of the path"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/nix/store:")),
+            extra_readonly_paths_from_value_in_family(Some("/nix/store:"), SpawnFamily::Unix),
             vec!["/nix/store".to_string()],
             "a trailing separator must not add an empty entry"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some(":/gnu:/nix/store::/gnu/store")),
+            extra_readonly_paths_from_value_in_family(
+                Some(":/gnu:/nix/store::/gnu/store"),
+                SpawnFamily::Unix
+            ),
             vec![
                 "/gnu".to_string(),
                 "/nix/store".to_string(),
@@ -1340,26 +1442,93 @@ mod tests {
             ],
             "an empty entry anywhere is dropped, the rest is kept in order"
         );
+
+        // The Windows encoding: blanks around a `C:\…` entry are padding, and the LF that
+        // opens or closes a value must not add an entry either.
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(
+                    "  ",
+                    r"C:\Toolchain A",
+                    "  \n\t",
+                    r"C:\Toolchain B",
+                    "  "
+                )),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string(), r"C:\Toolchain B".to_string()],
+            "surrounding blanks are padding, not part of a Windows path"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(r"C:\Toolchain A", "\n")),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string()],
+            "a trailing line feed must not add an empty entry"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(
+                    "\n",
+                    r"C:\Toolchain A",
+                    "\n\n",
+                    "   ",
+                    "\n",
+                    r"C:\Toolchain B",
+                    "\n"
+                )),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string(), r"C:\Toolchain B".to_string()],
+            "a blank entry anywhere is dropped — leading, middle or trailing — the rest \
+             is kept in order"
+        );
     }
 
     /// The publish side is the exact inverse: what the spawn side encodes is what the
-    /// child parses, and an empty list publishes nothing at all.
+    /// child parses, and an empty list publishes nothing at all. Both halves are pinned to
+    /// the family whose encoding is under test, and each family is checked with the entries
+    /// that family's platform can actually have.
     #[test]
     fn test_extra_readonly_paths_env_encoding_round_trips() {
-        for empty in [&[] as &[String], &[String::new()], &["  ".to_string()]] {
-            assert_eq!(
-                extra_readonly_paths_to_env(empty),
-                None,
-                "nothing to say must leave the variable unset"
-            );
+        use crate::harness::pty::SpawnFamily;
+
+        for family in [SpawnFamily::Unix, SpawnFamily::Windows] {
+            for empty in [&[] as &[String], &[String::new()], &["  ".to_string()]] {
+                assert_eq!(
+                    extra_readonly_paths_to_env_in_family(empty, family),
+                    None,
+                    "nothing to say must leave the variable unset"
+                );
+            }
         }
+
+        // The unix encoding: the historical `:` joining, unchanged.
         let paths = vec!["/nix/store".to_string(), "/gnu/store".to_string()];
-        let encoded = extra_readonly_paths_to_env(&paths).expect("a non-empty list is published");
+        let encoded = extra_readonly_paths_to_env_in_family(&paths, SpawnFamily::Unix)
+            .expect("a list is published");
         assert_eq!(encoded, "/nix/store:/gnu/store");
         assert_eq!(
-            extra_readonly_paths_from_value(Some(&encoded)),
+            extra_readonly_paths_from_value_in_family(Some(&encoded), SpawnFamily::Unix),
             paths,
             "the value must parse back to exactly the list that produced it"
+        );
+
+        // The Windows encoding: joined with a line feed, so the drive-letter colon of each
+        // entry survives and round-trips.
+        let win_paths = vec![r"C:\Toolchain A".to_string(), r"C:\Toolchain B".to_string()];
+        let win_encoded = extra_readonly_paths_to_env_in_family(&win_paths, SpawnFamily::Windows)
+            .expect("a list is published");
+        assert_eq!(
+            win_encoded,
+            concat!(r"C:\Toolchain A", "\n", r"C:\Toolchain B"),
+            "the Windows value joins with a line feed, never with a colon"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(&win_encoded), SpawnFamily::Windows),
+            win_paths,
+            "the Windows value must parse back to exactly the list that produced it"
         );
     }
 
