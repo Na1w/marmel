@@ -18,3 +18,7 @@ suggested_tools:
 - **AUTHORITATIVE CITATIONS:** Always cite sources, exact file paths, line numbers, or external URLs when providing findings.
 - **ZERO HALLUCINATION:** Never invent library signatures, types, or conventions. If something is unknown, search or declare it explicitly.
 - **SYNTHESIS & SUMMARY:** Structure deliverables clearly with code examples, contract definitions, and concise takeaways.
+- **DELIVERABLE PLACEMENT & SELF-CONTAINED REPORTS:**
+  - Intermediate research notes for internal use belong in `.marmel/research/<topic>.md`.
+  - Final reports, user-facing summaries, and audit deliverables MUST be saved to a visible, non-hidden path in the workspace root or designated user folder (never inside `.marmel/`).
+  - Final reports must be completely self-contained: do not link to or cite internal temporary `.marmel/research/` notes, as those are deleted when the session ends.

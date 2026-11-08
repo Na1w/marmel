@@ -263,6 +263,7 @@ async fn turn_boundary_commit_leaves_a_manifest_bearing_bundle() {
 #[tokio::test]
 async fn throttled_triggers_coalesce_and_mandatory_triggers_ignore_the_floor() {
     let _lock = TEST_MUTEX.lock().await;
+    marmennill::orchestrator::clear_worker_states();
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = Config {
         session_commit_min_interval_ms: 250,
@@ -511,6 +512,7 @@ async fn worker_lifecycle_edge_is_harvested_on_the_session_thread() {
         "the live worker must appear as a workers/* member: {members:?}"
     );
     drop(guard);
+    marmennill::orchestrator::clear_worker_states();
     assert_eq!(
         diff(
             &marmennill::ui::session::session_commit_ledger(),

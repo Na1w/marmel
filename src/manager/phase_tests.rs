@@ -2163,6 +2163,10 @@ fn test_cleanup_completed_removes_runtime_and_deletes_empty_dir() {
     fs::write(dir.join("archive/plan_1.md"), "archive").unwrap();
     fs::create_dir_all(dir.join("session")).unwrap();
     fs::write(dir.join("session/manifest.json"), "{}").unwrap();
+    fs::create_dir_all(dir.join("research")).unwrap();
+    fs::write(dir.join("research/topic.md"), "internal research").unwrap();
+    fs::create_dir_all(dir.join("tmp")).unwrap();
+    fs::write(dir.join("tmp/data.txt"), "overflow").unwrap();
     fs::write(dir.join("marmel.log"), "log line").unwrap();
     fs::write(dir.join("marmel.log.1"), "rotated log").unwrap();
     fs::write(dir.join("debug.log"), "debug line").unwrap();
@@ -2184,12 +2188,14 @@ fn test_cleanup_completed_preserves_user_files() {
     // Populate runtime files
     fs::create_dir_all(dir.join("prompts")).unwrap();
     fs::write(dir.join("prompts/t-001.md"), "prompt").unwrap();
+    fs::create_dir_all(dir.join("research")).unwrap();
+    fs::write(dir.join("research/internal.md"), "internal research notes").unwrap();
     fs::write(dir.join("marmel.log"), "log").unwrap();
 
     // Populate user files
     fs::write(dir.join("marmel.toml"), "model = \"custom\"").unwrap();
-    fs::create_dir_all(dir.join("research")).unwrap();
-    fs::write(dir.join("research/notes.md"), "my research").unwrap();
+    fs::create_dir_all(dir.join("skills")).unwrap();
+    fs::write(dir.join("skills/custom.md"), "my skill").unwrap();
 
     let cleaned = plan.cleanup_completed().unwrap();
     assert!(cleaned, "completed plan must trigger cleanup");
@@ -2202,12 +2208,16 @@ fn test_cleanup_completed_preserves_user_files() {
         "user config file must be preserved"
     );
     assert!(
-        dir.join("research/notes.md").exists(),
-        "user research files must be preserved"
+        dir.join("skills/custom.md").exists(),
+        "user skills files must be preserved"
     );
     assert!(
         !dir.join("prompts").exists(),
         "runtime prompts must be removed"
+    );
+    assert!(
+        !dir.join("research").exists(),
+        "runtime research notes must be removed"
     );
     assert!(
         !dir.join("marmel.log").exists(),
@@ -2234,6 +2244,80 @@ fn test_cleanup_completed_respects_keep_session() {
         "plan must remain when keep_session is active"
     );
     assert!(dir.exists(), "runtime directory must remain");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_find_marmel_dir_and_subpath() {
+    let p1 = Path::new("/workspace/project/.marmel/research/notes.md");
+    let (m1, s1) = find_marmel_dir_and_subpath(p1).unwrap();
+    assert_eq!(m1, PathBuf::from("/workspace/project/.marmel"));
+    assert_eq!(s1, PathBuf::from("research/notes.md"));
+
+    let p2 = Path::new("/workspace/project/.marmel");
+    assert!(find_marmel_dir_and_subpath(p2).is_none());
+
+    let p3 = Path::new("/workspace/project/src/main.rs");
+    assert!(find_marmel_dir_and_subpath(p3).is_none());
+
+    let p4 = Path::new(".marmel/scratch/temp.txt");
+    let (m4, s4) = find_marmel_dir_and_subpath(p4).unwrap();
+    assert_eq!(m4, PathBuf::from(".marmel"));
+    assert_eq!(s4, PathBuf::from("scratch/temp.txt"));
+}
+
+#[test]
+fn test_track_created_marmel_file_and_cleanup() {
+    let dir = temp_marmel();
+    let plan = Plan::at(&dir);
+    plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
+
+    let sub1 = Path::new("subagent_notes.txt");
+    let sub2 = Path::new("deep/nested/analysis.json");
+    let full1 = dir.join(sub1);
+    let full2 = dir.join(sub2);
+
+    fs::create_dir_all(full2.parent().unwrap()).unwrap();
+    fs::write(&full1, "notes").unwrap();
+    fs::write(&full2, "{}").unwrap();
+
+    track_created_marmel_file(&dir, sub1);
+    track_created_marmel_file(&dir, sub2);
+
+    let tracked = get_tracked_marmel_files_for(&dir);
+    assert!(tracked.contains(&full1));
+    assert!(tracked.contains(&full2));
+
+    // Verify .created_files exists on disk
+    let log_file = dir.join(CREATED_FILES_LOG);
+    assert!(log_file.exists());
+    let log_content = fs::read_to_string(&log_file).unwrap();
+    assert!(log_content.contains("subagent_notes.txt"));
+    assert!(log_content.contains("analysis.json"));
+
+    // Cleanup should remove both tracked files, .created_files, empty subdirectories, and empty dir
+    let cleaned = plan.cleanup_completed().unwrap();
+    assert!(cleaned);
+    assert!(!dir.exists(), "directory must be pruned completely");
+}
+
+#[test]
+fn test_prune_empty_subdirectories_preserves_skills() {
+    let dir = temp_marmel();
+    fs::create_dir_all(dir.join("empty_a/empty_b/empty_c")).unwrap();
+    fs::create_dir_all(dir.join("skills")).unwrap();
+
+    prune_empty_subdirectories(&dir);
+
+    assert!(
+        !dir.join("empty_a").exists(),
+        "empty directories should be pruned"
+    );
+    assert!(
+        dir.join("skills").exists(),
+        "skills directory should be preserved"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

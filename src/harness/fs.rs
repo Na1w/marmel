@@ -915,6 +915,7 @@ pub fn write_file(args: &Value) -> Result<ToolResult, ToolError> {
     let path = str_arg(args, "path", TOOL_WRITE_FILE)?;
     let content = str_arg(args, "content", TOOL_WRITE_FILE)?;
     let safe_path = resolve_safe_path(path, TOOL_WRITE_FILE)?;
+    let already_exists = safe_path.exists();
     if let Some(parent) = safe_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -922,6 +923,9 @@ pub fn write_file(args: &Value) -> Result<ToolResult, ToolError> {
         set_dir_permissions_755(parent);
     }
     write_file_atomic(&safe_path, content.as_bytes())?;
+    if !already_exists {
+        crate::manager::phase::track_created_file_if_marmel(&safe_path);
+    }
     Ok(ToolResult::ok(format!(
         "wrote {} bytes to {}",
         content.len(),
