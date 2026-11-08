@@ -161,10 +161,10 @@ use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_NO_SECURITY_ON_OBJECT, ERROR_PRIVILEGE_NOT_HELD,
-    ERROR_SUCCESS, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, STATUS_ACCESS_DENIED,
-    STATUS_ACCESS_VIOLATION, STATUS_DLL_NOT_FOUND, STATUS_ENTRYPOINT_NOT_FOUND,
-    STATUS_IN_PAGE_ERROR, STILL_ACTIVE, WAIT_OBJECT_0, WIN32_ERROR,
+    CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_NO_SECURITY_ON_OBJECT,
+    ERROR_PRIVILEGE_NOT_HELD, ERROR_SUCCESS, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    STATUS_ACCESS_DENIED, STATUS_ACCESS_VIOLATION, STATUS_DLL_NOT_FOUND,
+    STATUS_ENTRYPOINT_NOT_FOUND, STATUS_IN_PAGE_ERROR, STILL_ACTIVE, WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W,
@@ -184,7 +184,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, SYNCHRONIZE,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
 };
 // The launch half of the backend: the process-attribute list that carries the confinement
 // declaration, `CreateProcessW` and the wait for the child, and the std-handle inspection that
@@ -195,7 +195,7 @@ use windows_sys::Win32::System::Console::{
     GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
@@ -1089,19 +1089,27 @@ fn push_entry(
 ) {
     let text = path_text(path);
 
-    // The invariant, enforced rather than merely documented: an entry that contains a denied
-    // directory (or is the user-profile root, which contains every one of them) would make
-    // `.ssh` and `.gnupg` reachable through the inheritance of the grant itself.
-    if let Some(conflict) = sensitive_conflict(path, sensitive) {
-        notes.push(format!("{text}: {}", conflict.note()));
-        return;
-    }
+    // The user-profile root first, ahead of the generic conflict check below. That check *would*
+    // also reject this entry (the root contains every denied directory under it), but its wording
+    // names one denied directory and the inheritance mechanism, while this one names the actual
+    // reason the operator's entry is hopeless: the profile root itself is off the allow-list. On a
+    // real host the two notes would otherwise collapse into the same generic sentence, and the
+    // profile-root note would be unreachable in production.
     if let Some(home) = host.user_profile_root()
         && paths_match(path, home)
     {
         notes.push(format!(
             "{text}: the user profile directory itself is never granted, because the sensitive directories below it would become reachable through it"
         ));
+        return;
+    }
+
+    // The invariant, enforced rather than merely documented: an entry that is, or contains, a
+    // denied directory would make `.ssh` and `.gnupg` reachable through the inheritance of the
+    // grant itself. An entry inside a denied directory is the other honest answer: the grant would
+    // sit in the part of the filesystem the policy closes.
+    if let Some(conflict) = sensitive_conflict(path, sensitive) {
+        notes.push(format!("{text}: {}", conflict.note()));
         return;
     }
 
@@ -1960,6 +1968,50 @@ fn stdio_state() -> StdioState {
 const STD_HANDLE_ACCESS: u32 =
     FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
 
+/// The rights the handle that reads and rewrites a std object's DACL has to carry.
+///
+/// `GetSecurityInfo` requires `READ_CONTROL` and `SetSecurityInfo` requires `WRITE_DAC` — on the
+/// **calling handle**, not on the object behind it. The std handles of this process are created
+/// outside this crate (the one-shot stdio of a re-entry run is the pair of pipes the plumbing behind
+/// `std::process::Command`'s `Stdio::piped()` / `Stdio::null()` builds), and their access mask names
+/// only what the stream itself needs. Asking the security calls to work through such a handle
+/// answers `ERROR_ACCESS_DENIED` (`os error 5`), which is what this grant path used to report.
+const STD_HANDLE_SECURITY_ACCESS: u32 = READ_CONTROL | WRITE_DAC;
+
+/// Copy one std handle into this process with [`STD_HANDLE_SECURITY_ACCESS`] requested, so the DACL
+/// read and the DACL rewrite can happen at all.
+///
+/// `DuplicateHandle` re-runs the access check against the object's own descriptor, so the copy
+/// carries the standard security rights the caller already has on that object. The object is the
+/// same object: the grant the copy writes is the grant the **original** std handle is later checked
+/// against, which is the handle the confined child reads and writes through.
+///
+/// The original is deliberately *not* replaced for the launch: the access mask the child inherits is
+/// the source handle's, and only the source names `FILE_READ_DATA` and `FILE_WRITE_DATA` — a
+/// duplicate that asked for the security rights alone would hand the confined child a std handle it
+/// could neither read from nor write to. The SQOS options are left out on purpose: this copy is made
+/// inside the same process for the security calls only, and nothing here impersonates anything.
+fn duplicate_for_security(handle: HANDLE) -> Result<HANDLE, WIN32_ERROR> {
+    let mut duplicated: HANDLE = std::ptr::null_mut();
+    // SAFETY: the out-parameter is a valid pointer, and both process arguments are this process'
+    // `-1` pseudo-handle, which `DuplicateHandle` accepts for a copy into the current process.
+    let made = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut duplicated,
+            STD_HANDLE_SECURITY_ACCESS,
+            0,
+            0,
+        )
+    };
+    if made == 0 {
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(duplicated)
+}
+
 /// One trustee naming a SID, built by the API rather than spelled by hand:
 /// `BuildTrusteeWithSidW` fills the SID form (`TRUSTEE_IS_SID`, name = the SID pointer) that an
 /// AppContainer identity needs, because the name lookup a `TRUSTEE_IS_NAME` trustee would run
@@ -2006,7 +2058,10 @@ fn std_handle_trustees(app_sid: PSID, all_packages_sid: PSID) -> Vec<EXPLICIT_AC
 
 /// One inherited std object, the DACL this run added to it, and the handle to put that back.
 struct StdHandleGrant {
-    /// The object whose DACL changed.
+    /// The handle this guard works through: the [`duplicate_for_security`] copy made for the
+    /// security calls, which the guard closes once the DACL is back where it was. The std handle the
+    /// process was given is not closed here — it was never ours to close, and it is the handle the
+    /// confined launch hands to the child.
     handle: HANDLE,
     /// The security descriptor `GetSecurityInfo` handed back; its DACL is what the restore writes
     /// back, so the descriptor is kept alive until then and released by the same API the read
@@ -2047,10 +2102,12 @@ impl Drop for StdHandleGrant {
             );
         }
         // SAFETY: `SetEntriesInAclW` allocated the applied ACL, and the saved descriptor came from
-        // `GetSecurityInfo`; `LocalFree` is the release both document.
+        // `GetSecurityInfo`; `LocalFree` is the release both document. The handle closed last is the
+        // one this guard made for itself; the std handle of the process is untouched.
         unsafe {
             LocalFree(self.applied as *mut c_void);
             LocalFree(self.saved_sd);
+            CloseHandle(self.handle);
         }
     }
 }
@@ -2064,6 +2121,11 @@ impl Drop for StdHandleGrant {
 /// would change nothing — and the restore would have nothing to write), and an object with no
 /// security at all, which answers `ERROR_NO_SECURITY_ON_OBJECT` and is likewise reported as "no
 /// grant was possible, and none is needed" rather than as an error.
+///
+/// The work is done through [`duplicate_for_security`], not through the std handle itself: the std
+/// handles of this process are created with the rights of a stream and carry neither `READ_CONTROL`
+/// nor `WRITE_DAC`, and `SetSecurityInfo` without the latter answers `ERROR_ACCESS_DENIED` on an
+/// object the process owns outright.
 fn grant_std_handle(
     handle: HANDLE,
     app_sid: PSID,
@@ -2072,6 +2134,22 @@ fn grant_std_handle(
         return Ok(None);
     }
     let label = format!("standard stream object {handle:p}");
+    // The read and the rewrite run through a copy of the std handle that carries the rights the two
+    // calls require; the object behind it, and the std handle the launch hands to the child, stay
+    // exactly as the process had them. See [`STD_HANDLE_SECURITY_ACCESS`].
+    let secured = match duplicate_for_security(handle) {
+        Ok(duplicated) => duplicated,
+        Err(code) => {
+            return Err(WindowsSandboxError::AclMutate {
+                path: label,
+                reason: format!(
+                    "DuplicateHandle(READ_CONTROL | WRITE_DAC on the std handle) failed: {}",
+                    last_win32_error()
+                ),
+                code,
+            });
+        }
+    };
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -2079,7 +2157,7 @@ fn grant_std_handle(
     // the API writes into.
     let read = unsafe {
         GetSecurityInfo(
-            handle,
+            secured,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -2091,9 +2169,13 @@ fn grant_std_handle(
     };
     let _ = sacl; // the SACL is not part of this policy
     if read == ERROR_NO_SECURITY_ON_OBJECT {
+        // SAFETY: the duplicate is this call's to close, and nothing else was allocated.
+        unsafe { CloseHandle(secured) };
         return Ok(None);
     }
     if read != ERROR_SUCCESS {
+        // SAFETY: the read allocated nothing this call still needs.
+        unsafe { CloseHandle(secured) };
         return Err(WindowsSandboxError::AclRead {
             path: label,
             reason: format!(
@@ -2104,8 +2186,12 @@ fn grant_std_handle(
     }
     if dacl.is_null() {
         // SAFETY: the descriptor came from `GetSecurityInfo`, whose documented release is
-        // `LocalFree`; nothing references it, because no grant is applied to a NULL DACL.
-        unsafe { LocalFree(sd) };
+        // `LocalFree`; nothing references it, because no grant is applied to a NULL DACL. The
+        // duplicate is closed with it: no guard exists to hand it to.
+        unsafe {
+            LocalFree(sd);
+            CloseHandle(secured);
+        };
         return Ok(None);
     }
     let all_packages = ApplicationPackagesSid::all()?;
@@ -2116,8 +2202,12 @@ fn grant_std_handle(
     let built =
         unsafe { SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), dacl, &mut applied) };
     if built != ERROR_SUCCESS {
-        // SAFETY: the descriptor is the only object read here, and it is released unchanged.
-        unsafe { LocalFree(sd) };
+        // SAFETY: the descriptor is the only object read here, and it is released unchanged. The
+        // handle made for this call is released with it, because no guard takes it over.
+        unsafe {
+            LocalFree(sd);
+            CloseHandle(secured);
+        };
         return Err(WindowsSandboxError::AclMutate {
             path: label,
             reason: format!("SetEntriesInAclW failed: {}", last_win32_error()),
@@ -2127,7 +2217,7 @@ fn grant_std_handle(
     // SAFETY: the handle names the object, and `applied` is the freshly built ACL.
     let set = unsafe {
         SetSecurityInfo(
-            handle,
+            secured,
             SE_KERNEL_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -2138,10 +2228,11 @@ fn grant_std_handle(
     };
     if set != ERROR_SUCCESS {
         // SAFETY: neither the ACL that was built nor the descriptor reached the object, so both
-        // are released here rather than handed to a guard.
+        // are released here rather than handed to a guard. The duplicate outlives neither.
         unsafe {
             LocalFree(applied as *mut c_void);
             LocalFree(sd);
+            CloseHandle(secured);
         };
         return Err(WindowsSandboxError::AclMutate {
             path: label,
@@ -2150,7 +2241,7 @@ fn grant_std_handle(
         });
     }
     Ok(Some(StdHandleGrant {
-        handle,
+        handle: secured,
         saved_sd: sd,
         saved_dacl: dacl,
         applied,
@@ -2480,10 +2571,17 @@ impl From<WindowsSandboxError> for SandboxError {
                 SandboxError::RuleSetup { path, reason }
             }
             WindowsSandboxError::AclRead { path, reason }
-            | WindowsSandboxError::AclMutate { path, reason, .. }
-            | WindowsSandboxError::AclVerification { path, reason } => {
+            | WindowsSandboxError::AclMutate { path, reason, .. } => {
                 SandboxError::RuleSetup { path, reason }
             }
+            // A verification failure is not a rule that could not be built: the rule is there, and
+            // the object says the grant is not. The confinement in force is therefore not the one
+            // the policy promised — which is what `Enforcement` spells, and what
+            // `attempt_from_windows_error` already says for the same failure. The two mappings have
+            // to agree because the attempt surface and this error are one verdict rendered twice.
+            WindowsSandboxError::AclVerification { path, reason } => SandboxError::Enforcement {
+                reason: format!("{path}: {reason}"),
+            },
             WindowsSandboxError::AttributeList { reason }
             | WindowsSandboxError::Probe { reason }
             | WindowsSandboxError::Launch { reason, .. } => SandboxError::Enforcement { reason },
@@ -3091,9 +3189,11 @@ mod tests {
         Ok(())
     }
 
-    /// The sensitive-directory invariant: the user-profile root is never granted, the denied
-    /// directories themselves are never granted, and an operator-supplied entry that is an
-    /// ancestor of a denied directory is rejected with a note rather than turned into an ACE.
+    /// The sensitive-directory invariant, and the note each kind of entry really earns: the
+    /// user-profile root is never granted and says so in its own wording, an entry that is — or
+    /// contains — one of the denied directories is rejected with the inheritance wording, an entry
+    /// that does not exist on this host is skipped with the shared skip wording, and a genuine
+    /// extra directory survives every check above and becomes a grant.
     #[test]
     fn test_policy_table_never_exposes_the_sensitive_directories()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3107,8 +3207,18 @@ mod tests {
                 .join(sbpl::SENSITIVE_DENIED_BASENAMES[0])
                 .to_string_lossy()
                 .into_owned(),
+            // One level above the profile root: an entry that contains the denied directories
+            // without being the profile root, so the inheritance wording is the note it earns.
+            host.profile
+                .parent()
+                .unwrap_or(host.profile.as_path())
+                .to_string_lossy()
+                .into_owned(),
             // A real extra directory, which must survive the checks above.
             host.workspace.join("extra").to_string_lossy().into_owned(),
+            // A program-files spelling that does not exist here, published through the extras
+            // channel: the shared skip wording decides that one, not a rejection and not a grant.
+            host.missing.to_string_lossy().into_owned(),
         ];
         std::fs::create_dir_all(host.workspace.join("extra"))?;
 
@@ -3138,6 +3248,52 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("contains the sensitive directory")),
             "the denied-directory rejection must be reported: {:?}",
+            table.notes
+        );
+        // The two rejections are two notes, and each names the entry it was written for: the
+        // profile root because it is the profile root, and the entry above it because a denied
+        // directory sits inside that one.
+        let profile_note = path_text(&host.profile);
+        let ancestor_note = path_text(host.profile.parent().unwrap_or(host.profile.as_path()));
+        assert!(
+            table
+                .notes
+                .iter()
+                .any(|note| note.starts_with(&profile_note) && note.contains("never granted")),
+            "the profile root is rejected by name, with the profile-root wording: {:?}",
+            table.notes
+        );
+        let denied_note = path_text(&host.sensitive()[0]);
+        assert!(
+            table
+                .notes
+                .iter()
+                .any(|note| note.starts_with(&ancestor_note)
+                    && note.contains("contains the sensitive directory")
+                    && note.contains(&denied_note)),
+            "the entry above the profile root is rejected with the inheritance wording, naming the \
+             denied directory it contains: {:?}",
+            table.notes
+        );
+        // An entry that *is* one of the denied directories is rejected too, by name.
+        let denied_itself = path_text(&host.profile.join(sbpl::SENSITIVE_DENIED_BASENAMES[0]));
+        assert!(
+            table
+                .notes
+                .iter()
+                .any(|note| note.starts_with(&denied_itself)
+                    && note.contains("contains the sensitive directory")),
+            "an entry that is itself a denied directory is rejected as such: {:?}",
+            table.notes
+        );
+        // The missing extra entry is the shared skip wording, neither a rejection nor a grant.
+        assert!(
+            table
+                .notes
+                .iter()
+                .any(|note| note.contains(&path_text(&host.missing))
+                    && note.contains("does not exist")),
+            "an extra path absent on this host is skipped with the shared skip wording: {:?}",
             table.notes
         );
         assert!(
@@ -3226,9 +3382,13 @@ mod tests {
     #[test]
     fn test_windows_backend_is_registered_behind_its_cfg_gate() {
         let quote = char::from(34);
-        let source =
+        let raw =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/mod.rs"))
                 .expect("mod.rs must be readable from the crate manifest directory");
+        // The checkout's line endings are not part of this assertion. A Windows CI checkout can be
+        // written with CRLF (`core.autocrlf`/`core.eol`), and the needle below spans a newline, so
+        // an unnormalised read would search for one spelling of the declaration and find another.
+        let source = raw.replace("\r\n", "\n");
         // Spelled from parts, so this file never carries the needles it is checking for.
         let gate = format!("#[cfg(target_os = {quote}windows{quote})]");
         let module = format!("pub mod sandbox_{backend};", backend = "windows");
@@ -3417,14 +3577,28 @@ mod tests {
 
     /// Whether `handle` names an object whose DACL already carries an allow ACE for `sid` covering
     /// `mask` — the read side of the handle grant, spelled once for the test below.
+    ///
+    /// The read runs through [`duplicate_for_security`] for the reason the grant itself runs through
+    /// it: the raw handle of a fresh pipe carries the rights of a stream, not `READ_CONTROL`, and
+    /// `GetSecurityInfo` through such a handle answers `ERROR_ACCESS_DENIED`. A refused read is
+    /// answered here by a panic, because "the DACL could not be read" and "the DACL holds no such
+    /// ACE" are different answers, and this test has to tell them apart.
     fn handle_names_sid(handle: HANDLE, sid: PSID, mask: u32) -> bool {
+        let secured = match duplicate_for_security(handle) {
+            Ok(duplicated) => duplicated,
+            Err(code) => panic!(
+                "the DACL of the test object must be readable through a handle holding \
+                 READ_CONTROL (win32 error {code}): {}",
+                last_win32_error()
+            ),
+        };
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sacl: *mut ACL = std::ptr::null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: the handle names one live object, and each out-parameter is a valid pointer.
         let code = unsafe {
             GetSecurityInfo(
-                handle,
+                secured,
                 SE_KERNEL_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
@@ -3435,11 +3609,26 @@ mod tests {
             )
         };
         let _ = sacl;
-        if code != ERROR_SUCCESS || dacl.is_null() {
-            if !sd.is_null() {
-                // SAFETY: the descriptor came from `GetSecurityInfo`.
-                unsafe { LocalFree(sd) };
+        if code != ERROR_SUCCESS {
+            // SAFETY: the read allocated nothing this call still needs, and the handle it copied is
+            // this helper's to close.
+            unsafe {
+                LocalFree(sd);
+                CloseHandle(secured);
             }
+            panic!(
+                "reading the DACL of the test object failed (win32 error {code}): {}",
+                last_win32_error()
+            );
+        }
+        if dacl.is_null() {
+            // SAFETY: the descriptor came from `GetSecurityInfo`, and the copy made for the read is
+            // this helper's to close.
+            unsafe {
+                LocalFree(sd);
+                CloseHandle(secured);
+            }
+            // A NULL DACL carries no list to inspect: nothing names this SID.
             return false;
         }
         let mut size = ACL_SIZE_INFORMATION {
@@ -3484,14 +3673,25 @@ mod tests {
                 found = unsafe { EqualSid(sid, ace_sid) } != 0 && (allowed.Mask & mask) == mask;
             }
         }
-        // SAFETY: the descriptor was allocated by `GetSecurityInfo`.
-        unsafe { LocalFree(sd) };
+        // SAFETY: the descriptor was allocated by `GetSecurityInfo`, and the copy made for this read
+        // is this helper's to close.
+        unsafe {
+            LocalFree(sd);
+            CloseHandle(secured);
+        };
         found
     }
 
     /// A real handle, real DACL, real grant: `CreatePipe` gives an object with the default DACL of
     /// this process, which is exactly the object the confined child could not write to. The grant
     /// puts the AppContainer ACE on it, and dropping the guard puts the original back.
+    ///
+    /// The handle is the raw write end of the pipe, with no security rights in its access mask — the
+    /// shape a std handle of the one-shot path really has, and the reason this grant used to answer
+    /// `SetSecurityInfo failed: Access is denied. (os error 5)`: the call needs `WRITE_DAC` on the
+    /// handle it is given, and a stream handle does not have it. [`duplicate_for_security`] is what
+    /// supplies it, so this test exercises the same path the confined launch does rather than a
+    /// handle this test happens to have opened with the right rights.
     ///
     /// This test is only compiled where the Windows backend is compiled — the module is behind
     /// `#[cfg(target_os = "windows")]` in `mod.rs`, so it runs on the native Windows CI job.
@@ -3704,6 +3904,10 @@ mod tests {
 
     /// The hand-off is single-shot and per-thread: a thread that never prepared a policy has
     /// nothing parked, and releasing what is not there says so rather than pretending.
+    ///
+    /// The value the check returns is *whether something was parked*, so the fresh thread answers
+    /// `false` — an inverted expectation here reads a reported leak as a pass, which is how this
+    /// test used to agree with a hand-off that had nothing in it.
     #[test]
     fn test_a_fresh_thread_holds_no_parked_setup() {
         let handled = std::thread::spawn(|| {
@@ -3711,12 +3915,18 @@ mod tests {
                 take_windows_policy_setup().is_none(),
                 "a thread that prepared nothing has no parked setup"
             );
-            !discard_windows_policy_setup()
+            discard_windows_policy_setup()
         })
         .join();
         assert!(
             matches!(handled, Ok(false)),
             "the fresh-thread hand-off check must report that nothing was parked"
+        );
+        // The other half of the guard: the setup a run prepared belongs to the thread that prepared
+        // it, and nothing is left parked on the thread the next command is launched from.
+        assert!(
+            !discard_windows_policy_setup(),
+            "this thread holds no parked setup either, so nothing is left for the next command"
         );
     }
 
