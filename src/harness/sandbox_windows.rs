@@ -3789,17 +3789,23 @@ pub fn run_in_appcontainer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Security::Authorization::DENY_ACCESS;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
+    use windows_sys::Win32::Security::Authorization::{
+        ACCESS_MODE, ConvertStringSidToSidW, DENY_ACCESS,
+    };
     use windows_sys::Win32::Security::{
         CopySid, GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor,
-        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_QUERY,
+        SE_DACL_DEFAULTED, SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+        SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY,
         TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        GetShortPathNameW, ReadFile, WRITE_OWNER, WriteFile,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, GetShortPathNameW, PIPE_ACCESS_INBOUND, ReadFile, WriteFile,
     };
-    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
     use windows_sys::Win32::System::Threading::OpenProcessToken;
 
     /// The fixture host: one temporary directory playing the role of `%USERPROFILE%`, with the
@@ -5106,54 +5112,62 @@ mod tests {
     /// does not enable.
     const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 
-    /// What a fixture object concedes to the process that created it, and why every one of these
-    /// bits is there, which is one Windows rule: a caller-supplied `SECURITY_ATTRIBUTES` is not a
-    /// suggestion. `CreatePipe` creates the pipe **with** the descriptor this test wrote, and the
-    /// object manager then runs the create-time access check **against that DACL**, for the access
-    /// the creating process asks of the two ends it is handed. A DACL that is present but does not
-    /// concede one of those rights answers `ERROR_ACCESS_DENIED` (5) and no object comes into being
-    /// at all: present-but-insufficient is a refusal, and only a **NULL** DACL means "grant
-    /// everything". The mask therefore has to concede the creator's own request — in the spelling
-    /// that request is made in — next to the rights the calls under test ask for afterwards.
+    /// `ACCESS_DENIED_ACE_TYPE` spelled locally, for the same reason `ACCESS_ALLOWED_ACE_TYPE` is
+    /// spelled locally in the backend above: both live in
+    /// `windows_sys::Win32::System::SystemServices`, a module this crate does not enable.
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+    /// The two well-known trustees the contrast fixture's DACL names, by their documented string
+    /// form. `Everyone` is a group every token belongs to, which is what a deny needs to be worth
+    /// anything: a deny ACE aimed at the object's **owner** is the weakest expression of "denied"
+    /// there is, because the owner reaches `READ_CONTROL | WRITE_DAC` through the owner path rather
+    /// than through its own ACE. `OWNER RIGHTS` is the trustee that path answers to — once an ACE
+    /// names it, the owner's implicit security rights are exactly the bits that ACE concedes.
+    const EVERYONE_SID: &str = "S-1-1-0";
+    const OWNER_RIGHTS_SID: &str = "S-1-3-4";
+
+    /// The rights a fixture writes into its ACEs, and the rights a fixture asks of a handle — spelled
+    /// in **one** namespace, which is the single lesson the history of these two fixtures teaches.
     ///
-    /// * `GENERIC_READ | GENERIC_WRITE` — the data rights of a stream in the generic spelling the
-    ///   stream APIs ask of the read end and the write end with. Drop them and the **create** is
-    ///   what fails, one call before the code under test is reached.
-    /// * `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES |
-    ///   SYNCHRONIZE` — the same data rights spelled specifically, which is how a later access
-    ///   check against the object names them: the byte the companion test pushes through the pipe,
-    ///   and the read and write of the child that inherits the handle.
-    /// * `READ_CONTROL | WRITE_DAC` — the two rights the grant path is built on. `GetSecurityInfo`
-    ///   asks `READ_CONTROL` and `SetSecurityInfo` asks `WRITE_DAC` of the handle they work
-    ///   through, and [`duplicate_for_security`] can only carry rights this DACL concedes, because
-    ///   `DuplicateHandle` with an explicit `dwDesiredAccess` re-runs this same access check and
-    ///   can narrow access, never invent it.
-    /// * `WRITE_OWNER` — the ownership right of the process that rewrote the descriptor.
-    const FIXTURE_CALLER_ACCESS: u32 = GENERIC_READ
-        | GENERIC_WRITE
-        | READ_CONTROL
-        | WRITE_DAC
-        | WRITE_OWNER
-        | SYNCHRONIZE
-        | FILE_READ_DATA
-        | FILE_WRITE_DATA
-        | FILE_READ_ATTRIBUTES
-        | FILE_WRITE_ATTRIBUTES;
+    /// No generic bit appears anywhere in them. `GENERIC_READ` / `GENERIC_WRITE` are *request-side*
+    /// rights: the generic mapping is applied to the **desired access** an open or a create carries,
+    /// and never to the `AccessMask` of a stored `ACCESS_ALLOWED_ACE` when the access check runs. So
+    /// generic bits in a stored ACE grant nothing a later specifically-spelled request can use, and a
+    /// handle that came back holding only generic bits does not carry `READ_CONTROL` — which is exactly
+    /// how the two fixtures here came to invert against each other while their source looked symmetric.
+    ///
+    /// * `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE` (`0x00100083`) — the
+    ///   data rights of a byte stream, which is what the confined child uses an inherited std handle
+    ///   for, and the mask **both** fixtures open their measured handle with. `FILE_WRITE_ATTRIBUTES`
+    ///   is deliberately absent: nothing here writes attributes, and every extra bit is a bit a future
+    ///   reader has to reason about.
+    /// * `READ_CONTROL | WRITE_DAC` (`0x00060000`) — the two rights the grant path is built on.
+    ///   `GetSecurityInfo` asks `READ_CONTROL` and `SetSecurityInfo` asks `WRITE_DAC`, both **of the
+    ///   handle they work through**, judged when that handle was opened or duplicated and not per
+    ///   call. [`duplicate_for_security`] carries them only because a fixture's DACL concedes them:
+    ///   `DuplicateHandle` with an explicit mask re-runs that same check, so it can narrow access and
+    ///   can never invent it.
+    const FIXTURE_DATA_ACCESS: u32 =
+        FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 
-    /// The contrast object's mask: everything a stream handle really carries — the data rights in
-    /// both spellings, so that what the companion test measures is the refused security read and
-    /// not the create that had to succeed before it — and none of what the security calls need.
-    /// That is the shape of the std handles this process is *given*.
-    const FIXTURE_DATA_ONLY_ACCESS: u32 = GENERIC_READ
-        | GENERIC_WRITE
-        | SYNCHRONIZE
-        | FILE_READ_DATA
-        | FILE_WRITE_DATA
-        | FILE_READ_ATTRIBUTES
-        | FILE_WRITE_ATTRIBUTES;
+    /// The data rights plus the two security rights: what the concede fixture — the object the grant
+    /// path is allowed to work on — concedes to the process that created it (`0x00160083`).
+    const FIXTURE_CONCEDE_ACCESS: u32 = FIXTURE_DATA_ACCESS | READ_CONTROL | WRITE_DAC;
 
-    /// The two rights that decide whether a DACL can be read and rewritten at all.
-    const FIXTURE_SECURITY_ACCESS: u32 = READ_CONTROL | WRITE_DAC;
+    /// The two rights that decide whether a DACL can be read and rewritten at all, and therefore the
+    /// mask the contrast fixture refuses (`0x00060000`).
+    const FIXTURE_DENIED_SECURITY: u32 = READ_CONTROL | WRITE_DAC;
+
+    /// What the contrast fixture leaves the owner path: `SYNCHRONIZE`, and nothing else
+    /// (`0x00100000`). With no `OWNER RIGHTS` ACE at all, the owner of an object is granted
+    /// `READ_CONTROL | WRITE_DAC` implicitly — so a fixture that merely denied the security rights to
+    /// a trustee would keep them itself, and the process running the test is the object's owner.
+    const FIXTURE_OWNER_RIGHTS_ALLOW: u32 = SYNCHRONIZE;
+
+    /// The mask both fixtures open their measured handle with: specific rights only, no generic bits,
+    /// no security rights. Identical on both fixtures is the point — the only difference between the
+    /// two is what the object's DACL says, so a difference in outcome can only be the DACL's doing.
+    const FIXTURE_OPEN_REQUEST: u32 = FIXTURE_DATA_ACCESS;
 
     /// The Win32 code `GetSecurityInfo` answers when asked for the DACL of `handle` and nothing else,
     /// releasing whatever the read allocated either way.
@@ -5186,44 +5200,595 @@ mod tests {
         code
     }
 
-    /// Create the fixture's anonymous pipe with `attrs`, and answer a refusal with the precondition
-    /// it broke rather than with a bare Win32 code.
+    /// The counter that makes each fixture's pipe name unique inside this process: the pid keeps two
+    /// test binaries apart, this keeps the two fixtures of one binary apart, and both together mean a
+    /// name this test uses is a name nothing else has.
+    static FIXTURE_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    /// The fixture's named pipe: the server end this test created with a descriptor it wrote, and the
+    /// client end it opened by name afterwards — the handle every measurement below runs on.
+    struct FixturePipe {
+        /// The unique name of the object, kept because reopening the *same* object with a different
+        /// request is what makes a fixture measurable twice.
+        name: String,
+        /// The server end: created by this test, and the far side of the data-channel control.
+        server: HANDLE,
+        /// The client end, opened with [`FIXTURE_OPEN_REQUEST`]: the shape of a std handle — a handle
+        /// carrying the rights of a stream, and nothing else.
+        client: HANDLE,
+    }
+
+    /// Create the fixture object and its measured handle, answering a refusal with the precondition it
+    /// broke rather than with a bare Win32 code.
     ///
-    /// `conceded` is the mask the fixture's own DACL grants this process, and it belongs in the
-    /// message because a create refused by the descriptor the test wrote can only mean one thing:
-    /// that mask withholds a right the **creator** asked for. The create runs the same access check
-    /// as everything else here, against the supplied descriptor, for the data rights of a stream
-    /// (`GENERIC_READ` for the read end, `GENERIC_WRITE` for the write end) — so
-    /// `ERROR_ACCESS_DENIED` on this call names a fixture whose mask forgot its own creator, not a
-    /// Windows the grant path cannot work on.
+    /// **A named pipe, on a name nothing else uses, and not the anonymous `CreatePipe` these fixtures
+    /// used to be** — and the object kind is the whole reason the two fixtures stopped inverting:
     ///
-    /// `Err` carries the code so that a test which needs the object can report the exact refusal: a
-    /// create the fixture's own DACL defeats is a mask that withheld a right the creator asked for,
-    /// which is a failure to surface and never a reason to skip the measurement that follows.
+    /// * An anonymous pipe has no name, so it can never be reopened: the descriptor the test supplied
+    ///   is the only thing it was ever judged by, and nothing can be pointed back at the object to ask
+    ///   what its stored DACL actually says. npfs implements pipes under `\Device\NamedPipe`, and no
+    ///   page documents which descriptor a handle-based `GetSecurityInfo` or `DuplicateHandle` consults
+    ///   for a name-less pipe — the per-instance one, or the device's, which concedes `READ_CONTROL`
+    ///   but not `WRITE_DAC` to a normal user. That one descriptor predicts both inversions this
+    ///   fixture file produced, and neither could be told apart from a working fixture.
+    /// * A named pipe instance is a securable **named** object with its own DACL, documented to carry
+    ///   the standard rights — both security rights the grant path needs included — and the name lets
+    ///   the same object be opened again with a specific rights mask, so the same DACL can be measured
+    ///   through two handles and re-checked after every change.
+    ///
+    /// `PIPE_ACCESS_INBOUND` rather than `PIPE_ACCESS_DUPLEX` is the one deliberate difference from the
+    /// obvious spelling: the create asks for the server handle's access in the *generic* form the
+    /// object manager maps to specific rights before the check (`GENERIC_READ` here, whose mapped
+    /// rights all sit inside the masks below), whereas `DUPLEX` or `OUTBOUND` would put `GENERIC_WRITE`
+    /// in the request, whose mapping reaches `FILE_WRITE_ATTRIBUTES` — a bit the fixture masks
+    /// deliberately do not contain. The data-channel control therefore runs client → server.
+    /// `FILE_FLAG_FIRST_PIPE_INSTANCE` makes a name collision an error rather than a second instance
+    /// quietly sharing a pipe mode, and `PIPE_REJECT_REMOTE_CLIENTS` keeps a test object off the wire.
+    ///
+    /// `conceded` is the mask the fixture's own DACL grants this process, and it belongs in the message
+    /// because a create the supplied descriptor defeats can only mean that mask withheld a right the
+    /// **creator** asked for: the create runs the same access check as everything else here, against
+    /// that very descriptor. `Err` carries the code so the test that needed the object can report the
+    /// exact refusal — a fixture whose mask forgot its own creator is a regression to surface, and
+    /// never a condition to skip past.
     fn create_fixture_pipe(
         attrs: &SECURITY_ATTRIBUTES,
         conceded: u32,
-    ) -> Result<(HANDLE, HANDLE), (WIN32_ERROR, String)> {
-        let mut read: HANDLE = std::ptr::null_mut();
-        let mut write: HANDLE = std::ptr::null_mut();
-        // SAFETY: two out-parameters, plus a security-attributes block naming a live descriptor the
-        // caller owns and keeps alive across the call.
-        let made = unsafe { CreatePipe(&mut read, &mut write, attrs, 0) };
-        if made == 0 {
+    ) -> Result<FixturePipe, (WIN32_ERROR, String)> {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = format!("\\\\.\\pipe\\marmel-test-{}-{seq}", std::process::id());
+        let wide_name = WideString::new(&name);
+        // SAFETY: the name buffer outlives the call, `attrs` names a live absolute descriptor the
+        // caller owns and keeps alive across the call, and every remaining argument is a value the API
+        // documents for a byte-mode pipe.
+        let server = unsafe {
+            CreateNamedPipeW(
+                wide_name.pcwstr(),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                attrs,
+            )
+        };
+        if server.is_null() || server == INVALID_HANDLE_VALUE {
             let code = unsafe { GetLastError() };
             return Err((
                 code,
                 format!(
-                    "CreatePipe refused the object it was creating (win32 error {code}): {detail}; \
-                     the create-time access check runs against the descriptor the fixture wrote, \
-                     whose DACL concedes 0x{conceded:08X} to this process — the data rights of the \
-                     two ends it hands back (GENERIC_READ on the read end, GENERIC_WRITE on the \
-                     write end) are part of that request",
+                    "CreateNamedPipeW({name}) refused to create the fixture object (win32 error \
+                     {code}): {detail}; the create-time access check runs against the descriptor the \
+                     fixture wrote, whose DACL concedes 0x{conceded:08X} to this process, and \
+                     `FILE_FLAG_FIRST_PIPE_INSTANCE` means the same refusal can also mean the name \
+                     was not free",
                     detail = last_win32_error(),
                 ),
             ));
         }
-        Ok((read, write))
+        // The handle the tests measure, opened with the one pinned request both fixtures use.
+        // `FIXTURE_OPEN_REQUEST` spells specific rights on purpose: a request carrying generic bits
+        // would be mapped by the object manager before the check, and the fixture would then be
+        // measuring the mapping rather than its own DACL.
+        let client = unsafe {
+            CreateFileW(
+                wide_name.pcwstr(),
+                FIXTURE_OPEN_REQUEST,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if client.is_null() || client == INVALID_HANDLE_VALUE {
+            let code = unsafe { GetLastError() };
+            // SAFETY: the server end is the only handle this function made so far, and it is released
+            // before the failure is reported, so a fixture that never came to be leaks nothing.
+            unsafe { CloseHandle(server) };
+            return Err((
+                code,
+                format!(
+                    "CreateFileW({name}) refused the measured handle of the fixture object (win32 \
+                     error {code}): {detail}; the request asks 0x{request:08X} — the specific data \
+                     rights of a stream — which the fixture's own DACL (0x{conceded:08X}) contains",
+                    detail = last_win32_error(),
+                    request = FIXTURE_OPEN_REQUEST,
+                ),
+            ));
+        }
+        Ok(FixturePipe {
+            name,
+            server,
+            client,
+        })
+    }
+
+    /// Open the fixture **again** by name, asking `request` of it, and report a refusal together with
+    /// the message that names it.
+    ///
+    /// Reopening is what a named object makes possible and an anonymous pipe never did: this is a fresh
+    /// access check against the object's **stored** DACL, so it answers the one question both fixtures
+    /// depend on — does the DACL on the object concede (or refuse) `request` to this token, right now —
+    /// independently of every handle that already exists and whatever rights it froze at its own open.
+    fn reopen_fixture(
+        fixture: &FixturePipe,
+        request: u32,
+    ) -> Result<HANDLE, (WIN32_ERROR, String)> {
+        let wide_name = WideString::new(&fixture.name);
+        // SAFETY: the name buffer outlives the call, and every other argument is a value.
+        let handle = unsafe {
+            CreateFileW(
+                wide_name.pcwstr(),
+                request,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            let code = unsafe { GetLastError() };
+            return Err((
+                code,
+                format!(
+                    "CreateFileW({name} asking 0x{request:08X}) was refused (win32 error {code}): \
+                     {detail}",
+                    name = fixture.name,
+                    detail = last_win32_error(),
+                ),
+            ));
+        }
+        Ok(handle)
+    }
+
+    /// Push exactly one byte from `write_end` to `read_end` and assert it arrived: the positive control
+    /// that the object behind a fixture handle is genuinely usable **as a data channel**.
+    ///
+    /// Without it, "the security call was refused" could also mean "nothing lives behind this handle,
+    /// and it answers `ERROR_ACCESS_DENIED` to everything". With it, the only thing a security refusal
+    /// can still mean is the security right that was withheld.
+    fn fixture_carries_one_byte(write_end: HANDLE, read_end: HANDLE) {
+        let mut written = 0u32;
+        // SAFETY: a one-byte buffer, a live handle, and one out-parameter.
+        let wrote = unsafe {
+            WriteFile(
+                write_end,
+                b"x".as_ptr(),
+                1,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            wrote != 0 && written == 1,
+            "WriteFile on the fixture handle {write_end:p} must work: its DACL concedes the data \
+             rights of a stream (0x{:08X}) — {}",
+            FIXTURE_DATA_ACCESS,
+            last_win32_error()
+        );
+        let mut buffer = [0u8; 1];
+        let mut got = 0u32;
+        // SAFETY: a one-byte buffer, a live handle, and one out-parameter.
+        let arrived = unsafe {
+            ReadFile(
+                read_end,
+                buffer.as_mut_ptr(),
+                1,
+                &mut got,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            arrived != 0 && got == 1 && buffer == *b"x",
+            "ReadFile on the fixture handle {read_end:p} must return the byte {write_end:p} wrote: \
+             {}",
+            last_win32_error()
+        );
+    }
+
+    /// An ACL that `SetEntriesInAclW` allocated, released by `LocalFree` when this value is dropped.
+    ///
+    /// The contrast fixture chains three of these and the grant path allocates another; an ACL released
+    /// only on the success path leaks on exactly the paths a failing assertion takes, so ownership, not
+    /// an error branch, does the releasing.
+    struct OwnedAcl {
+        dacl: *mut ACL,
+    }
+
+    impl OwnedAcl {
+        /// The ACL itself, as `SetSecurityInfo` and the next link of a chain want it.
+        fn acl(&self) -> *mut ACL {
+            self.dacl
+        }
+    }
+
+    impl Drop for OwnedAcl {
+        fn drop(&mut self) {
+            // SAFETY: `dacl` is the ACL `SetEntriesInAclW` allocated for this value alone;
+            // `SetSecurityInfo` copies an ACL into the object's descriptor rather than adopting it, so
+            // nothing outlives this release.
+            unsafe { LocalFree(self.dacl as *mut c_void) };
+        }
+    }
+
+    /// Add exactly one ACE to `old`: one `EXPLICIT_ACCESS_W`, one `SetEntriesInAclW`, one ACL.
+    ///
+    /// One entry per call is a decision, not shyness. `SetEntriesInAclW` emits exactly one ACE per
+    /// entry and **sorts** the result, deny ACEs ahead of allow ACEs, so a mixed grant/deny array
+    /// leaves the caller with two coexisting ACEs in an order the source neither controls nor may
+    /// assert by position — a fixture that "proves" its deny by array position is proving nothing.
+    /// Built one entry at a time, every ACE has a line of code behind it and the sort becomes something
+    /// the read-back checks.
+    ///
+    /// The trustee is the SID form the backend uses everywhere (`TRUSTEE_IS_SID`, built by
+    /// `BuildTrusteeWithSidW`) and inheritance is `NO_INHERITANCE`: a pipe instance is an object, not a
+    /// container, so an ACE written here is an ACE that counts for this object alone.
+    ///
+    /// `purpose` names this ACE in the failure message, because a `SetEntriesInAclW` refusal inside a
+    /// chain whose three steps each mean something different is otherwise undiagnosable.
+    fn add_ace(
+        old: *const ACL,
+        mode: ACCESS_MODE,
+        mask: u32,
+        trustee: PSID,
+        purpose: &str,
+    ) -> Result<OwnedAcl, WindowsSandboxError> {
+        let entries = [EXPLICIT_ACCESS_W {
+            grfAccessPermissions: mask,
+            grfAccessMode: mode,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: trustee_for_sid(trustee),
+        }];
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `entries` outlives the call, `trustee` is an allocated SID the caller keeps alive,
+        // `old` is null or the ACL of the previous link whose `OwnedAcl` the caller keeps alive until
+        // this one exists, and the out-parameter is a valid pointer.
+        let built =
+            unsafe { SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), old, &mut dacl) };
+        if built != ERROR_SUCCESS {
+            // SAFETY: a failed build either left the out-parameter null — `LocalFree(NULL)` does
+            // nothing — or left an ACL nothing else can reach.
+            if !dacl.is_null() {
+                unsafe { LocalFree(dacl as *mut c_void) };
+            }
+            return Err(WindowsSandboxError::AclMutate {
+                path: purpose.to_string(),
+                reason: format!(
+                    "SetEntriesInAclW(one {purpose} entry, mask 0x{mask:08X}) failed: {}",
+                    last_win32_error()
+                ),
+                code: built,
+            });
+        }
+        Ok(OwnedAcl { dacl })
+    }
+
+    /// A well-known SID by its documented string form, copied into an [`OwnedSid`] so that the block
+    /// `ConvertStringSidToSidW` allocated is released on every path, the error paths included.
+    fn well_known_sid(text: &str) -> Result<OwnedSid, WindowsSandboxError> {
+        let wide = WideString::new(text);
+        let mut sid: PSID = std::ptr::null_mut();
+        // SAFETY: the name buffer outlives the call, and the out-parameter is a valid pointer into
+        // which the API writes the SID it allocates.
+        let made = unsafe { ConvertStringSidToSidW(wide.pcwstr(), &mut sid) };
+        if made == 0 || sid.is_null() {
+            return Err(WindowsSandboxError::Sid {
+                reason: format!(
+                    "ConvertStringSidToSidW({text}) failed: {}",
+                    last_win32_error()
+                ),
+                code: unsafe { GetLastError() },
+            });
+        }
+        let copied = OwnedSid::copy(sid);
+        // SAFETY: `LocalFree` is the documented release of the block `ConvertStringSidToSidW`
+        // allocated, and the copy `OwnedSid::copy` made is what this function hands back — so the
+        // original dies here even on the path where `copied` is an error.
+        unsafe { LocalFree(sid) };
+        copied
+    }
+
+    /// One ACE of a DACL as it was read back off the object: kind, flags, access mask, and the trustee
+    /// rendered to its `S-…` string form.
+    struct AceDump {
+        kind: u8,
+        flags: u8,
+        mask: u32,
+        trustee: String,
+    }
+
+    impl AceDump {
+        /// The ACE in the shape an assertion message needs: everything a mask regression has to be
+        /// recognised by, and every mask in hex.
+        fn describe(&self) -> String {
+            let kind = match self.kind {
+                ACCESS_ALLOWED_ACE_TYPE => "ALLOW",
+                ACCESS_DENIED_ACE_TYPE => "DENY",
+                _ => "OTHER",
+            };
+            format!(
+                "{kind} flags 0x{:02X} mask 0x{:08X} trustee {}",
+                self.flags, self.mask, self.trustee
+            )
+        }
+    }
+
+    /// Read the DACL the object behind `handle` really has and flatten every ACE in it — probe P1 of
+    /// the fixture design, and the probe whose answer decides whether any other measurement here means
+    /// anything.
+    ///
+    /// `handle` has to carry `READ_CONTROL` **itself**: `GetSecurityInfo` does not re-run the access
+    /// check, it asks the object manager to validate the rights the handle was given, so the answer is
+    /// a statement about this handle and this object and nothing else.
+    fn read_back_dacl(handle: HANDLE, object: &str) -> Result<Vec<AceDump>, WindowsSandboxError> {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle names one live object, and every out-parameter is a valid pointer.
+        let code = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                &mut sacl,
+                &mut sd,
+            )
+        };
+        let _ = sacl; // the SACL is not what these fixtures author
+        if code != ERROR_SUCCESS {
+            // SAFETY: `LocalFree` is the documented release of whatever the read allocated, and
+            // `LocalFree(NULL)` is defined to do nothing.
+            unsafe { LocalFree(sd) };
+            return Err(WindowsSandboxError::AclRead {
+                path: object.to_string(),
+                reason: format!(
+                    "GetSecurityInfo(DACL_SECURITY_INFORMATION) through the handle {handle:p} of \
+                     {object} could not read the DACL: {}",
+                    last_win32_error()
+                ),
+                code,
+            });
+        }
+        let dumped = dump_dacl(dacl, handle, object);
+        // SAFETY: every ACE the dump copied out of belongs to this descriptor, and nothing the
+        // returned `Vec` holds points into it any more.
+        unsafe { LocalFree(sd) };
+        dumped
+    }
+
+    /// Flatten one DACL into `(kind, flags, mask, trustee)` per ACE — refusing to let a NULL DACL or an
+    /// unreadable list pass for an empty one, because a NULL DACL grants every principal everything and
+    /// every refusal measured downstream of it would be vacuous.
+    fn dump_dacl(
+        dacl: *mut ACL,
+        through: HANDLE,
+        object: &str,
+    ) -> Result<Vec<AceDump>, WindowsSandboxError> {
+        if dacl.is_null() {
+            return Err(WindowsSandboxError::AclVerification {
+                path: object.to_string(),
+                reason: format!(
+                    "the DACL of {object} read through the handle {through:p} is NULL: a fixture \
+                     that supplied its own descriptor always has a DACL, and a NULL DACL grants \
+                     every principal everything — so every refusal asserted downstream of it proves \
+                     nothing"
+                ),
+            });
+        }
+        let mut size = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        // SAFETY: the ACL and the information buffer belong to this call.
+        let sized = unsafe {
+            GetAclInformation(
+                dacl,
+                std::ptr::from_mut(&mut size).cast::<c_void>(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        };
+        if sized == 0 {
+            return Err(WindowsSandboxError::AclRead {
+                path: object.to_string(),
+                reason: format!(
+                    "GetAclInformation(AclSizeInformation) on the DACL of {object} failed: {}",
+                    last_win32_error()
+                ),
+                code: unsafe { GetLastError() },
+            });
+        }
+        let mut dumped = Vec::new();
+        for index in 0..size.AceCount {
+            let mut ace: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `GetAce` reads the ACL it is given and writes one pointer.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                return Err(WindowsSandboxError::AclRead {
+                    path: object.to_string(),
+                    reason: format!(
+                        "GetAce(index {index}) on the DACL of {object} failed: {}",
+                        last_win32_error()
+                    ),
+                    code: unsafe { GetLastError() },
+                });
+            }
+            let typed: *const ACCESS_ALLOWED_ACE = ace.cast();
+            // SAFETY: `ACCESS_ALLOWED_ACE` and `ACCESS_DENIED_ACE` share their layout — `ACE_HEADER`,
+            // then the access mask, then the trustee SID — which is what lets this one read cover both
+            // kinds, and `GetAce` guarantees the pointer is valid for the ACE's own size.
+            let access = unsafe { &*typed };
+            let trustee = unsafe {
+                // SAFETY: the trustee SID of an access-ACE starts at `SidStart`, which is inside the
+                // ACE `GetAce` just handed out, and `sid_to_string` only reads the SID it is given.
+                sid_to_string(
+                    std::ptr::from_ref(&access.SidStart)
+                        .cast::<c_void>()
+                        .cast_mut(),
+                )
+            }?;
+            dumped.push(AceDump {
+                kind: access.Header.AceType,
+                flags: access.Header.AceFlags,
+                mask: access.Mask,
+                trustee,
+            });
+        }
+        Ok(dumped)
+    }
+
+    /// Assert the shape of a read-back DACL — probe P1 in its hard form: exactly as many ACEs as were
+    /// authored, each present with the trustee, kind and mask it was authored with, no ACE carrying
+    /// inheritance flags, and the first authored ACE sitting first in the list.
+    ///
+    /// This is the assertion that makes a mask regression name itself instead of inverting the test.
+    /// Every refusal these fixtures report is then a refusal of a DACL whose contents have just been
+    /// proven on the record; an ACL holding SIDs this test never wrote — the shape of
+    /// `\Device\NamedPipe`, or of the token's default DACL — fails here, with both lists printed and
+    /// every mask in hex, rather than three calls later as an opaque `ERROR_ACCESS_DENIED`.
+    ///
+    /// `expected` is ordered the way the recipe writes the ACL, and index 0 is asserted positionally:
+    /// `SetEntriesInAclW` sorts deny ACEs ahead of allow ACEs, and the contrast fixture's refusal leans
+    /// on that order, so it is checked and not assumed.
+    fn assert_dacl_is(
+        object: &str,
+        handle: HANDLE,
+        expected: &[(&str, u8, u32)],
+    ) -> Result<(), WindowsSandboxError> {
+        let dump = read_back_dacl(handle, object)?;
+        let authored = expected
+            .iter()
+            .copied()
+            .map(|(trustee, kind, mask)| {
+                format!("type {kind} flags 0x00 mask 0x{mask:08X} trustee {trustee}")
+            })
+            .collect::<Vec<_>>()
+            .join("  |  ");
+        let shown = dump
+            .iter()
+            .map(AceDump::describe)
+            .collect::<Vec<_>>()
+            .join("  |  ");
+        assert_eq!(
+            dump.len(),
+            expected.len(),
+            "{object}: the DACL read through the handle {handle:p} holds {} ACE(s) — [ {shown} ] — \
+             but this test authored {} — [ {authored} ]. A different list means the descriptor the \
+             fixture supplied is not the descriptor on the object, and every security outcome measured \
+             through it belongs to somebody else's DACL.",
+            dump.len(),
+            expected.len(),
+        );
+        let mut remaining = dump;
+        for (index, (trustee, kind, mask)) in expected.iter().copied().enumerate() {
+            let found = remaining.iter().position(|ace| {
+                ace.kind == kind && ace.mask == mask && ace.trustee == trustee && ace.flags == 0
+            });
+            let Some(found) = found else {
+                let shown = remaining
+                    .iter()
+                    .map(AceDump::describe)
+                    .collect::<Vec<_>>()
+                    .join("  |  ");
+                panic!(
+                    "{object}: the DACL read through the handle {handle:p} does not carry an ACE this \
+                     test authored — expected type {kind} with mask 0x{mask:08X} for trustee \
+                     {trustee}, with no inheritance flags, among [ {shown} ]; authored in full: \
+                     [ {authored} ]"
+                );
+            };
+            if index == 0 {
+                assert_eq!(
+                    found, 0,
+                    "{object}: the first ACE of the DACL read through {handle:p} must be the first \
+                     ACE this test authored (type {kind}, mask 0x{mask:08X}, trustee {trustee}) — \
+                     `SetEntriesInAclW` sorts a deny ACE ahead of the allow ACEs, and this fixture's \
+                     refusal is only meaningful if that is what the object holds; the list read back \
+                     is [ {shown} ]"
+                );
+            }
+            remaining.remove(found);
+        }
+        Ok(())
+    }
+
+    /// Assert the shape of the descriptor a fixture is about to create its object with — probe P2, and
+    /// the cheapest way to tell a real security fixture from one that quietly ran on the token's
+    /// default DACL: `nLength` has to name the attributes block itself; the descriptor has to be the
+    /// absolute format `InitializeSecurityDescriptor` produced, at revision 1; `SE_DACL_PRESENT` has to
+    /// be set because the ACL was attached; `SE_DACL_DEFAULTED` has to be clear because the ACL was
+    /// written rather than inferred; and `SE_DACL_PROTECTED` has to be set so that nothing the object
+    /// inherits from its container can join the ACE list the read-back asserts on.
+    fn assert_descriptor_shape(
+        descriptor: &TestDescriptor,
+        attrs: &SECURITY_ATTRIBUTES,
+        object: &str,
+    ) {
+        assert_eq!(
+            attrs.nLength as usize,
+            std::mem::size_of::<SECURITY_ATTRIBUTES>(),
+            "{object}: SECURITY_ATTRIBUTES::nLength must be the size of the attributes block itself: \
+             any other value makes the create ignore the descriptor and fall back to the token's \
+             default DACL"
+        );
+        assert!(
+            !attrs.lpSecurityDescriptor.is_null(),
+            "{object}: the attributes block has to name the descriptor this test built"
+        );
+        assert_eq!(
+            u16::from(descriptor.sd.Revision),
+            SECURITY_DESCRIPTOR_REVISION as u16,
+            "{object}: the descriptor must carry revision 1 — a descriptor that does not is treated \
+             as a NULL descriptor, which grants everything"
+        );
+        assert_ne!(
+            descriptor.sd.Control & SE_DACL_PRESENT,
+            0,
+            "{object}: SE_DACL_PRESENT must be set (Control 0x{:04X}); a descriptor whose DACL is \
+             absent is a NULL DACL, which grants every principal everything and makes every refusal \
+             asserted downstream of it vacuous",
+            descriptor.sd.Control
+        );
+        assert_eq!(
+            descriptor.sd.Control & SE_DACL_DEFAULTED,
+            0,
+            "{object}: SE_DACL_DEFAULTED must be clear — the DACL here was written, not inferred \
+             (Control 0x{:04X})",
+            descriptor.sd.Control
+        );
+        assert_ne!(
+            descriptor.sd.Control & SE_DACL_PROTECTED,
+            0,
+            "{object}: SE_DACL_PROTECTED must be set, so ACEs inherited from the object's container \
+             cannot join the ACE list the read-back asserts on (Control 0x{:04X})",
+            descriptor.sd.Control
+        );
     }
 
     /// One SID owned by this test: `CopySid` wrote it into a `u32`-aligned buffer, which is the
@@ -5340,15 +5905,25 @@ mod tests {
     struct TestDescriptor {
         /// Boxed so its address stays put while `SECURITY_ATTRIBUTES` points at it.
         sd: Box<SECURITY_DESCRIPTOR>,
-        /// The DACL `SetEntriesInAclW` allocated for the descriptor, released on drop — the object is
-        /// created from a copy of the descriptor, so the ACL outlives every use here and nothing else.
-        dacl: *mut ACL,
+        /// The DACL `SetEntriesInAclW` allocated for the descriptor, released when this value drops —
+        /// the object is created from a copy of the descriptor, so the ACL outlives every use here and
+        /// nothing else. Never read: it is kept solely so the release happens on every path, error
+        /// paths and panics included (the `_` prefix names that intent, as elsewhere in this file).
+        _dacl: OwnedAcl,
     }
 
     impl TestDescriptor {
-        /// Grant `allow` to this process, and — when `deny` is not `0` — refuse it `deny` as well, with
-        /// nobody else on the list. `SetEntriesInAclW` orders a deny ACE ahead of the allow ACEs, so the
-        /// refused rights stay refused.
+        /// Grant `allow` to this process alone, with nobody else on the list: one `EXPLICIT_ACCESS_W`,
+        /// one `SetEntriesInAclW` call, one ACE.
+        ///
+        /// There is no deny parameter here, and that is a decision. `SetEntriesInAclW` emits exactly one
+        /// ACE per entry and sorts the ACL it returns, so one call holding both a grant and a deny for
+        /// one trustee leaves two coexisting ACEs in an order the source neither controls nor may assert
+        /// by position; and a deny aimed at the very principal that **owns** the object is the weakest
+        /// way to say "denied" there is, because the owner reaches `READ_CONTROL | WRITE_DAC` through
+        /// the owner path unless an `OWNER RIGHTS` ACE restricts it. The contrast fixture therefore
+        /// refuses the security rights through a *sequence* of single-entry writes ([`add_ace`]) whose
+        /// result the read-back ([`assert_dacl_is`]) then proves.
         ///
         /// The ACE has the shape a non-container object needs, which is also the shape the production
         /// grant uses: `GRANT_ACCESS` — access is conceded, never implicit; a trustee in SID form
@@ -5358,26 +5933,13 @@ mod tests {
         /// which on an object that supports no inheritance leaves a plain `ACCESS_ALLOWED_ACE` with no
         /// `INHERIT_ONLY_ACE` bit — so the ACE counts for the object it is written on, which is the
         /// only object this fixture has.
-        fn for_caller(
-            allow: u32,
-            deny: u32,
-            caller: &OwnedSid,
-        ) -> Result<Self, WindowsSandboxError> {
-            let trustee = trustee_for_sid(caller.sid());
-            let mut entries = vec![EXPLICIT_ACCESS_W {
+        fn for_caller(allow: u32, caller: &OwnedSid) -> Result<Self, WindowsSandboxError> {
+            let entries = [EXPLICIT_ACCESS_W {
                 grfAccessPermissions: allow,
                 grfAccessMode: GRANT_ACCESS,
                 grfInheritance: NO_INHERITANCE,
-                Trustee: trustee,
+                Trustee: trustee_for_sid(caller.sid()),
             }];
-            if deny != 0 {
-                entries.push(EXPLICIT_ACCESS_W {
-                    grfAccessPermissions: deny,
-                    grfAccessMode: DENY_ACCESS,
-                    grfInheritance: NO_INHERITANCE,
-                    Trustee: trustee,
-                });
-            }
             let mut dacl: *mut ACL = std::ptr::null_mut();
             // SAFETY: `entries` outlives the call, and a null old ACL means "start from these entries
             // alone" — which is exactly a DACL that names no one but this process.
@@ -5396,6 +5958,9 @@ mod tests {
                     code: built,
                 });
             }
+            // The ACL is owned from the moment it exists, so every path below — error paths included —
+            // releases it without an error branch having to remember to.
+            let dacl = OwnedAcl { dacl };
             let mut sd = Box::new(SECURITY_DESCRIPTOR {
                 Revision: 0,
                 Sbz1: 0,
@@ -5420,8 +5985,6 @@ mod tests {
                 ERROR_SUCCESS
             };
             if initialised_error != ERROR_SUCCESS {
-                // SAFETY: the ACL reached no descriptor, so this call releases it itself.
-                unsafe { LocalFree(dacl as *mut c_void) };
                 return Err(WindowsSandboxError::AclMutate {
                     path: "the fixture descriptor".to_string(),
                     reason: format!(
@@ -5431,26 +5994,44 @@ mod tests {
                     code: initialised_error,
                 });
             }
+            // `SE_DACL_PROTECTED`: the object created from this descriptor has to hold exactly the ACEs
+            // this test wrote. ACEs marked inheritable in the object's container are copied into an
+            // object's DACL when it is created, and a fixture whose read-back then shows SIDs nobody
+            // authored — or whose refusal turns out to have been authorised by an inherited ACE — is
+            // measuring somebody else's policy.
+            // SAFETY: the pointer names the live, initialised descriptor, and both control masks are
+            // plain bit values.
+            let protected = unsafe {
+                SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+            };
+            if protected == 0 {
+                return Err(WindowsSandboxError::AclMutate {
+                    path: "the fixture descriptor".to_string(),
+                    reason: format!(
+                        "SetSecurityDescriptorControl(SE_DACL_PROTECTED) failed: {}",
+                        last_win32_error()
+                    ),
+                    code: unsafe { GetLastError() },
+                });
+            }
             // SAFETY: the descriptor is initialised, `descriptor_ptr` still names the boxed
             // descriptor (the box is not moved), and the ACL handed to it is the one this struct keeps
             // alive until drop — past every object created from it.
             let attached =
-                unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, dacl as *const ACL, 0) };
+                unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, dacl.acl().cast_const(), 0) };
             let attached_error = if attached == 0 {
                 unsafe { GetLastError() }
             } else {
                 ERROR_SUCCESS
             };
             if attached_error != ERROR_SUCCESS {
-                // SAFETY: as above — no descriptor outlives this function to reference the ACL.
-                unsafe { LocalFree(dacl as *mut c_void) };
                 return Err(WindowsSandboxError::AclMutate {
                     path: "the fixture descriptor".to_string(),
                     reason: format!("SetSecurityDescriptorDacl failed: {}", last_win32_error()),
                     code: attached_error,
                 });
             }
-            Ok(Self { sd, dacl })
+            Ok(Self { sd, _dacl: dacl })
         }
 
         /// The attributes block to hand to the create call: this descriptor, and no inheritance — the
@@ -5464,20 +6045,13 @@ mod tests {
         }
     }
 
-    impl Drop for TestDescriptor {
-        fn drop(&mut self) {
-            // SAFETY: `dacl` is the ACL `SetEntriesInAclW` allocated, and `LocalFree` is its documented
-            // release; the object created from the descriptor holds its own copy.
-            unsafe { LocalFree(self.dacl as *mut c_void) };
-        }
-    }
-
     /// A real handle, a real DACL, a real grant — on an object this test created with a descriptor it
-    /// wrote itself: `CreatePipe` with a [`TestDescriptor`] whose DACL concedes this process the data
-    /// rights of the two ends (in both spellings, see [`FIXTURE_CALLER_ACCESS`], because the create is
-    /// checked against that very descriptor) and the two security rights the grant works through. The
-    /// grant puts the AppContainer ACE on that object, and dropping the guard puts the original DACL
-    /// back.
+    /// wrote itself: a named pipe instance created with a [`TestDescriptor`] whose single ACE concedes
+    /// this process the data rights of a stream **and** the two security rights the grant works
+    /// through ([`FIXTURE_CONCEDE_ACCESS`], `0x00160083`), then opened again by name asking the data
+    /// rights alone ([`FIXTURE_OPEN_REQUEST`], `0x00100083`) so that the handle the grant runs on has
+    /// the shape of a std handle. The grant puts the AppContainer ACE on that object, and dropping the
+    /// guard puts back the DACL it read.
     ///
     /// Why the fixture has to own the descriptor: `grant_std_handle` works through
     /// [`duplicate_for_security`], and `DuplicateHandle` with an explicit desired-access mask re-runs
@@ -5489,13 +6063,18 @@ mod tests {
     /// [`test_a_foreign_handle_refuses_the_security_read_and_duplication_cannot_repair_it`]; this one
     /// proves the grant-and-restore path itself, on the only kind of object it can ever succeed on.
     ///
-    /// Of the two candidate fixtures, (A) `CreatePipe` with explicit `SECURITY_ATTRIBUTES` is chosen
-    /// over (B) `CreateFileW("\\\\.\\NUL", READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES |
-    /// SYNCHRONIZE, …)` for two reasons. `lpSecurityAttributes` is consulted only when the object is
-    /// **created**: opening the existing `NUL` device would leave its own DACL in charge, which is a
-    /// foreign object wearing a different costume, and its rights are the device's, not the caller's
-    /// choice. And the production grant is about a stream object — the anonymous pipes the one-shot
-    /// path hands to the confined child — so a pipe is the object class the test should exercise.
+    /// Why a **named** pipe rather than the anonymous `CreatePipe` this fixture used to be, and why
+    /// every mask in it is spelled in specific rights, is argued once where both fixtures are built
+    /// ([`create_fixture_pipe`], [`FIXTURE_DATA_ACCESS`]). In one line each: the descriptor a handle
+    /// reports for a name-less pipe is not a documented readout of the DACL the test wrote, and generic
+    /// bits written into a stored ACE are never expanded when the access check runs.
+    ///
+    /// The assertions therefore run in the order the fixture prescribes, so that a failure names itself:
+    /// the descriptor is checked before it is handed to the create, the object's DACL is read back and
+    /// asserted ACE by ACE **before** anything is granted ([`assert_dacl_is`]), the object is proven to
+    /// carry a byte of data, and the same object is reopened by name asking the two security rights —
+    /// the positive control that says those rights are genuinely available on this object kind, which
+    /// is what makes the companion test's refusal of them worth asserting.
     ///
     /// This test is only compiled where the Windows backend is compiled — the module is behind
     /// `#[cfg(target_os = "windows")]` in `mod.rs`, so it runs on the native Windows CI job.
@@ -5503,70 +6082,152 @@ mod tests {
     fn test_a_real_std_handle_grant_is_applied_and_then_restored() -> Result<(), WindowsSandboxError>
     {
         let caller = caller_sid()?;
-        let mut descriptor = TestDescriptor::for_caller(FIXTURE_CALLER_ACCESS, 0, &caller)?;
+        // SAFETY: `caller` owns a valid SID that `OwnedSid::copy` wrote into a DWORD-aligned buffer, and
+        // `sid_to_string` only reads the SID it is handed and releases the string it allocates.
+        let caller_sid_text = unsafe { sid_to_string(caller.sid()) }?;
+        let mut descriptor = TestDescriptor::for_caller(FIXTURE_CONCEDE_ACCESS, &caller)?;
         let attrs = descriptor.attributes();
-        let (read, write) =
-            create_fixture_pipe(&attrs, FIXTURE_CALLER_ACCESS).map_err(|(code, detail)| {
+        assert_descriptor_shape(&descriptor, &attrs, "the concede fixture");
+        let fixture =
+            create_fixture_pipe(&attrs, FIXTURE_CONCEDE_ACCESS).map_err(|(code, detail)| {
                 WindowsSandboxError::Launch {
                     reason: format!(
-                        "the fixture could not create the object its own descriptor is meant to \
-                         make possible: {detail}"
+                        "the concede fixture could not create the named pipe its own descriptor is \
+                         meant to make possible: {detail}"
                     ),
                     code,
                 }
             })?;
+        // The handle every measurement below runs on, and the handle the grant is applied through: the
+        // client end, opened with `FIXTURE_OPEN_REQUEST` — the data rights of a stream and nothing else.
+        let client = fixture.client;
+        // P1, before anything is granted: the DACL on the object is exactly the one this test wrote.
+        // The read runs through a `READ_CONTROL | WRITE_DAC` duplicate, which is the same handle class
+        // [`grant_std_handle`] works through, so the probe measures the path the code under test takes.
+        let secured = duplicate_for_security(client).map_err(|code| {
+            WindowsSandboxError::AclMutate {
+                path: fixture.name.clone(),
+                reason: format!(
+                    "DuplicateHandle(READ_CONTROL | WRITE_DAC) on the concede fixture's measured \
+                     handle {client:p} was refused, so the fixture's own ACE (mask \
+                     0x{concede:08X}) does not really concede the two rights the grant path is built \
+                     on: {detail} — duplication can only narrow what the object's DACL concedes, \
+                     never add to it",
+                    concede = FIXTURE_CONCEDE_ACCESS,
+                    detail = last_win32_error(),
+                ),
+                code,
+            }
+        })?;
+        assert_dacl_is(
+            "the concede fixture",
+            secured,
+            &[(
+                caller_sid_text.as_str(),
+                ACCESS_ALLOWED_ACE_TYPE,
+                FIXTURE_CONCEDE_ACCESS,
+            )],
+        )?;
+        // The positive control every refusal in the companion test leans on: this object, reopened by
+        // name and asking the two security rights, is granted them — so `READ_CONTROL` and `WRITE_DAC`
+        // are real on this object kind and this descriptor, and a refusal of them elsewhere can only be
+        // the DACL that refuses them, never the object class or the descriptor format.
+        let security_open =
+            reopen_fixture(&fixture, FIXTURE_OPEN_REQUEST | FIXTURE_DENIED_SECURITY).map_err(
+                |(code, detail)| WindowsSandboxError::AclMutate {
+                    path: fixture.name.clone(),
+                    reason: format!(
+                        "reopening the concede fixture asking 0x{concede:08X} was refused: {detail} \
+                         — the concede fixture exists to show that a handle which is granted the two \
+                         security rights really gets them on this object kind",
+                        concede = FIXTURE_OPEN_REQUEST | FIXTURE_DENIED_SECURITY,
+                    ),
+                    code,
+                },
+            )?;
+        assert_eq!(
+            security_read_code(security_open),
+            ERROR_SUCCESS,
+            "GetSecurityInfo(DACL_SECURITY_INFORMATION) through a handle reopened with the security \
+             rights (0x{concede:08X}) must succeed on the concede fixture, or the object kind itself \
+             cannot support the grant path: {detail}",
+            concede = FIXTURE_OPEN_REQUEST | FIXTURE_DENIED_SECURITY,
+            detail = last_win32_error(),
+        );
+        // The object is genuinely usable as a data channel, on the very handle the grant runs through:
+        // what the security calls need is not what the stream needs, and the stream side works.
+        fixture_carries_one_byte(client, fixture.server);
         let app_sid = allocate_app_package_sid(&[2, 2])?;
         assert!(
-            !handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
-            "before the grant runs, the DACL of the write end {write:p} must not yet name the \
-             AppContainer SID (mask 0x{:08X}) — it is the one this test wrote, which names only \
-             this process",
+            !handle_names_sid(client, app_sid, STD_HANDLE_ACCESS),
+            "before the grant runs, the DACL of the measured handle {client:p} must not yet name the \
+             AppContainer SID (mask 0x{:08X}) — it is the one this test wrote, which names only this \
+             process",
             STD_HANDLE_ACCESS
         );
-        let grant = grant_std_handle(write, app_sid)?;
+        let grant = grant_std_handle(client, app_sid)?;
         let Some(grant) = grant else {
-            // SAFETY: the two pipe ends and the SID are this test's to release.
+            // SAFETY: the AppContainer SID and every handle this test opened are this test's to
+            // release, including on this path, which never received a guard.
             unsafe {
                 FreeSid(app_sid);
-                CloseHandle(read);
-                CloseHandle(write);
+                CloseHandle(security_open);
+                CloseHandle(secured);
+                CloseHandle(client);
+                CloseHandle(fixture.server);
             }
             return Err(WindowsSandboxError::AclMutate {
-                path: "the test pipe".to_string(),
+                path: fixture.name.clone(),
                 reason: format!(
-                    "the write end {write:p} of the fixture pipe concedes this process \
-                     READ_CONTROL | WRITE_DAC, so the grant had to add the AppContainer ACE (mask \
-                     0x{:08X}) to its DACL and reported none instead",
-                    STD_HANDLE_ACCESS
+                    "the measured handle {client:p} of the concede fixture concedes this process \
+                     READ_CONTROL | WRITE_DAC (0x{concede:08X}), so the grant had to add the \
+                     AppContainer ACE (mask 0x{std_access:08X}) to its DACL and reported none \
+                     instead",
+                    concede = FIXTURE_CONCEDE_ACCESS,
+                    std_access = STD_HANDLE_ACCESS,
                 ),
                 code: 0,
             });
         };
         assert!(
-            handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
-            "the DACL read through the READ_CONTROL duplicate of the write end {write:p} must show \
-             the ACE this run applied (AppContainer SID, mask 0x{:08X})",
+            handle_names_sid(client, app_sid, STD_HANDLE_ACCESS),
+            "the DACL read through the READ_CONTROL duplicate of the measured handle {client:p} must \
+             show the ACE this run applied (AppContainer SID, mask 0x{:08X})",
             STD_HANDLE_ACCESS
         );
         drop(grant);
         assert!(
-            !handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
-            "the guard restores the DACL it read: the AppContainer ACE (mask 0x{:08X}) must be \
-             gone from the write end {write:p}",
+            !handle_names_sid(client, app_sid, STD_HANDLE_ACCESS),
+            "the guard restores the DACL it read: the AppContainer ACE (mask 0x{:08X}) must be gone \
+             from the measured handle {client:p}",
             STD_HANDLE_ACCESS
         );
         assert!(
-            handle_names_sid(write, caller.sid(), FIXTURE_CALLER_ACCESS),
-            "the restored DACL is the one this test wrote: the ACE granting this process the \
-             fixture mask 0x{:08X} must survive the restore on the write end {write:p}",
-            FIXTURE_CALLER_ACCESS
+            handle_names_sid(client, caller.sid(), FIXTURE_CONCEDE_ACCESS),
+            "the restored DACL is the one this test wrote: the ACE granting this process the fixture \
+             mask 0x{:08X} must survive the restore on the measured handle {client:p}",
+            FIXTURE_CONCEDE_ACCESS
         );
-        // SAFETY: the SID was allocated by `AllocateAndInitializeSid`, and the two pipe ends were
-        // created by this test.
+        // P1 once more, with the restore behind us: the object is back to the single ACE this test
+        // authored — the applied AppContainer ACE is gone, and the fixture's own ACE survived with the
+        // mask it was written with.
+        assert_dacl_is(
+            "the concede fixture, after the restore",
+            secured,
+            &[(
+                caller_sid_text.as_str(),
+                ACCESS_ALLOWED_ACE_TYPE,
+                FIXTURE_CONCEDE_ACCESS,
+            )],
+        )?;
+        // SAFETY: the SID was allocated by `AllocateAndInitializeSid`, and every handle closed here was
+        // created or duplicated by this test.
         unsafe {
             FreeSid(app_sid);
-            CloseHandle(read);
-            CloseHandle(write);
+            CloseHandle(security_open);
+            CloseHandle(secured);
+            CloseHandle(client);
+            CloseHandle(fixture.server);
         }
         Ok(())
     }
@@ -5574,10 +6235,24 @@ mod tests {
     /// The reality a duplication trick cannot move: an object whose DACL refuses `READ_CONTROL` and
     /// `WRITE_DAC` to this process refuses them to **every** handle that names it, because
     /// `DuplicateHandle` with an explicit desired-access mask re-runs the access check against the
-    /// object's own security descriptor for the calling token. Concretely: the fixture below is a pipe
-    /// created with a descriptor that allows the data rights and explicitly denies
-    /// `READ_CONTROL | WRITE_DAC`, and its DACL is out of reach both through the handle the create
-    /// returned and through a duplicate asking for exactly the rights the security calls want.
+    /// object's own security descriptor for the calling token. Concretely: the fixture below is a named
+    /// pipe whose DACL concedes the data rights of a stream, denies `READ_CONTROL | WRITE_DAC` to
+    /// `Everyone`, and reduces the owner path to `SYNCHRONIZE` with an `OWNER RIGHTS` ACE. Its DACL is
+    /// out of reach through the handle opened with the data rights alone, through a duplicate asking for
+    /// exactly the rights the security calls want, and through a fresh open by name that asks for them.
+    ///
+    /// Two decisions make that refusal worth asserting, and they are the two the predecessor of this
+    /// fixture got wrong. The deny is not aimed at this process's own SID: a deny ACE naming the
+    /// principal that **owns** the object is the weakest way to say "denied" there is, because the owner
+    /// reaches `READ_CONTROL | WRITE_DAC` by the owner path — which is exactly what made the predecessor
+    /// answer `GetSecurityInfo` with `ERROR_SUCCESS` where a refusal was asserted. So the deny is put on
+    /// a group every token belongs to, and the owner path is closed off by the `OWNER RIGHTS` ACE that
+    /// follows it. And the object is not born denied: an object that never had the rights can only ever
+    /// report a refusal, and cannot tell "this right is denied to me" from "this object never supported
+    /// the right". So the object is created while the security rights are still conceded, the read and
+    /// the rewrite are proven through a handle that had to be granted those very rights to do either,
+    /// and only then is the DACL rewritten — after which every assertion below is measured against a
+    /// DACL whose three ACEs have just been read back and asserted by name and mask.
     ///
     /// This is why the **production** stdio grant is warn-only and stays warn-only. The streams the
     /// one-shot path hands over are pipes this process did not create: the re-entry plumbing's own
@@ -5601,87 +6276,283 @@ mod tests {
     fn test_a_foreign_handle_refuses_the_security_read_and_duplication_cannot_repair_it()
     -> Result<(), WindowsSandboxError> {
         let caller = caller_sid()?;
-        // One right of difference from the fixture of the grant test: the data rights stay — in both
-        // spellings, so that the create is not what fails here — and the two security rights are
-        // explicitly refused.
-        let mut descriptor =
-            TestDescriptor::for_caller(FIXTURE_DATA_ONLY_ACCESS, FIXTURE_SECURITY_ACCESS, &caller)?;
+        // SAFETY: `caller` owns a valid SID that `OwnedSid::copy` wrote into a DWORD-aligned buffer, and
+        // `sid_to_string` only reads the SID it is handed and releases the string it allocates.
+        let caller_sid_text = unsafe { sid_to_string(caller.sid()) }?;
+        let everyone = well_known_sid(EVERYONE_SID)?;
+        let owner_rights = well_known_sid(OWNER_RIGHTS_SID)?;
+        // One right of difference from the fixture of the grant test, and it is applied later: the
+        // object is created with the very same descriptor — the data rights plus the two security
+        // rights — so that the security rights can first be proven available, and only then refused.
+        let mut descriptor = TestDescriptor::for_caller(FIXTURE_CONCEDE_ACCESS, &caller)?;
         let attrs = descriptor.attributes();
-        // The contrast object has to exist, or the two assertions below are never executed and the
-        // test goes green having measured nothing. The DACL this test wrote concedes the generic
-        // data rights `CreatePipe` asks for at create time and refuses only the two security rights,
-        // so the create is expected to succeed; a refusal here is a broken fixture — a mask that
-        // forgot the rights its own creator asked for — and that is a regression to report, not a
-        // condition to skip past. The failure names the object, the conceded mask in hex and the
-        // Win32 code, all three of which `create_fixture_pipe` already puts into `detail`.
-        let (read, write) =
-            create_fixture_pipe(&attrs, FIXTURE_DATA_ONLY_ACCESS).map_err(|(code, detail)| {
+        assert_descriptor_shape(&descriptor, &attrs, "the contrast fixture");
+        // The contrast object has to exist, or the assertions below are never executed and the test goes
+        // green having measured nothing. The descriptor this test wrote concedes the create everything
+        // it asks of the object it is creating, so the create is expected to succeed; a refusal here is
+        // a broken fixture — a mask that forgot the rights its own creator asked for — and that is a
+        // regression to report, not a condition to skip past. The failure names the object, the conceded
+        // mask in hex and the Win32 code, all three of which `create_fixture_pipe` puts into `detail`.
+        let fixture =
+            create_fixture_pipe(&attrs, FIXTURE_CONCEDE_ACCESS).map_err(|(code, detail)| {
                 WindowsSandboxError::Launch {
                     reason: format!(
-                        "the foreign-handle test could not create the contrast pipe its own \
+                        "the foreign-handle test could not create the contrast object its own \
                          descriptor is meant to make possible, so its refused security read was \
                          never measured: {detail}"
                     ),
                     code,
                 }
             })?;
-        // The object is perfectly usable for data: what is out of reach is its descriptor, not the
-        // stream. One byte proves the pipe works, so the refusals below cannot be blamed on an object
-        // that never came into being.
-        let mut written = 0u32;
-        // SAFETY: a one-byte buffer, a live write end, and one out-parameter.
-        let wrote =
-            unsafe { WriteFile(write, b"x".as_ptr(), 1, &mut written, std::ptr::null_mut()) };
-        assert!(
-            wrote != 0 && written == 1,
-            "WriteFile on the write end {write:p} must still work: the fixture DACL concedes it the \
-             data rights of a stream, {}",
-            last_win32_error()
-        );
-        let mut buffer = [0u8; 1];
-        let mut got = 0u32;
-        // SAFETY: a one-byte buffer, a live read end, and one out-parameter.
-        let read_ok =
-            unsafe { ReadFile(read, buffer.as_mut_ptr(), 1, &mut got, std::ptr::null_mut()) };
-        assert!(
-            read_ok != 0 && got == 1 && buffer == *b"x",
-            "ReadFile on the read end {read:p} must return the byte the data rights wrote: {}",
-            last_win32_error()
-        );
-        // (i) the security read through the handle the create returned is refused: that handle carries
-        // the rights of a stream, and the object's DACL does not add the security ones.
+        // The handle the refusals are measured through: opened with the same pinned request as the
+        // concede fixture, so the two fixtures differ in nothing but what the object's DACL says.
+        let client = fixture.client;
+        // P1 on the object as it was born: one ACE, this process, the concede mask. This is the read
+        // that proves the descriptor this test supplied really is the descriptor on the object — not the
+        // one `\Device\NamedPipe` carries, and not the token's default DACL. The handle it reads through
+        // is the duplicate the grant path itself would make, and that duplicate exists only because the
+        // DACL concedes both security rights: `READ_CONTROL` for this read, `WRITE_DAC` for the rewrite
+        // that follows.
+        let probe = duplicate_for_security(client).map_err(|code| {
+            WindowsSandboxError::AclMutate {
+                path: fixture.name.clone(),
+                reason: format!(
+                    "DuplicateHandle(READ_CONTROL | WRITE_DAC) on the contrast fixture's measured \
+                     handle {client:p} was refused while the fixture still conceded both rights (mask \
+                     0x{concede:08X}), so this object kind cannot carry the grant path at all and the \
+                     refusal asserted below would prove nothing: {detail}",
+                    concede = FIXTURE_CONCEDE_ACCESS,
+                    detail = last_win32_error(),
+                ),
+                code,
+            }
+        })?;
+        assert_dacl_is(
+            "the contrast fixture, as created",
+            probe,
+            &[(
+                caller_sid_text.as_str(),
+                ACCESS_ALLOWED_ACE_TYPE,
+                FIXTURE_CONCEDE_ACCESS,
+            )],
+        )?;
         assert_eq!(
-            security_read_code(write),
-            ERROR_ACCESS_DENIED,
-            "GetSecurityInfo(DACL_SECURITY_INFORMATION) through the data-rights handle {write:p} \
-             must be refused: the fixture DACL denies this process READ_CONTROL"
+            security_read_code(probe),
+            ERROR_SUCCESS,
+            "GetSecurityInfo(DACL_SECURITY_INFORMATION) through the handle {probe:p} made for it must \
+             succeed while the fixture concedes READ_CONTROL — otherwise the refusal asserted below is \
+             the object kind talking, not the deny: {detail}",
+            detail = last_win32_error(),
         );
-        // (ii) and duplicating the handle asking for exactly the rights the security calls need does
-        // not repair it: the copy is granted what the object's descriptor concedes, and nothing more.
-        match duplicate_for_security(write) {
+        // The rewrite, which is at the same time the `WRITE_DAC` probe: three single-entry
+        // `SetEntriesInAclW` calls chained on each other — this process's data rights, the two security
+        // rights denied to a group this token belongs to, and `OWNER RIGHTS` reduced to `SYNCHRONIZE` so
+        // the owner path cannot resurrect the refused rights through the mere fact that this process
+        // owns the object. Every ACL the chain allocates is owned by an `OwnedAcl` and released on the
+        // way out, the panicking way included.
+        let allowed = add_ace(
+            std::ptr::null(),
+            GRANT_ACCESS,
+            FIXTURE_DATA_ACCESS,
+            caller.sid(),
+            "the contrast fixture's data-rights allow",
+        )?;
+        let denied = add_ace(
+            allowed.acl(),
+            DENY_ACCESS,
+            FIXTURE_DENIED_SECURITY,
+            everyone.sid(),
+            "the contrast fixture's security-rights deny",
+        )?;
+        let restricted_owner = add_ace(
+            denied.acl(),
+            GRANT_ACCESS,
+            FIXTURE_OWNER_RIGHTS_ALLOW,
+            owner_rights.sid(),
+            "the contrast fixture's OWNER RIGHTS restriction",
+        )?;
+        // SAFETY: `probe` carries `WRITE_DAC` — which is what made this rewrite possible at all — and
+        // `restricted_owner` owns the ACL the API copies into the object's descriptor.
+        let set = unsafe {
+            SetSecurityInfo(
+                probe,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                restricted_owner.acl().cast_const(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            set,
+            ERROR_SUCCESS,
+            "SetSecurityInfo(DACL_SECURITY_INFORMATION) through the WRITE_DAC handle {probe:p} must \
+             succeed: this is the probe that proves the fixture's object kind can rewrite its DACL at \
+             all, which is half of what the production grant path needs — the write answered (win32 \
+             error {set}) and said: {detail}",
+            detail = last_win32_error(),
+        );
+        // P1 on the object as it now stands, still read through the handle whose `READ_CONTROL` was
+        // frozen when it was opened. Three ACEs: the deny first, because that is the order
+        // `SetEntriesInAclW` sorts them into and the order the refusal below relies on; this process's
+        // data allow; and the owner restriction. This is also the owner-path discriminator — the ACE
+        // whose absence would let the owner path hand the security rights back is named here, with its
+        // mask, before a single refusal is asserted.
+        assert_dacl_is(
+            "the contrast fixture, after the deny",
+            probe,
+            &[
+                (
+                    EVERYONE_SID,
+                    ACCESS_DENIED_ACE_TYPE,
+                    FIXTURE_DENIED_SECURITY,
+                ),
+                (
+                    caller_sid_text.as_str(),
+                    ACCESS_ALLOWED_ACE_TYPE,
+                    FIXTURE_DATA_ACCESS,
+                ),
+                (
+                    OWNER_RIGHTS_SID,
+                    ACCESS_ALLOWED_ACE_TYPE,
+                    FIXTURE_OWNER_RIGHTS_ALLOW,
+                ),
+            ],
+        )?;
+        // (i) The measured handle is obtainable with the pinned request, and the object behind it is
+        // genuinely usable for data: what is out of reach is its descriptor, not the stream. One byte
+        // each way proves that, so the refusals below cannot be blamed on an object that never came into
+        // being. (`PIPE_ACCESS_INBOUND` gives the object one direction, client → server.)
+        fixture_carries_one_byte(client, fixture.server);
+        // (ii) The security read through the measured handle is refused: that handle carries the rights
+        // of a stream, the read is judged by what the handle was given, and the object's DACL now refuses
+        // the security ones to this token.
+        assert_eq!(
+            security_read_code(client),
+            ERROR_ACCESS_DENIED,
+            "GetSecurityInfo(DACL_SECURITY_INFORMATION) through the data-rights handle {client:p} must \
+             be refused: the DACL read back through {probe:p} denies READ_CONTROL to \
+             {everyone_sid}, and the OWNER RIGHTS ACE {owner_sid} leaves the owner path 0x{owner_mask:08X}",
+            everyone_sid = EVERYONE_SID,
+            owner_sid = OWNER_RIGHTS_SID,
+            owner_mask = FIXTURE_OWNER_RIGHTS_ALLOW,
+        );
+        // (iii) And the refusal is the DACL's, not the handle's: reopening the same object by name and
+        // asking for the two security rights — a fresh check against the object's stored DACL, which no
+        // existing handle can influence — is refused, where the identical call on the concede fixture is
+        // granted. Same object kind, same create, same pinned open mask, opposite answers: this is the
+        // pair that stops the two fixtures being mirror images of a mechanism that never ran.
+        match reopen_fixture(&fixture, FIXTURE_OPEN_REQUEST | FIXTURE_DENIED_SECURITY) {
+            Ok(reopened) => {
+                // SAFETY: this call opened the handle, and it is closed before the assertion fails.
+                unsafe { CloseHandle(reopened) };
+                panic!(
+                    "CreateFileW(0x{concede:08X} on {name}) was granted after the deny, so the DACL \
+                     read back above does not refuse the security rights it is asserted to refuse: the \
+                     owner path, an inherited ACE, or a deny ACE that does not apply to this token are \
+                     the candidates",
+                    name = fixture.name,
+                    concede = FIXTURE_OPEN_REQUEST | FIXTURE_DENIED_SECURITY,
+                );
+            }
+            Err((code, detail)) => assert_eq!(
+                code, ERROR_ACCESS_DENIED,
+                "reopening the contrast fixture with the security rights must be refused by its DACL — \
+                 the concede fixture, reopened the same way, is granted them: {detail}"
+            ),
+        }
+        // (iv) Duplicating the handle and asking for exactly the rights the security calls need does not
+        // repair it: the copy is granted what the object's descriptor concedes, and nothing more.
+        match duplicate_for_security(client) {
             Err(code) => assert_eq!(
                 code, ERROR_ACCESS_DENIED,
-                "DuplicateHandle(READ_CONTROL | WRITE_DAC) on the data-rights handle {write:p} is \
-                 judged against the object's DACL, which denies both of those rights to this \
-                 process"
+                "DuplicateHandle(READ_CONTROL | WRITE_DAC) on the data-rights handle {client:p} is \
+                 judged against the object's DACL, which denies both of those rights to this process — \
+                 the ACL read back above names the deny ACE that does it"
             ),
             Ok(duplicated) => {
-                // Even where the copy itself is granted, the read through it still answers the same
-                // way, because the object's DACL is the thing that decides.
+                // Even where the copy itself is granted, the read through it still answers the same way,
+                // because the object's DACL is the thing that decides.
                 assert_eq!(
                     security_read_code(duplicated),
                     ERROR_ACCESS_DENIED,
                     "the READ_CONTROL | WRITE_DAC duplicate {duplicated:p} of the data-rights handle \
-                     {write:p} reads no more of the object's DACL than the handle did"
+                     {client:p} reads no more of the object's DACL than the handle did: {detail}",
+                    detail = last_win32_error(),
                 );
                 // SAFETY: this test created the duplicate, so this test closes it.
                 unsafe { CloseHandle(duplicated) };
             }
         }
-        // SAFETY: the two pipe ends were created by this test.
+        // The controls that keep (ii)–(iv) about the mask and not about handle juggling: a copy that asks
+        // for nothing new always succeeds, and each of the two rights is refused on its own, because a
+        // combined refusal alone never says which right is missing.
+        let mut same_access: HANDLE = std::ptr::null_mut();
+        // SAFETY: the out-parameter is a valid pointer and both process arguments are this process' `-1`
+        // pseudo-handle, which `DuplicateHandle` accepts for a copy into the current process.
+        let same = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                client,
+                GetCurrentProcess(),
+                &mut same_access,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        assert!(
+            same != 0,
+            "DuplicateHandle(DUPLICATE_SAME_ACCESS) on the data-rights handle {client:p} must succeed: \
+             if even a copy that asks for nothing new were refused, the refusals above would be about \
+             handle duplication and not about the mask — it said: {detail}",
+            detail = last_win32_error(),
+        );
+        // SAFETY: this test created the duplicate.
+        unsafe { CloseHandle(same_access) };
+        for right in [READ_CONTROL, WRITE_DAC] {
+            let mut one: HANDLE = std::ptr::null_mut();
+            // SAFETY: as above — one valid out-parameter and this process' pseudo-handle twice.
+            let made = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    client,
+                    GetCurrentProcess(),
+                    &mut one,
+                    right,
+                    0,
+                    0,
+                )
+            };
+            if made != 0 {
+                // SAFETY: the handle this branch did not expect is closed before the assertion fails.
+                unsafe { CloseHandle(one) };
+                panic!(
+                    "DuplicateHandle(0x{right:08X}) on the data-rights handle {client:p} was granted \
+                     after the deny, so one of the two rights the grant path needs is not refused after \
+                     all, and either the deny ACE or the OWNER RIGHTS restriction does not do what the \
+                     DACL read back above says it does"
+                );
+            }
+            assert_eq!(
+                unsafe { GetLastError() },
+                ERROR_ACCESS_DENIED,
+                "DuplicateHandle(0x{right:08X}) on the data-rights handle {client:p} must be refused by \
+                 the object's DACL, and refused by name: the ACL read back above denies \
+                 0x{denied_mask:08X} to {everyone_sid} and leaves the owner path 0x{owner_mask:08X}",
+                denied_mask = FIXTURE_DENIED_SECURITY,
+                everyone_sid = EVERYONE_SID,
+                owner_mask = FIXTURE_OWNER_RIGHTS_ALLOW,
+            );
+        }
+        // SAFETY: every handle closed here was created or duplicated by this test. The two well-known
+        // SIDs need nothing: the fixtures' ACEs were built from copies, and the blocks
+        // `ConvertStringSidToSidW` allocated were released by `well_known_sid` itself.
         unsafe {
-            CloseHandle(read);
-            CloseHandle(write);
+            CloseHandle(probe);
+            CloseHandle(client);
+            CloseHandle(fixture.server);
         }
         Ok(())
     }
