@@ -73,7 +73,7 @@ use crate::harness::sandbox::{
 };
 use crate::harness::sbpl;
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// `ACCESS_ALLOWED_ACE_TYPE` spelled as the `u8` the ACE header field needs: the constant in
 /// `windows_sys::Win32::System::SystemServices` is typed `u32` and lives in a module this crate
@@ -89,21 +89,40 @@ const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 /// [`attempt_windows_sandbox`]: self::attempt_windows_sandbox
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WindowsSandboxError {
-    /// The AppContainer profile for this run could not be created or derived: no confinement
-    /// identity exists, so this is an availability failure.
+    /// The AppContainer profile for this run could not be created: no confinement identity
+    /// exists, so this is an availability failure.
     #[error("AppContainer profile {name} could not be created: {reason}")]
-    Profile { name: String, reason: String },
+    Profile {
+        name: String,
+        reason: String,
+        /// The `HRESULT` (or Win32 code) the failing `CreateAppContainerProfile` answered with,
+        /// spelled out in the reason line as hex **and** decimal. `0` where the failure was
+        /// decided locally — an invalid generated name — rather than by a call.
+        code: WIN32_ERROR,
+    },
     /// A SID could not be allocated, converted or released, for the same reason: there is no
     /// AppContainer identity to build a policy around.
     #[error("the AppContainer security identifier could not be handled: {reason}")]
-    Sid { reason: String },
+    Sid {
+        reason: String,
+        /// The Win32 error the failing SID call reported, `0` where the failure was decided
+        /// locally (too many sub-authorities) rather than by a call.
+        code: WIN32_ERROR,
+    },
     /// The policy names an entry it cannot grant: the workspace root is itself inside (or is)
     /// one of the directories the policy denies, so no honest policy exists for this run.
     #[error("sandbox policy could not be built for {path}: {reason}")]
     RuleSetup { path: String, reason: String },
     /// The DACL of `path` could not be read, so the policy for that path cannot be verified.
     #[error("the DACL of {path} could not be read: {reason}")]
-    AclRead { path: String, reason: String },
+    AclRead {
+        path: String,
+        reason: String,
+        /// The Win32 error the read answered with (`ERROR_ACCESS_DENIED`,
+        /// `ERROR_NO_SECURITY_ON_OBJECT`, …). It is carried here as well as in the prose, so the
+        /// structured log field and the operator text cannot disagree about which code it was.
+        code: WIN32_ERROR,
+    },
     /// The DACL of `path` could not be changed. `code` is the Win32 error, and
     /// [`WindowsSandboxError::is_access_refusal`] says whether it is the expected
     /// "this process may not rewrite that DACL" outcome rather than a policy error.
@@ -120,7 +139,12 @@ pub enum WindowsSandboxError {
     /// The `PROC_THREAD_ATTRIBUTE_LIST` for the launch could not be sized, allocated or filled:
     /// the confinement is declared correctly, but it cannot be handed to `CreateProcessW`.
     #[error("the launch attribute list could not be built: {reason}")]
-    AttributeList { reason: String },
+    AttributeList {
+        reason: String,
+        /// The Win32 error the sizing or filling call reported (`ERROR_BAD_LENGTH` or
+        /// `ERROR_INVALID_PARAMETER`). `0` where the call reported none.
+        code: WIN32_ERROR,
+    },
     /// The confined process could not be created, or the wait for it and the read of its exit code
     /// failed. `code` is the Win32 error as `GetLastError` reported it (0 where no Win32 error is
     /// involved), which is what renders the failure through
@@ -172,22 +196,30 @@ impl WindowsSandboxError {
         }
     }
 
-    /// The Win32 error this failure carries, `0` when no Win32 error is involved.
+    /// The Win32 error this failure carries: the code a failing call reported (`GetLastError`), or
+    /// the `HRESULT` of a call that answers in those terms, `0` when no Win32 call is behind it.
     ///
-    /// `AclMutate` and `Launch` keep one because they *are* the outcome of a Win32 call; the
-    /// other failures are decided before or without one, and reporting `0` as if it were a code
-    /// would be a lie.
+    /// Every variant that *is* the outcome of a call keeps that code, so the structured log field
+    /// (`log_windows_sandbox_failure`) and the prose always name the same one. `AclRead` and
+    /// `Profile` used to answer `0` here while their prose carried `5` and an `HRESULT`
+    /// respectively — the asymmetry that made two ranks of a desktop refusal (t-030 §5-§6)
+    /// indistinguishable in the log, and impossible to tell apart from the code field alone. The
+    /// variants that stay at `0` are the ones decided before or between calls, where reporting a
+    /// code would be a lie.
     #[must_use]
     pub fn win32_code(&self) -> WIN32_ERROR {
         match self {
             WindowsSandboxError::AclMutate { code, .. }
+            | WindowsSandboxError::AclRead { code, .. }
+            | WindowsSandboxError::Profile { code, .. }
+            | WindowsSandboxError::Sid { code, .. }
+            | WindowsSandboxError::AttributeList { code, .. }
             | WindowsSandboxError::Launch { code, .. } => *code,
-            WindowsSandboxError::Profile { .. }
-            | WindowsSandboxError::Sid { .. }
-            | WindowsSandboxError::RuleSetup { .. }
-            | WindowsSandboxError::AclRead { .. }
+            // No Win32 call failed behind these three: the rule failure is a policy judgement, the
+            // verification failure is a DACL that does not match the policy, and a probe failure
+            // reports the child's own exit status rather than a `GetLastError` value.
+            WindowsSandboxError::RuleSetup { .. }
             | WindowsSandboxError::AclVerification { .. }
-            | WindowsSandboxError::AttributeList { .. }
             | WindowsSandboxError::Probe { .. } => 0,
         }
     }
@@ -227,13 +259,13 @@ use windows_sys::Win32::Foundation::{
     STATUS_ENTRYPOINT_NOT_FOUND, STATUS_IN_PAGE_ERROR, STILL_ACTIVE, WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::{
-    BuildTrusteeWithSidW, ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
-    SE_KERNEL_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    BuildTrusteeWithSidW, ConvertSidToStringSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+    GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, AllocateAndInitializeSid,
@@ -294,16 +326,6 @@ impl WideString {
     fn pcwstr(&self) -> *const u16 {
         self.buf.as_ptr()
     }
-
-    /// The buffer decoded back for diagnostics (lossy: it may hold lone surrogates).
-    fn as_string(&self) -> String {
-        let end = self
-            .buf
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(self.buf.len());
-        String::from_utf16_lossy(&self.buf[..end])
-    }
 }
 
 impl Default for WideString {
@@ -335,19 +357,79 @@ fn path_text(path: &Path) -> String {
     path.display().to_string()
 }
 
-/// The last Win32 error as text.
+/// The last Win32 error, as the pair a failure record needs: the code and the OS text for it.
+///
+/// The code is kept next to the text rather than folded into it, because the structured log field
+/// and the prose must never be able to disagree about which code a failing call reported.
 ///
 /// `windows_sys` 0.59 carries no error object, so `GetLastError` plus
 /// `io::Error::from_raw_os_error` is the spelling this crate uses.
-fn last_win32_error() -> String {
+fn last_win32_error_detail() -> (WIN32_ERROR, String) {
     // SAFETY: GetLastError reads thread-local error state and takes no arguments.
     let code = unsafe { GetLastError() };
-    std::io::Error::from_raw_os_error(code as i32).to_string()
+    (
+        code,
+        std::io::Error::from_raw_os_error(code as i32).to_string(),
+    )
+}
+
+/// The last Win32 error as text.
+fn last_win32_error() -> String {
+    last_win32_error_detail().1
+}
+
+/// The `WIN32` facility of an `HRESULT`: the value that says "the code below is a Win32 error"
+/// (`FACILITY_WIN32` in `winerror.h`), so `0x8007…` statuses can be traced back to the
+/// `ERROR_ACCESS_DENIED` and friends the operator can look up.
+const WIN32_FACILITY: WIN32_ERROR = 7;
+
+/// The Win32 code an `HRESULT` wraps, when its facility is the Win32 facility.
+///
+/// `0x80070005` is severity `E`, facility `FACILITY_WIN32` (7) and code `ERROR_ACCESS_DENIED` (5):
+/// a status in that family *is* a Win32 error, and the mapping has to be spelled out for the
+/// operator who is handed both numbers. A status with another facility has no Win32 code to
+/// report, and `None` says so rather than inventing one.
+#[must_use]
+const fn win32_code_of_hresult(code: WIN32_ERROR) -> Option<WIN32_ERROR> {
+    if code & 0x8000_0000 != 0 && (code >> 16) & 0x1FFF == WIN32_FACILITY {
+        Some(code & 0xFFFF)
+    } else {
+        None
+    }
+}
+
+/// The code a failing Win32 call reported, spelled out so it can be read without a lookup: hex
+/// **and** decimal, plus the Win32 code an `0x8007…`-class `HRESULT` wraps.
+///
+/// `io::Error::from_raw_os_error` renders an `HRESULT` as a bare negative number
+/// (`Access is denied. (os error -2147024891)`), which looks exactly like a Win32 code and is not
+/// one — the diagnostic asymmetry t-030 §6 ranks as a hazard for the AppContainer-profile rank of
+/// refusal. This clause is what makes the operator-facing reason line say which number is which.
+#[must_use]
+fn hresult_clauses(code: windows_sys::core::HRESULT) -> String {
+    let unsigned = code as WIN32_ERROR;
+    if unsigned & 0x8000_0000 == 0 {
+        // Not an `HRESULT`: a plain Win32 error, whose decimal number is the whole story.
+        return format!("(win32 code {unsigned})");
+    }
+    let wrapped = win32_code_of_hresult(unsigned)
+        .map(|wrapped| format!(", wrapping win32 code {wrapped}"))
+        .unwrap_or_default();
+    format!("(HRESULT 0x{unsigned:08X}, decimal {code}{wrapped})")
 }
 
 /// Render a Win32 `HRESULT` as the OS error it carries, for operator-visible text.
 fn hresult_text(code: windows_sys::core::HRESULT) -> String {
     std::io::Error::from_raw_os_error(code).to_string()
+}
+
+/// The OS text for a Win32 status the call reported **itself**, as opposed to whatever
+/// `GetLastError` happens to hold.
+///
+/// `GetNamedSecurityInfoW` and `GetSecurityInfo` answer with the code their own prose already
+/// names, so the structured `code` field and the text have to come from the same number.
+fn status_text(code: WIN32_ERROR) -> String {
+    std::io::Error::from_raw_os_error(code as i32).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +459,7 @@ fn allocate_app_package_sid(sub_authorities: &[u32]) -> Result<PSID, WindowsSand
             "an app-package SID takes between 1 and 8 sub-authorities, got {}",
             sub_authorities.len()
         ),
+        code: 0,
     })?;
     let mut sub = [0u32; 8];
     sub[..sub_authorities.len()].copy_from_slice(sub_authorities);
@@ -391,16 +474,17 @@ fn allocate_app_package_sid(sub_authorities: &[u32]) -> Result<PSID, WindowsSand
         )
     };
     if ok == 0 || sid.is_null() {
+        let (code, text) = last_win32_error_detail();
         return Err(WindowsSandboxError::Sid {
             reason: format!(
-                "AllocateAndInitializeSid(S-1-15-{}) failed: {}",
+                "AllocateAndInitializeSid(S-1-15-{}) failed: {text}",
                 sub_authorities
                     .iter()
                     .map(u32::to_string)
                     .collect::<Vec<String>>()
                     .join("-"),
-                last_win32_error()
             ),
+            code,
         });
     }
     Ok(sid)
@@ -445,15 +529,17 @@ impl Drop for ApplicationPackagesSid {
 /// # Safety
 ///
 /// `sid` must be a valid SID: anything allocated by this module (a profile SID from
-/// `CreateAppContainerProfile` or an app-package SID from `allocate_app_package_sid`) or by
-/// `ConvertStringSidToSidW` satisfies this. Win32 reads the memory behind the pointer.
+/// `CreateAppContainerProfile` or an app-package SID from `allocate_app_package_sid`) satisfies
+/// this. Win32 reads the memory behind the pointer.
 pub unsafe fn sid_to_string(sid: PSID) -> Result<String, WindowsSandboxError> {
     let mut raw: *mut u16 = std::ptr::null_mut();
     // SAFETY: the output pointer is valid; the string it receives is read below and freed here.
     let ok = unsafe { ConvertSidToStringSidW(sid, &mut raw) };
     if ok == 0 || raw.is_null() {
+        let (code, text) = last_win32_error_detail();
         return Err(WindowsSandboxError::Sid {
-            reason: format!("ConvertSidToStringSidW failed: {}", last_win32_error()),
+            reason: format!("ConvertSidToStringSidW failed: {text}"),
+            code,
         });
     }
     let text = wide_cstr_to_string(raw);
@@ -462,28 +548,6 @@ pub unsafe fn sid_to_string(sid: PSID) -> Result<String, WindowsSandboxError> {
         LocalFree(raw as *mut c_void);
     }
     Ok(text)
-}
-
-/// Parse a SID string back into an allocated SID (released with `LocalFree`).
-///
-/// Kept as the inverse of [`sid_to_string`]: it is the helper the launch layer uses when it has
-/// only the string spelling of a SID it needs to hand to Win32, and the tests of this module use
-/// it to check that the strings this module produces really do round-trip.
-pub fn string_to_sid(text: &str) -> Result<PSID, WindowsSandboxError> {
-    let wide = WideString::new(text);
-    let mut sid: PSID = std::ptr::null_mut();
-    // SAFETY: the input is a NUL-terminated string owned by `wide`, the output is read into.
-    let ok = unsafe { ConvertStringSidToSidW(wide.pcwstr(), &mut sid) };
-    if ok == 0 || sid.is_null() {
-        return Err(WindowsSandboxError::Sid {
-            reason: format!(
-                "ConvertStringSidToSidW({}) failed: {}",
-                wide.as_string(),
-                last_win32_error()
-            ),
-        });
-    }
-    Ok(sid)
 }
 
 // ---------------------------------------------------------------------------
@@ -651,9 +715,10 @@ impl AppContainerProfileGuard {
     /// Create a fresh AppContainer profile for this run, with the capabilities the launch will
     /// declare.
     ///
-    /// The SID is the one `CreateAppContainerProfile` derives from the generated name, which is
-    /// the same SID [`Self::derive_sid`] would hand back for that name later. Taking the
-    /// capabilities by value is deliberate: the guard keeps them alive for the launch.
+    /// The SID is the one `CreateAppContainerProfile` derives from the generated name: the profile
+    /// is created for this run and deleted when it ends, so nothing has to be re-derived from the
+    /// name later. Taking the capabilities by value is deliberate: the guard keeps them alive for
+    /// the launch.
     pub fn create(
         workspace_root: &Path,
         capabilities: CapabilitySids,
@@ -664,6 +729,7 @@ impl AppContainerProfileGuard {
             return Err(WindowsSandboxError::Profile {
                 name,
                 reason: "the generated name is not a valid AppContainer profile name".to_string(),
+                code: 0,
             });
         }
         let wide_name = WideString::new(&name);
@@ -688,7 +754,14 @@ impl AppContainerProfileGuard {
         if result < 0 || sid.is_null() {
             return Err(WindowsSandboxError::Profile {
                 name,
-                reason: format!("CreateAppContainerProfile failed: {}", hresult_text(result)),
+                reason: format!(
+                    "CreateAppContainerProfile failed: {} {}",
+                    hresult_text(result),
+                    hresult_clauses(result)
+                ),
+                // The `HRESULT` of the call, kept as the raw status so the log field and the
+                // reason line name the same one (the reason line spells it out in hex too).
+                code: result as WIN32_ERROR,
             });
         }
         Ok(Self {
@@ -697,28 +770,6 @@ impl AppContainerProfileGuard {
             capabilities,
             _single_thread: PhantomData,
         })
-    }
-
-    /// The identity of an existing profile, without creating anything: the fallback used when a
-    /// profile from an earlier run has to be reused.
-    ///
-    /// The returned SID is owned by the caller and released with `LocalFree`.
-    #[must_use = "the derived SID is a LocalFree allocation the caller owns"]
-    pub fn derive_sid(name: &str) -> Result<PSID, WindowsSandboxError> {
-        let wide = WideString::new(name);
-        let mut sid: PSID = std::ptr::null_mut();
-        // SAFETY: `wide` owns the name for the duration of the call.
-        let result = unsafe { DeriveAppContainerSidFromAppContainerName(wide.pcwstr(), &mut sid) };
-        if result < 0 || sid.is_null() {
-            return Err(WindowsSandboxError::Profile {
-                name: wide.as_string(),
-                reason: format!(
-                    "DeriveAppContainerSidFromAppContainerName failed: {}",
-                    hresult_text(result)
-                ),
-            });
-        }
-        Ok(sid)
     }
 
     /// The profile name, as the launch-time `SECURITY_CAPABILITIES` block and
@@ -909,23 +960,76 @@ fn env_dirs(names: &[&str]) -> Vec<PathBuf> {
 }
 
 /// Compare two path spellings the way the Windows filesystem does: case-insensitively, with the
-/// separators and the drive-prefix spelling flattened away.
-///
+/// separators and the verbatim markers flattened away, so a canonicalised spelling and a plain one
+/// name the same location.
 fn paths_match(left: &Path, right: &Path) -> bool {
     comparable_components(left) == comparable_components(right)
 }
 
-/// The components of `path`, normalised for [`paths_match`].
+/// The components of `path`, normalised for [`paths_match`]: lower-cased, split on either
+/// separator, with the verbatim markers Windows accepts dropped.
+///
+/// The spelling a path is written in is not part of its identity, and the two spellings this
+/// policy meets are not the same one: the workspace root arrives canonicalised
+/// (`\\?\C:\Users\fredrik\source\marmel`, the shape `canonicalize()` produces and that the
+/// name-based ACL APIs are handed), while the denied directories come from the environment in
+/// their plain spelling (`C:\Users\fredrik\.ssh`). Comparing the drive **prefix** as a component
+/// made those two spellings different locations, so the sensitive-directory invariant — the hard
+/// `RuleSetup` failure for a workspace root that is, or contains, a denied directory — never fired
+/// for a real root, only for the plain-spelled fixtures the tests used.
+///
+/// The markers are what has to go: `\\?\C:\Users` and `C:\Users` are one volume, and
+/// `\\?\UNC\server\share` and `\\server\share` are one share (a mapped, redirected or WSL workspace
+/// root canonicalises to the UNC spelling).
 fn comparable_components(path: &Path) -> Vec<String> {
-    path.components()
-        .map(|component| match component {
-            Component::Prefix(prefix) => prefix.as_os_str().to_string_lossy().to_lowercase(),
-            Component::RootDir => String::new(),
-            Component::CurDir => String::new(),
-            Component::ParentDir => "..".to_string(),
-            Component::Normal(name) => name.to_string_lossy().to_lowercase(),
-        })
+    let spelling = path.as_os_str().to_string_lossy().to_lowercase();
+    strip_windows_path_markers(&spelling)
+        .split(['/', '\\'])
+        // An empty segment is what a separator pair leaves behind, and a `.` segment says "this
+        // directory": neither names a part of the location.
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .map(str::to_owned)
         .collect()
+}
+
+/// The marker Windows puts in front of a path to say "interpret this literally, do not normalise
+/// it": `\\` + `?` + `\` in front of a drive, a UNC share or a device name.
+const VERBATIM_MARKER: &str = "\\\\?\\";
+
+/// The marker of a verbatim **share**: the marker above, plus the `UNC` word that names the share
+/// form (checked against the lower-cased spelling, which is what `comparable_components` works
+/// with).
+const VERBATIM_UNC_MARKER: &str = "\\\\?\\unc\\";
+
+/// The device form of the marker above (`\\` + `.` + `\`), which names a device namespace such as
+/// `\\.\COM1` rather than a volume.
+const DEVICE_MARKER: &str = "\\\\.\\";
+
+/// The separator that opens a plain share spelling. A verbatim share rewrites onto the two of
+/// these that a plain spelling opens with, so both spellings keep one component list.
+const UNC_SEPARATOR: &str = "\\";
+
+/// Drop the verbatim and device markers from a lower-cased path spelling, and rewrite a verbatim
+/// UNC to the plain share spelling.
+///
+/// A marker says how Windows is to **interpret** a path, not which location it names, so the two
+/// spellings of one location have to lose the marker before they can be compared:
+/// `\\?\C:\Users` becomes `C:\Users` and `\\?\UNC\server\share` becomes `\\server\share`. A
+/// spelling without a marker is returned as it stands.
+fn strip_windows_path_markers(spelling: &str) -> String {
+    if let Some(rest) = spelling.strip_prefix(VERBATIM_UNC_MARKER) {
+        // The marker ends with the separator that closes the `UNC` word, so `rest` starts at the
+        // share name. A plain spelling opens that same share name with two separators, and the
+        // rewrite supplies exactly those two.
+        return format!("{UNC_SEPARATOR}{UNC_SEPARATOR}{rest}");
+    }
+    if let Some(rest) = spelling.strip_prefix(DEVICE_MARKER) {
+        return rest.to_owned();
+    }
+    if let Some(rest) = spelling.strip_prefix(VERBATIM_MARKER) {
+        return rest.to_owned();
+    }
+    spelling.to_owned()
 }
 
 /// Whether `candidate` names an ancestor of (or the same directory as) `target`.
@@ -1289,8 +1393,11 @@ impl DaclSnapshot {
                 path: path_text(path),
                 reason: format!(
                     "GetNamedSecurityInfoW failed (win32 error {code}): {}",
-                    last_win32_error()
+                    status_text(code)
                 ),
+                // The code the call answered with, kept structurally so the log field and the
+                // prose cannot drift apart.
+                code,
             });
         }
         let _ = sacl; // the SACL is not part of this policy
@@ -1355,9 +1462,11 @@ impl DaclSnapshot {
             )
         };
         if sized == 0 {
+            let (code, text) = last_win32_error_detail();
             return Err(WindowsSandboxError::AclRead {
                 path: path_text(path),
-                reason: format!("GetAclInformation failed: {}", last_win32_error()),
+                reason: format!("GetAclInformation failed: {text}"),
+                code,
             });
         }
         for index in 0..size.AceCount {
@@ -1365,9 +1474,11 @@ impl DaclSnapshot {
             // SAFETY: `GetAce` reads the ACL it is given and writes one pointer.
             let ok = unsafe { GetAce(self.dacl, index, &mut ace) };
             if ok == 0 || ace.is_null() {
+                let (code, text) = last_win32_error_detail();
                 return Err(WindowsSandboxError::AclRead {
                     path: path_text(path),
-                    reason: format!("GetAce(index {index}) failed: {}", last_win32_error()),
+                    reason: format!("GetAce(index {index}) failed: {text}"),
+                    code,
                 });
             }
             // SAFETY: an access-allowed ACE begins with its header, and the SID follows the
@@ -1816,11 +1927,12 @@ impl AttributeListGuard {
             unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size) };
         let _ = queried;
         if size == 0 {
+            let (code, text) = last_win32_error_detail();
             return Err(WindowsSandboxError::AttributeList {
                 reason: format!(
-                    "the size query for a {count}-attribute list reported 0 bytes (query pass: {}",
-                    last_win32_error()
+                    "the size query for a {count}-attribute list reported 0 bytes (query pass: {text})"
                 ),
+                code,
             });
         }
         let mut buffer = vec![0u64; size.div_ceil(std::mem::size_of::<u64>())];
@@ -1835,11 +1947,12 @@ impl AttributeListGuard {
             )
         };
         if initialised == 0 {
+            let (code, text) = last_win32_error_detail();
             return Err(WindowsSandboxError::AttributeList {
                 reason: format!(
-                    "InitializeProcThreadAttributeList({count} attributes, {size} bytes) failed: {}",
-                    last_win32_error()
+                    "InitializeProcThreadAttributeList({count} attributes, {size} bytes) failed: {text}"
                 ),
+                code,
             });
         }
         Ok(Self {
@@ -1875,11 +1988,10 @@ impl AttributeListGuard {
             )
         };
         if updated == 0 {
+            let (code, text) = last_win32_error_detail();
             return Err(WindowsSandboxError::AttributeList {
-                reason: format!(
-                    "UpdateProcThreadAttribute({attribute}) failed: {}",
-                    last_win32_error()
-                ),
+                reason: format!("UpdateProcThreadAttribute({attribute}) failed: {text}"),
+                code,
             });
         }
         Ok(())
@@ -2240,8 +2352,9 @@ fn grant_std_handle(
             path: label,
             reason: format!(
                 "GetSecurityInfo failed (win32 error {read}): {}",
-                last_win32_error()
+                status_text(read)
             ),
+            code: read,
         });
     }
     if dacl.is_null() {
@@ -2607,6 +2720,12 @@ fn append_win32_code(reason: String, code: WIN32_ERROR) -> String {
 /// happened (`step`), what stage failed (`kind`), which object it is about (`path`) and the
 /// Win32 error the failing call reported (`code`).
 ///
+/// The `code` field is the raw status the call reported: a `WIN32_ERROR` for a DACL, SID or launch
+/// call, and the `HRESULT` of `CreateAppContainerProfile` for a profile failure. The field is a
+/// decimal either way, which is why the prose of a profile failure spells the same status in hex
+/// and in decimal too — `0x80070005` and `-2147024891` are the same thing, and an operator reading
+/// `code=2147483653` needs to know which of the two to look up.
+///
 /// Every refusal class has to appear in the log with its causal chain, because the operator can
 /// only be told to look there; the prose of the failure is kept in the message so the two views
 /// cannot disagree.
@@ -2624,12 +2743,12 @@ fn log_windows_sandbox_failure(step: &str, err: &WindowsSandboxError) {
 #[must_use]
 fn attempt_from_windows_error(err: WindowsSandboxError) -> SandboxAttempt {
     match err {
-        WindowsSandboxError::Profile { name, reason } => SandboxAttempt::Unavailable {
+        WindowsSandboxError::Profile { name, reason, .. } => SandboxAttempt::Unavailable {
             reason: format!("AppContainer profile {name} could not be created: {reason}"),
         },
-        WindowsSandboxError::Sid { reason } => SandboxAttempt::Unavailable { reason },
+        WindowsSandboxError::Sid { reason, .. } => SandboxAttempt::Unavailable { reason },
         WindowsSandboxError::RuleSetup { path, reason }
-        | WindowsSandboxError::AclRead { path, reason } => {
+        | WindowsSandboxError::AclRead { path, reason, .. } => {
             SandboxAttempt::RuleFailed { path, reason }
         }
         WindowsSandboxError::AclMutate { path, reason, code } => SandboxAttempt::RuleFailed {
@@ -2643,9 +2762,8 @@ fn attempt_from_windows_error(err: WindowsSandboxError) -> SandboxAttempt {
         }
         // Launch-side failures say the same thing about the attempt: the policy was built, but
         // confining something with it did not work, which is an enforcement failure.
-        WindowsSandboxError::AttributeList { reason } | WindowsSandboxError::Probe { reason } => {
-            SandboxAttempt::EnforcementFailed { reason }
-        }
+        WindowsSandboxError::AttributeList { reason, .. }
+        | WindowsSandboxError::Probe { reason } => SandboxAttempt::EnforcementFailed { reason },
         WindowsSandboxError::Launch { reason, code } => SandboxAttempt::EnforcementFailed {
             reason: append_win32_code(reason, code),
         },
@@ -2658,22 +2776,24 @@ fn attempt_from_windows_error(err: WindowsSandboxError) -> SandboxAttempt {
 impl From<WindowsSandboxError> for SandboxError {
     fn from(value: WindowsSandboxError) -> Self {
         match value {
-            WindowsSandboxError::Profile { name, reason } => SandboxError::Unavailable {
+            WindowsSandboxError::Profile { name, reason, .. } => SandboxError::Unavailable {
                 reason: format!("AppContainer profile {name} could not be created: {reason}"),
             },
-            WindowsSandboxError::Sid { reason } => SandboxError::Unavailable {
+            WindowsSandboxError::Sid { reason, .. } => SandboxError::Unavailable {
                 reason: format!("sid: {reason}"),
             },
             WindowsSandboxError::RuleSetup { path, reason } => {
                 SandboxError::RuleSetup { path, reason }
             }
-            // The Win32 code stays attached here too, exactly as in `attempt_from_windows_error`:
-            // the two mappings are one verdict rendered twice, and the operator who has to fix
-            // this is the one reading the code. `AclMutate` is a separate arm because it is the
-            // only one of the two that carries a code at all.
-            WindowsSandboxError::AclRead { path, reason } => {
-                SandboxError::RuleSetup { path, reason }
-            }
+            // `AclRead` now carries the code structurally as well, but its prose already names it
+            // (`GetNamedSecurityInfoW failed (win32 error 5) …`), so the verdict text is not
+            // inflated with a second copy of the same number. `AclMutate` is the arm that does
+            // append, because its prose does not name the code.
+            WindowsSandboxError::AclRead {
+                path,
+                reason,
+                code: _,
+            } => SandboxError::RuleSetup { path, reason },
             WindowsSandboxError::AclMutate { path, reason, code } => SandboxError::RuleSetup {
                 path,
                 reason: append_win32_code(reason, code),
@@ -2686,7 +2806,7 @@ impl From<WindowsSandboxError> for SandboxError {
             WindowsSandboxError::AclVerification { path, reason } => SandboxError::Enforcement {
                 reason: format!("{path}: {reason}"),
             },
-            WindowsSandboxError::AttributeList { reason }
+            WindowsSandboxError::AttributeList { reason, .. }
             | WindowsSandboxError::Probe { reason } => SandboxError::Enforcement { reason },
             WindowsSandboxError::Launch { reason, code } => SandboxError::Enforcement {
                 reason: append_win32_code(reason, code),
@@ -3099,6 +3219,14 @@ mod tests {
         }
     }
 
+    /// The verbatim (`\\?\` + the rest) spelling of `path`: the shape `canonicalize()` produces on
+    /// Windows, and therefore the shape a real workspace root and a real extra path arrive in.
+    /// Used to hand the fixture paths to the table in the spelling production actually uses.
+    fn verbatim_spelling(path: &Path) -> PathBuf {
+        let text = path.display().to_string();
+        PathBuf::from(format!("\\\\?\\{}", text.trim_start_matches(['/', '\\'])))
+    }
+
     /// The profile name is derived from the workspace root, survives sanitisation, and stays
     /// inside the name ceiling Windows enforces for an AppContainer profile.
     #[test]
@@ -3471,14 +3599,19 @@ mod tests {
         assert_eq!(unsafe { sid_to_string(all.sid())? }, "S-1-15-2-2");
         assert_eq!(unsafe { sid_to_string(restricted.sid())? }, "S-1-15-2-3");
 
-        // The string form round-trips through `ConvertStringSidToSidW`, the helper a later stage
-        // uses when it has only a name for the SID it needs.
-        let parsed = string_to_sid("S-1-15-3-1")?;
-        // SAFETY: `parsed` is the SID `ConvertStringSidToSidW` just allocated.
-        assert_eq!(unsafe { sid_to_string(parsed)? }, "S-1-15-3-1");
-        // SAFETY: the SID was allocated by `ConvertStringSidToSidW`, whose documented release is
-        // `LocalFree`.
-        unsafe { LocalFree(parsed) };
+        // The identity is the object Win32 allocated, never a re-parsed name: the string form is
+        // diagnostics only, so the check that matters is that the capability SID the profile
+        // declares and the one the production construction path allocates are the same identity.
+        let internet_client = allocate_app_package_sid(&[3, 1])?;
+        // SAFETY: `internet_client` is the SID `AllocateAndInitializeSid` just allocated.
+        assert_eq!(
+            unsafe { sid_to_string(internet_client)? },
+            "S-1-15-3-1",
+            "allocating the capability identity again gives the same SID"
+        );
+        // SAFETY: the SID was allocated by `AllocateAndInitializeSid`, whose documented release is
+        // `FreeSid`.
+        unsafe { FreeSid(internet_client) };
         Ok(())
     }
 
@@ -3905,9 +4038,10 @@ mod tests {
         );
         assert!(!guard.as_list().is_null());
 
-        // A real `SECURITY_CAPABILITIES` block, built the way the profile guard builds it: the list
-        // accepts it, which is what proves the attribute constant and the size argument agree.
-        let sid = string_to_sid("S-1-15-3-1")?;
+        // A real `SECURITY_CAPABILITIES` block, built the way the profile guard builds it: the
+        // list accepts it, which is what proves the attribute constant and the size argument
+        // agree. The SID is allocated the way the capability list allocates its own.
+        let sid = allocate_app_package_sid(&[3, 1])?;
         let capabilities = CapabilitySids::internet_client()?;
         let block = SECURITY_CAPABILITIES {
             AppContainerSid: sid,
@@ -3922,9 +4056,9 @@ mod tests {
         let handles = stdio_state().handles;
         guard.set_handle_list(&handles)?;
 
-        // SAFETY: the SID was allocated by `ConvertStringSidToSidW`, whose documented release is
-        // `LocalFree`; the capability array belongs to `capabilities`, which outlives this call.
-        unsafe { LocalFree(sid) };
+        // SAFETY: the SID was allocated by `AllocateAndInitializeSid`, whose documented release is
+        // `FreeSid`; the capability array belongs to `capabilities`, which outlives this call.
+        unsafe { FreeSid(sid) };
         Ok(())
     }
 
@@ -3957,6 +4091,7 @@ mod tests {
         for err in [
             WindowsSandboxError::AttributeList {
                 reason: "the attribute list refused the capability block".to_string(),
+                code: 87,
             },
             WindowsSandboxError::Launch {
                 reason: "CreateProcessW failed".to_string(),
@@ -3990,6 +4125,7 @@ mod tests {
     fn test_availability_and_rule_failures_keep_their_classes() {
         let no_identity = WindowsSandboxError::Sid {
             reason: "no SID could be allocated".to_string(),
+            code: 1337,
         };
         assert!(
             matches!(
@@ -4097,13 +4233,396 @@ mod tests {
         assert_eq!(probe.win32_code(), 0, "no Win32 error is involved");
         assert_eq!(probe.path(), "", "the probe names no object");
 
+        // The desktop case for a profile refusal: `E_ACCESSDENIED` from
+        // `CreateAppContainerProfile`. The HRESULT is the status that call reported, so the log
+        // field has to carry it rather than `0`.
         let profile = WindowsSandboxError::Profile {
             name: "marmel-sandbox-profile".to_string(),
-            reason: "CreateAppContainerProfile failed: Access is denied.".to_string(),
+            reason: "CreateAppContainerProfile failed: Access is denied. (os error -2147024891) \
+                 (HRESULT 0x80070005, decimal -2147024891, wrapping win32 code 5)"
+                .to_string(),
+            code: 0x8007_0005,
         };
         assert_eq!(profile.kind(), "profile");
-        assert_eq!(profile.win32_code(), 0, "the HRESULT is not a Win32 code");
+        assert_eq!(
+            profile.win32_code(),
+            0x8007_0005,
+            "the status the failing call answered with is the code the log field names"
+        );
         assert_eq!(profile.path(), "", "a profile name is not an object path");
+    }
+
+    /// Every variant that *is* the outcome of a Win32 call has to report the status that call
+    /// answered with, and the class it is reported under: `AclRead` and `Profile` used to answer
+    /// `0` while their prose named `5` and an `HRESULT`. Those were two ranks of a desktop
+    /// refusal, one log line apart and impossible to tell apart from the `code` field alone
+    /// (t-030 §5-§6).
+    #[test]
+    fn test_each_variant_reports_its_own_kind_and_the_status_of_its_call() {
+        let cases: Vec<WindowsSandboxError> = vec![
+            // `E_ACCESSDENIED`: the status `CreateAppContainerProfile` answers with when the
+            // profile directory cannot be created (a redirected, mandatory or guarded profile).
+            WindowsSandboxError::Profile {
+                name: "marmel-sandbox-x".to_string(),
+                reason: "CreateAppContainerProfile failed".to_string(),
+                code: 0x8007_0005,
+            },
+            WindowsSandboxError::AclRead {
+                path: r"C:\work\proj".to_string(),
+                reason: "GetNamedSecurityInfoW failed (win32 error 5)".to_string(),
+                code: 5,
+            },
+            WindowsSandboxError::Sid {
+                reason: "AllocateAndInitializeSid(S-1-15-3-1) failed".to_string(),
+                code: 1337,
+            },
+            WindowsSandboxError::AttributeList {
+                reason: "the size query for an attribute list reported 0 bytes".to_string(),
+                code: 24,
+            },
+            // The two that already reported their code, unchanged.
+            WindowsSandboxError::AclMutate {
+                path: r"C:\work\proj".to_string(),
+                reason: "SetNamedSecurityInfoW failed".to_string(),
+                code: 1314,
+            },
+            WindowsSandboxError::Launch {
+                reason: "CreateProcessW failed".to_string(),
+                code: 2,
+            },
+        ];
+        // The class and the code belong to the variant: this is what the log record of a refusal
+        // is built from, so a wrong pairing is a wrong diagnosis.
+        let expected: &[(&str, WIN32_ERROR)] = &[
+            ("profile", 0x8007_0005),
+            ("acl-read", 5),
+            ("sid", 1337),
+            ("attribute-list", 24),
+            ("acl-mutate", 1314),
+            ("launch", 2),
+        ];
+        for (err, (expected_kind, expected_code)) in cases.into_iter().zip(expected.iter()) {
+            assert_eq!(err.kind(), *expected_kind, "the class of {err}");
+            assert_eq!(
+                err.win32_code(),
+                *expected_code,
+                "the code the log field would carry for {err}"
+            );
+        }
+
+        // The variants decided *before or between* calls still report no code, because reporting
+        // one would be a lie: the rule failure is a policy judgement, the verification failure is
+        // a DACL that does not match the policy, and a probe failure reports the child's own exit
+        // status rather than a `GetLastError` value.
+        for (err, expected_kind) in [
+            (
+                WindowsSandboxError::RuleSetup {
+                    path: r"C:\work\proj".to_string(),
+                    reason: "the root is a denied directory".to_string(),
+                },
+                "rule-setup",
+            ),
+            (
+                WindowsSandboxError::AclVerification {
+                    path: r"C:\work\proj".to_string(),
+                    reason: "the grant this policy applied is not visible in the DACL".to_string(),
+                },
+                "acl-verification",
+            ),
+            (
+                WindowsSandboxError::Probe {
+                    reason: "the confined probe exited with 1".to_string(),
+                },
+                "probe",
+            ),
+        ] {
+            assert_eq!(err.kind(), expected_kind, "the class of {err}");
+            assert_eq!(err.win32_code(), 0, "no Win32 call failed behind {err}");
+        }
+    }
+
+    /// An `0x8007…`-class `HRESULT` has to reach the operator as hex **and** decimal, with the
+    /// Win32 code it wraps: `io::Error::from_raw_os_error` alone prints one as a bare negative
+    /// number that looks like a Win32 code and is not one (t-030 §6).
+    #[test]
+    fn test_hresult_is_rendered_as_hex_and_decimal_for_the_operator() {
+        // `E_ACCESSDENIED` as `CreateAppContainerProfile` reports it: `HRESULT` from
+        // `FACILITY_WIN32` and `ERROR_ACCESS_DENIED`.
+        let status: windows_sys::core::HRESULT = 0x8007_0005u32 as i32;
+        let clauses = hresult_clauses(status);
+        for spelling in ["0x80070005", "-2147024891", "win32 code 5"] {
+            assert!(
+                clauses.contains(spelling),
+                "the reason line has to carry the {spelling} spelling: {clauses}"
+            );
+        }
+        // The reason text the operator of a profile refusal actually reads.
+        let reason = format!(
+            "CreateAppContainerProfile failed: {} {}",
+            hresult_text(status),
+            hresult_clauses(status)
+        );
+        assert!(reason.contains("Access is denied"), "{reason}");
+        assert!(reason.contains("0x80070005"), "{reason}");
+        assert!(reason.contains("-2147024891"), "{reason}");
+
+        // A plain Win32 code is spelled as the one number it is, not as an `HRESULT`.
+        assert_eq!(hresult_clauses(5), "(win32 code 5)");
+        // And the mapping back to a code the operator can look up has to be exact in both
+        // directions: the Win32 facility wraps, anything else does not.
+        assert_eq!(win32_code_of_hresult(0x8007_0005), Some(5));
+        assert_eq!(win32_code_of_hresult(0x8007_04CF), Some(1231));
+        assert_eq!(
+            win32_code_of_hresult(5),
+            None,
+            "a plain Win32 error has no `HRESULT` form to unwrap"
+        );
+        assert_eq!(
+            win32_code_of_hresult(0xC000_0005),
+            None,
+            "an access-violation status does not wrap a Win32 code"
+        );
+    }
+
+    /// The two spellings one location can be written in have to compare as one location: the
+    /// workspace root reaches the policy canonicalised (`\\?\C:\…`, the shape `canonicalize()`
+    /// produces and that the name-based ACL APIs are handed), while the denied directories come
+    /// from the environment in their plain spelling (t-030 §3.4).
+    #[test]
+    fn test_verbatim_and_plain_spellings_of_one_location_compare_equal() {
+        let plain = Path::new(r"C:\Users\fredrik\source\marmel");
+        let verbatim = Path::new(r"\\?\C:\Users\fredrik\source\marmel");
+        assert_eq!(
+            comparable_components(plain),
+            comparable_components(verbatim),
+            "one volume, spelled two ways, must compare as one location"
+        );
+        assert!(
+            paths_match(plain, verbatim),
+            "{} vs {}",
+            plain.display(),
+            verbatim.display()
+        );
+        assert!(
+            paths_match(verbatim, plain),
+            "{} vs {}",
+            verbatim.display(),
+            plain.display()
+        );
+        // The marker is a marker, not a segment: it leaves nothing behind in the comparison.
+        assert_eq!(
+            comparable_components(Path::new(r"\\?\C:\Users\fredrik")),
+            vec!["c:".to_string(), "users".to_string(), "fredrik".to_string()],
+            "the verbatim marker and the separators must not leave a segment behind"
+        );
+
+        // The relation `sensitive_conflict` asks about, between a plain denied directory and a
+        // canonicalised root: impossible before the fix, because the drive prefix differed.
+        assert!(
+            is_ancestor_or_self(
+                Path::new(r"C:\Users\fredrik"),
+                Path::new(r"\\?\C:\Users\fredrik\.ssh")
+            ),
+            "a denied directory under the profile root has to be reachable from it"
+        );
+
+        // A UNC root: `canonicalize()` spells a mapped, redirected or WSL share `\\?\UNC\…`.
+        let plain_unc = Path::new(r"\\server\share\work");
+        let verbatim_unc = Path::new(r"\\?\UNC\server\share\work");
+        assert!(
+            paths_match(plain_unc, verbatim_unc),
+            "{} vs {}",
+            plain_unc.display(),
+            verbatim_unc.display()
+        );
+        assert!(
+            is_ancestor_or_self(Path::new(r"\\?\UNC\server\share"), plain_unc),
+            "the share root has to be an ancestor of the directories inside it"
+        );
+
+        // Case stays irrelevant, and two different locations do not collapse onto each other just
+        // because one of them carries a marker.
+        assert!(paths_match(
+            Path::new(r"\\?\C:\Users\Fredrik\.ssh"),
+            Path::new(r"c:\users\fredrik\.ssh")
+        ));
+        assert!(
+            !paths_match(Path::new(r"repos\alpha"), Path::new(r"C:\repos\alpha")),
+            "a relative spelling is not the absolute one"
+        );
+    }
+
+    /// The sensitive-directory invariant has to fire whichever way the paths are spelled, and keep
+    /// telling the two kinds apart: an entry that exposes a denied directory through inheritance,
+    /// and an entry that sits inside one.
+    #[test]
+    fn test_sensitive_conflict_reports_both_kinds_for_either_spelling() {
+        let denied: Vec<PathBuf> = vec![PathBuf::from(r"C:\Users\fredrik\.ssh")];
+        // The root that *contains* a denied directory: plain, and canonicalised.
+        for root in [
+            Path::new(r"C:\Users\fredrik"),
+            Path::new(r"\\?\C:\Users\fredrik"),
+        ] {
+            let conflict = sensitive_conflict(root, &denied)
+                .unwrap_or_else(|| panic!("{} must conflict", root.display()));
+            assert_eq!(
+                conflict.kind,
+                SensitiveConflictKind::Contains,
+                "for {}",
+                root.display()
+            );
+            assert!(
+                conflict.note().contains("contains the sensitive directory"),
+                "{}",
+                conflict.note()
+            );
+        }
+        // The root that *sits inside* a denied directory: plain, and canonicalised.
+        for root in [
+            Path::new(r"C:\Users\fredrik\.ssh\repos"),
+            Path::new(r"\\?\C:\Users\fredrik\.ssh\repos"),
+        ] {
+            let conflict = sensitive_conflict(root, &denied)
+                .unwrap_or_else(|| panic!("{} must conflict", root.display()));
+            assert_eq!(
+                conflict.kind,
+                SensitiveConflictKind::Inside,
+                "for {}",
+                root.display()
+            );
+            assert!(
+                conflict
+                    .note()
+                    .contains("sits inside the sensitive directory"),
+                "{}",
+                conflict.note()
+            );
+        }
+        // The same two directions for a UNC root, the shape a mapped, redirected or WSL workspace
+        // canonicalises to.
+        let unc_denied: Vec<PathBuf> = vec![PathBuf::from(r"\\server\share\.ssh")];
+        for root in [
+            Path::new(r"\\server\share"),
+            Path::new(r"\\?\UNC\server\share"),
+        ] {
+            let conflict = sensitive_conflict(root, &unc_denied)
+                .unwrap_or_else(|| panic!("{} must conflict", root.display()));
+            assert_eq!(
+                conflict.kind,
+                SensitiveConflictKind::Contains,
+                "for {}",
+                root.display()
+            );
+        }
+        for root in [
+            Path::new(r"\\server\share\.ssh\repos"),
+            Path::new(r"\\?\UNC\server\share\.ssh\repos"),
+        ] {
+            let conflict = sensitive_conflict(root, &unc_denied)
+                .unwrap_or_else(|| panic!("{} must conflict", root.display()));
+            assert_eq!(
+                conflict.kind,
+                SensitiveConflictKind::Inside,
+                "for {}",
+                root.display()
+            );
+        }
+        // A sibling of a denied directory is not a conflict in either spelling: the checks above
+        // discriminate, they do not reject everything.
+        for root in [
+            Path::new(r"C:\Users\fredrik\source\marmel"),
+            Path::new(r"\\?\C:\Users\fredrik\source\marmel"),
+        ] {
+            assert!(
+                sensitive_conflict(root, &denied).is_none(),
+                "{} is neither inside nor an ancestor of the denied directory",
+                root.display()
+            );
+        }
+    }
+
+    /// The hard failure for a workspace root with no honest policy has to fire for the
+    /// canonicalised spelling, not only for the plain fixture path the tests used: the production
+    /// path canonicalises the root before the table is built (t-030 §0.5 and §3.4).
+    #[test]
+    fn test_policy_table_fails_closed_for_a_canonicalised_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = FakeHost::new()?;
+        let inside = host.profile.join(".ssh").join("repo");
+        std::fs::create_dir_all(&inside)?;
+        // Both spellings the policy layer can be handed: the plain one, and the verbatim one
+        // `canonicalize()` produces for it on Windows.
+        let canonical = std::fs::canonicalize(&inside)?;
+        assert_ne!(
+            canonical, inside,
+            "the fixture has to reach the table in both spellings for the check to mean anything"
+        );
+        for root in [inside.clone(), canonical] {
+            match build_policy_table(&root, &[], &host.host) {
+                Ok(table) => panic!(
+                    "{} names no honest policy, got {:?}",
+                    root.display(),
+                    table.entries
+                ),
+                Err(err @ WindowsSandboxError::RuleSetup { .. }) => {
+                    let rendered = err.to_string();
+                    assert!(
+                        rendered.contains("sits inside the sensitive directory"),
+                        "the refusal has to name the denied directory it sits inside: {rendered}"
+                    );
+                }
+                Err(other) => panic!("expected a rule setup failure, got {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// The notes a non-entry earns are chosen by comparing paths, so the verbatim spelling of the
+    /// profile root — or of a directory already on the list — still earns the note that belongs to
+    /// it: the comparison has to see through the marker for that to hold.
+    #[test]
+    fn test_a_verbatim_spelling_of_an_entry_earned_its_own_note()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = FakeHost::new()?;
+        let extra = host.workspace.join("extra");
+        std::fs::create_dir_all(&extra)?;
+        let verbatim_profile = verbatim_spelling(&host.profile);
+        let verbatim_extra = verbatim_spelling(&extra);
+        let extras = vec![
+            // The profile root, spelled the way `canonicalize()` spells it.
+            verbatim_profile.display().to_string(),
+            // One real directory, in its plain spelling and its verbatim spelling.
+            extra.display().to_string(),
+            verbatim_extra.display().to_string(),
+        ];
+
+        let table = build_policy_table(&host.workspace, &extras, &host.host)?;
+
+        assert!(
+            table.notes.iter().any(|note| {
+                note.contains("the user profile directory itself is never granted")
+                    && note.starts_with(&path_text(verbatim_profile.as_path()))
+            }),
+            "the verbatim spelling of the profile root is rejected as the profile root: {:?}",
+            table.notes
+        );
+        assert!(
+            table.notes.iter().any(|note| {
+                note.starts_with(&path_text(verbatim_extra.as_path()))
+                    && note.contains("already covered by the built-in allow-list")
+            }),
+            "the verbatim spelling of a directory already on the list is the duplicate skip, not \
+             a second rejection or a second grant: {:?}",
+            table.notes
+        );
+        assert!(
+            table
+                .entries
+                .iter()
+                .any(|entry| paths_match(entry.path.as_path(), extra.as_path())),
+            "exactly one spelling of the real directory becomes the grant"
+        );
+        Ok(())
     }
 
     /// The hand-off is single-shot and per-thread: a thread that never prepared a policy has
