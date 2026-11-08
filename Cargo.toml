@@ -75,14 +75,11 @@ libc = "0.2"
 landlock = "0.4"
 
 # Windows sandbox backend (AppContainer). Pinned to 0.59 because that release
-# links a static import library through `windows-targets 0.52.6`, which is what
-# the `x86_64-pc-windows-gnu` cross-check leg needs; 0.61 switches to
-# `raw-dylib` and is stricter. Note there is no `Win32_Security_AppContainer`
-# feature in windows-sys: the AppContainer profile APIs
-# (CreateAppContainerProfile, DeleteAppContainerProfile,
-# DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath) live in
-# `Win32::Security::Isolation`, gated by `Win32_Security_Isolation`
-# (links userenv.dll). See .marmel/research/windows_appcontainer_api.md.
+# links through the `windows-targets 0.52.6` static import library, which the
+# `x86_64-pc-windows-gnu` cross-check leg can link; 0.61 switched to raw-dylib
+# and is stricter. `Win32_Security_Isolation` is the feature carrying the
+# AppContainer profile APIs (CreateAppContainerProfile/DeleteAppContainerProfile,
+# linking userenv.dll); there is no `Win32_Security_AppContainer` feature.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
