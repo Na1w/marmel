@@ -1918,6 +1918,55 @@ mod tests {
         );
     }
 
+    /// The opt-out has to reach the **launch**, not stop at the decision. A Windows re-entry child
+    /// that always uses its confined launch would put an opted-out command inside an AppContainer
+    /// too, which is precisely what the documented escape hatch promises never to do. No Linux host
+    /// can run a Windows AppContainer, so the contract is pinned at the source: the exec step must
+    /// read the enforcement verdict, must run an opted-out run through the spawn side's own shell
+    /// rules rather than through the confined launch, must release anything the policy pass parked
+    /// on that path, and must keep the confined launch for an established confinement.
+    #[test]
+    fn test_main_rs_an_opted_out_windows_run_launches_the_pending_command_unconfined() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs must be readable from the crate manifest dir");
+        let exec_step = src
+            .find("fn exec_pending_command(")
+            .map(|from| {
+                let rest = &src[from..];
+                rest[..rest.find("fn boot_manager(").unwrap_or(rest.len())].to_string()
+            })
+            .expect("the exec step must stay one function");
+
+        assert!(
+            exec_step.contains("harness::sandbox::Enforcement::Established")
+                || exec_step.contains("harness::sandbox::Enforcement::Skipped"),
+            "the launch must read the enforcement verdict it was handed"
+        );
+        let opt_out_at = exec_step
+            .find("Enforcement::Skipped")
+            .expect("the opt-out verdict must be the branch the launch takes");
+        let confined_at = exec_step
+            .find("harness::sandbox_windows::run_in_appcontainer(")
+            .expect("the confined launch must stay for an established confinement");
+        assert!(
+            opt_out_at < confined_at,
+            "the opted-out leg must be taken instead of the confined launch, never before it"
+        );
+        assert!(
+            exec_step.contains("harness::pty::windows_shell_argv(")
+                && exec_step.contains(".spawn()")
+                && exec_step.contains("child.wait("),
+            "an opted-out run must be launched on the shared shell rules, as a child this process \
+             waits for and exits with: the opt-out must not be a re-spelled shell"
+        );
+        assert!(
+            exec_step.contains("harness::sandbox_windows::discard_windows_policy_setup(")
+                && exec_step.contains(".current_dir(cwd)"),
+            "the opted-out leg must release a parked AppContainer setup and run the pending \
+             command in the directory the protocol handed over"
+        );
+    }
+
     /// The Landlock integration tests must not rebuild a binary path from a hard-coded executable
     /// name: sandboxing is decided by the resolved exe path, never by a name.
     #[test]

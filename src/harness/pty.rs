@@ -887,7 +887,11 @@ fn windows_cmd_program(comspec: Option<&str>) -> String {
 ///   trimming, no re-quoting, no POSIX preamble. Quoting/escaping of the payload
 ///   (portable-pty's `append_quoted` applies MSVCRT backslash rules while `cmd.exe` has
 ///   no backslash escape) is deliberately out of scope here and belongs to t-009.
-pub(crate) fn windows_shell_argv(command: &str, comspec: Option<&str>) -> (String, Vec<String>) {
+///
+/// `pub` rather than `pub(crate)`, because the re-entry child in `main.rs` runs the opt-out leg
+/// through this same decision table instead of re-spelling `cmd /C <command>`: the spawn side and
+/// the opted-out launch must not be able to disagree about which shell a payload means.
+pub fn windows_shell_argv(command: &str, comspec: Option<&str>) -> (String, Vec<String>) {
     let trimmed = command.trim();
     if is_windows_interactive_shell(command) {
         let program = if is_windows_cmd_shell(command) {

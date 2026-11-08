@@ -53,8 +53,9 @@
 //! to. A read-only entry is therefore first **verified** against the DACL that exists
 //! ([`AclCoverage`]) and only mutated when the grant really is missing; a mutation refused with
 //! `ERROR_ACCESS_DENIED` or `ERROR_PRIVILEGE_NOT_HELD` is a skip note plus a warning for a
-//! non-required entry, and a rule failure only for a required one (the workspace root and the
-//! temporary directories).
+//! non-required entry, and a rule failure only for a required one — and exactly one entry is ever
+//! required: the workspace root. The temporary directories are the read-write entries that are
+//! **not** required, so a refusal there costs one write target and warns, it does not fail the run.
 //!
 //! The module comes in two layers, and they meet at one hand-off. The policy layer creates the
 //! profile and puts the ACEs on the objects; the launch layer hands that profile to
@@ -948,15 +949,24 @@ pub struct WindowsPolicyTable {
 }
 
 impl WindowsPolicyTable {
-    /// The entries whose mutation the confinement cannot lose: the read-write grants, i.e. the
-    /// workspace root and the temporary directories. A refusal on one of these is a rule
-    /// failure, because confining the run without a writable workspace and temporary directory
-    /// is not the policy that was asked for.
+    /// The entries whose mutation the confinement cannot lose: the **one** entry the shared policy
+    /// list marks `required`, i.e. the workspace root. Everything else can be declined with a
+    /// note: the temporary directories are read-write entries too, but a policy that cannot grant
+    /// one of them still confines the run and only lacks one of the write targets it asked for,
+    /// which is reported as a partially enforced attempt instead of being turned into a rule
+    /// failure that exits every command on that host.
     #[must_use = "the entries whose ACEs the confinement cannot lose, for the caller that must apply them or report the failure"]
     pub fn confinement_critical(&self) -> impl Iterator<Item = &PolicyPath> {
+        self.entries.iter().filter(|entry| entry.required)
+    }
+
+    /// The read-write entries that are **not** required: the temporary directories, i.e. the
+    /// entries the confinement applies when it can and degrades to a note when it cannot.
+    #[must_use = "the optional read-write entries, for the caller that declines them rather than losing the confinement with them"]
+    pub fn optional_read_write_entries(&self) -> impl Iterator<Item = &PolicyPath> {
         self.entries
             .iter()
-            .filter(|entry| entry.required || entry.grant == Grant::ReadWrite)
+            .filter(|entry| !entry.required && entry.grant == Grant::ReadWrite)
     }
 
     /// The read-only half, for the caller that verifies rather than mutates.
@@ -1466,38 +1476,97 @@ impl Drop for AclGrantGuard {
     }
 }
 
-/// Apply every entry of the table, and hand back the guards that restore what changed.
+/// The one-line note for a grant this policy asked for and did not get: the entry, the polarity it
+/// was asked for, and the reason. The shape is the one `sandbox::extra_path_skip_note` uses for an
+/// operator-supplied extra path, so a skipped rule reads the same way on every backend.
+fn declined_grant_note(entry: &PolicyPath, reason: impl std::fmt::Display) -> String {
+    let polarity = match entry.grant {
+        Grant::ReadWrite => "read-write",
+        Grant::ReadOnly => "read-only",
+    };
+    format!(
+        "warning: ignoring sandbox {polarity} path {}: {reason}",
+        path_text(&entry.path)
+    )
+}
+
+/// What one run of [`apply_policy_entries`] produced: the guards that restore what changed, plus
+/// the optional read-write entries (the temporary directories) whose grant was asked for and not
+/// got, named by path.
+struct PolicyApplication {
+    /// The guards for every ACE that really was added, in application order.
+    guards: Vec<AclGrantGuard>,
+    /// One entry per read-write entry that is **not** granted, in the order it was declined.
+    /// Read-only entries that declined are not listed here: losing a toolchain directory does not
+    /// narrow what the confinement can *write*, and the confinement itself is unaffected.
+    declined_readwrite: Vec<String>,
+}
+
+/// Whether the grant `entry` asks for is visible on the object it names, using the same snapshot
+/// logic as [`AclCoverage`]: a NULL DACL covers everything, and every other object answers for
+/// itself.
+fn grant_is_visible(app_sid: PSID, entry: &PolicyPath) -> Result<bool, WindowsSandboxError> {
+    let snapshot = DaclSnapshot::read(&entry.path)?;
+    if snapshot.is_null() {
+        return Ok(true);
+    }
+    snapshot.covers(&entry.path, app_sid, entry.grant)
+}
+
+/// Report one declined read-write entry the way every other skipped entry is reported: the note on
+/// stderr and through `tracing`, and the path recorded as declined.
+fn decline_read_write_entry(
+    declined: &mut Vec<String>,
+    entry: &PolicyPath,
+    reason: impl std::fmt::Display,
+) {
+    let note = declined_grant_note(entry, reason);
+    tracing::warn!("{note}");
+    eprintln!("{note}");
+    declined.push(path_text(&entry.path));
+}
+
+/// Apply every entry of the table, and hand back the guards that restore what changed together
+/// with the entries that declined.
 ///
-/// The classification follows the fail-closed contract: a read-write entry (the workspace root
-/// and the temporary directories) whose mutation is refused is a rule failure, because the
-/// policy that can then be enforced is not the policy that was asked for. A read-only entry
-/// whose mutation is refused keeps the confinement and loses one toolchain directory, which is
-/// reported as a skip note and a warning — the same shape an operator-supplied extra path that
-/// cannot become a rule takes on a Landlock host.
+/// The classification follows the fail-closed contract, with one deliberate distinction. The
+/// **required** entry — the workspace root, the one entry the shared policy list insists on — must
+/// be granted or the policy fails outright, because the policy that can then be enforced is not
+/// the policy that was asked for. Every other entry is optional: a read-only entry whose mutation
+/// is refused keeps the confinement and loses one toolchain directory, and a read-write entry
+/// (a temporary directory) whose mutation is refused keeps the confinement and loses one write
+/// target. Both are reported as a skip note plus a warning — the same shape an operator-supplied
+/// extra path that cannot become a rule takes on a Landlock host — and the read-write decline is
+/// additionally recorded, because it is what turns the attempt from `FullyEnforced` into
+/// `PartiallyEnforced` rather than an exit for every command on that host.
 fn apply_policy_entries(
     app_sid: PSID,
     table: &WindowsPolicyTable,
-) -> Result<Vec<AclGrantGuard>, WindowsSandboxError> {
+) -> Result<PolicyApplication, WindowsSandboxError> {
     let mut guards: Vec<AclGrantGuard> = Vec::new();
+    let mut declined_readwrite: Vec<String> = Vec::new();
     for entry in &table.entries {
         match AclGrantGuard::apply(app_sid, entry) {
             Ok(Some(guard)) => guards.push(guard),
             Ok(None) => {}
-            Err(err) if !(entry.required || entry.grant == Grant::ReadWrite) => {
-                // A read-only refusal: the confinement stands and one entry is simply not
+            Err(err) if !entry.required => {
+                // A non-required refusal: the confinement stands and one entry is simply not
                 // granted. The re-entry child has no logging subscriber yet, so the operator
                 // also sees the note on stderr (the `extra_path_skip_note` precedent).
-                let note = format!(
-                    "warning: ignoring sandbox read-only path {}: {err}",
-                    path_text(&entry.path)
-                );
+                let note = declined_grant_note(entry, &err);
                 tracing::warn!("{note}");
                 eprintln!("{note}");
+                if entry.grant == Grant::ReadWrite {
+                    declined_readwrite.push(path_text(&entry.path));
+                }
             }
             Err(err) => return Err(err),
         }
     }
-    Ok(guards)
+    Ok(PolicyApplication {
+        guards,
+        declined_readwrite,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2422,6 +2491,24 @@ impl From<WindowsSandboxError> for SandboxError {
     }
 }
 
+/// The reason a partially enforced run carries: the read-write entries the policy asked for and
+/// did not get, each named by path. `None` when nothing was declined, i.e. when the confinement
+/// that exists is the whole policy that was asked for.
+///
+/// The paths are named because the operator has to be able to act on the verdict: an unnamed
+/// missing write target is a warning nobody can trace back to a directory.
+#[must_use]
+fn partial_reason_for(declined_readwrite: &[String]) -> Option<String> {
+    if declined_readwrite.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the AppContainer policy granted every required entry but not every optional read-write \
+         entry: {} — that write target is missing from the confinement",
+        declined_readwrite.join(", ")
+    ))
+}
+
 /// Everything the policy layer has established for one run.
 ///
 /// `t-008` hands [`WindowsPolicySetup::profile`] (and the capability list it owns) to
@@ -2433,6 +2520,15 @@ pub struct WindowsPolicySetup {
     pub profile: AppContainerProfileGuard,
     /// The ACEs applied for it, in application order; restoring them is how the run ends.
     pub grants: Vec<AclGrantGuard>,
+    /// The read-write entries this policy asked for and did not get, named by path in the order
+    /// they were declined: a temporary directory whose DACL mutation was refused, or whose applied
+    /// grant is not visible in the object it names.
+    ///
+    /// Empty means the policy is the policy that was asked for. Non-`empty` means the confinement
+    /// in force is that policy **minus one write target**, which the attempt surface reports as a
+    /// partially enforced run rather than quietly calling full, or failing every command run on
+    /// that host.
+    pub declined_readwrite: Vec<String>,
 }
 
 impl WindowsPolicySetup {
@@ -2440,6 +2536,17 @@ impl WindowsPolicySetup {
     #[must_use]
     pub fn sid(&self) -> PSID {
         self.profile.sid()
+    }
+
+    /// The reason of a partially enforced run: the optional read-write entries that are missing
+    /// from the confinement that was asked for. `None` when every entry landed, i.e. when the
+    /// confinement is the whole policy.
+    ///
+    /// Every entry it names is a path the operator can act on, which is the point of spelling the
+    /// reason out rather than keeping the verdict quiet.
+    #[must_use]
+    pub fn partial_reason(&self) -> Option<String> {
+        partial_reason_for(&self.declined_readwrite)
     }
 }
 
@@ -2470,15 +2577,15 @@ pub fn prepare_windows_policy(
         "created the AppContainer profile for this run"
     );
 
-    let grants = apply_policy_entries(profile.sid(), &table)?;
+    let application = apply_policy_entries(profile.sid(), &table)?;
+    let mut declined_readwrite = application.declined_readwrite;
 
-    // Every read-write grant must be visible on the object it names, or the confinement the
-    // policy promises is not the confinement the child is about to experience.
+    // Every **required** grant must be visible on the object it names, or the confinement the
+    // policy promises is not the confinement the child is about to experience. That is the one
+    // entry the confinement cannot lose, so a grant missing from it is an enforcement failure
+    // rather than a note.
     for entry in table.confinement_critical() {
-        let snapshot = DaclSnapshot::read(&entry.path)?;
-        let covered =
-            snapshot.is_null() || snapshot.covers(&entry.path, profile.sid(), entry.grant)?;
-        if !covered {
+        if !grant_is_visible(profile.sid(), entry)? {
             return Err(WindowsSandboxError::AclVerification {
                 path: path_text(&entry.path),
                 reason: "the grant this policy applied is not visible in the object's DACL"
@@ -2487,7 +2594,33 @@ pub fn prepare_windows_policy(
         }
     }
 
-    Ok(WindowsPolicySetup { profile, grants })
+    // The optional read-write entries — the temporary directories — are re-read with the same
+    // snapshot logic, and a grant that is not visible there is the same decline as a refused
+    // mutation: one write target is missing, the confinement stands. An entry already declined
+    // above is not reported a second time.
+    for entry in table.optional_read_write_entries() {
+        let name = path_text(&entry.path);
+        if declined_readwrite.contains(&name) {
+            continue;
+        }
+        match grant_is_visible(profile.sid(), entry) {
+            Ok(true) => {}
+            Ok(false) => decline_read_write_entry(
+                &mut declined_readwrite,
+                entry,
+                "the grant this policy applied is not visible in the object's DACL",
+            ),
+            // The re-read itself failed: the entry cannot be confirmed, which is a decline, not a
+            // verdict on the confinement.
+            Err(err) => decline_read_write_entry(&mut declined_readwrite, entry, &err),
+        }
+    }
+
+    Ok(WindowsPolicySetup {
+        profile,
+        grants: application.guards,
+        declined_readwrite,
+    })
 }
 
 thread_local! {
@@ -2555,7 +2688,9 @@ pub fn discard_windows_policy_setup() -> bool {
 /// The setup is parked in the `PREPARED_SETUP` thread-local and handed straight back, which is
 /// what keeps preparation single-shot per run: whoever prepared it once is the only one who can
 /// pick it up. The returned attempt is `FullyEnforced` only when the enforcement probe accepted
-/// the confinement, and every failure comes back with `None` — no half-applied policy is parked.
+/// the confinement **and** every entry of the policy it built; it is `PartiallyEnforced` when the
+/// probe accepted a policy that had to decline one of its optional read-write entries. Every
+/// failure comes back with `None` — no half-applied policy is parked.
 #[must_use]
 pub fn attempt_windows_sandbox_with_setup(
     workspace_root: &Path,
@@ -2574,7 +2709,18 @@ pub fn attempt_windows_sandbox_with_setup(
         return (attempt_from_windows_error(err), None);
     }
     put_prepared_setup(setup);
-    (SandboxAttempt::FullyEnforced, take_windows_policy_setup())
+    let setup = take_windows_policy_setup();
+    // The verdict describes the policy that exists, not the one that was intended. A declined
+    // read-write entry — a temporary directory this host would not let the policy grant — means
+    // the confinement in force is the confinement that was asked for, minus one write target.
+    // That is what `PartiallyEnforced` spells (and what the shared dispatch warns about), rather
+    // than a `FullyEnforced` claim the object state contradicts or a rule failure that costs the
+    // whole host every command it runs.
+    let attempt = match setup.as_ref().and_then(|setup| setup.partial_reason()) {
+        Some(reason) => SandboxAttempt::PartiallyEnforced { reason },
+        None => SandboxAttempt::FullyEnforced,
+    };
+    (attempt, setup)
 }
 
 /// What one Windows sandbox attempt achieved, with the policy it built parked for the launch
@@ -2802,6 +2948,97 @@ mod tests {
         );
         assert!(read_write.contains(&host.workspace));
         Ok(())
+    }
+
+    /// The confinement may only be strict about **one** entry: the workspace root, the entry the
+    /// shared policy list marks `required`. Every temporary directory is an *optional* read-write
+    /// entry instead, so a refusal there costs one write target and warns rather than failing the
+    /// policy — on a host whose temp DACL cannot be mutated, that failure used to be every command
+    /// on that host exiting with the refusal code.
+    #[test]
+    fn test_confinement_critical_is_the_workspace_root_and_nothing_else()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = FakeHost::new()?;
+        let table = build_policy_table(&host.workspace, &[], &host.host)?;
+
+        let critical: Vec<PathBuf> = table
+            .confinement_critical()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert_eq!(
+            critical.len(),
+            1,
+            "exactly one entry may be confinement critical, got {critical:?}"
+        );
+        assert_eq!(critical[0], host.workspace, "and it is the workspace root");
+
+        let optional: Vec<PathBuf> = table
+            .optional_read_write_entries()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert!(
+            optional
+                .iter()
+                .any(|path| paths_match(path, &host.temp_dir)),
+            "the temporary directory is an optional read-write entry: {optional:?}"
+        );
+        assert!(
+            !optional
+                .iter()
+                .any(|path| paths_match(path, &host.workspace)),
+            "the required entry is never part of the optional half: {optional:?}"
+        );
+        Ok(())
+    }
+
+    /// A refused read-write grant is reported in the one-line note vocabulary the other backends
+    /// use, with the polarity that was declined; and it is what turns the verdict from
+    /// `FullyEnforced` into `PartiallyEnforced` — a reason naming the path the operator can act
+    /// on, never a bare failure.
+    #[test]
+    fn test_a_declined_read_write_grant_is_noted_and_named_in_the_partial_reason() {
+        let temp = PolicyPath {
+            path: PathBuf::from(r"C:\Windows\Temp"),
+            grant: Grant::ReadWrite,
+            required: false,
+        };
+        let note = declined_grant_note(&temp, "SetNamedSecurityInfoW failed: Access is denied.");
+        assert!(
+            note.starts_with("warning: ignoring sandbox read-write path "),
+            "the note must name the polarity that was declined: {note}"
+        );
+        assert!(
+            note.contains(r"C:\Windows\Temp") && note.contains("Access is denied."),
+            "the note must name the entry and the reason behind it: {note}"
+        );
+        assert_eq!(
+            note.lines().count(),
+            1,
+            "one line per declined entry: {note}"
+        );
+
+        let read_only = PolicyPath {
+            path: PathBuf::from(r"C:\Windows"),
+            grant: Grant::ReadOnly,
+            required: false,
+        };
+        assert!(
+            declined_grant_note(&read_only, "no WRITE_DAC on this object")
+                .starts_with("warning: ignoring sandbox read-only path "),
+            "a read-only decline keeps the wording the read-only skips already had"
+        );
+
+        assert_eq!(
+            partial_reason_for(&[]),
+            None,
+            "a policy that declined nothing is the whole policy"
+        );
+        let reason = partial_reason_for(std::slice::from_ref(&path_text(&temp.path)))
+            .expect("one declined read-write entry makes the attempt partially enforced");
+        assert!(
+            reason.contains(r"C:\Windows\Temp"),
+            "the reason must name the write target that is missing: {reason}"
+        );
     }
 
     /// The toolchain and system directories get the read-and-execute grant, and a path that

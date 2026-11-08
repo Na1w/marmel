@@ -39,12 +39,13 @@
 //! for the rest of the run, so confinement is applied inside the re-entry child. Nothing is ever
 //! written into the real user profile: `%USERPROFILE%` is probed by reading it only.
 //!
-//! One Windows-specific asymmetry with the macOS file matters below: an explicit opt-out read by
-//! the **re-entry child** still launches the pending command inside an AppContainer (the confined
-//! launch in `src/main.rs` is where every Windows payload is run), so `MARMEL_DISABLE_SANDBOX=1`
-//! cannot be the attribution leg here. The attribution leg is the same payload run by `cmd.exe`
-//! straight from the test process, which is the only leg this file runs with no AppContainer at
-//! all. Both kinds are asserted, and each says which one it is.
+//! One Windows-specific point of contract matters below: an explicit opt-out read by the
+//! **re-entry child** runs the pending command **unconfined** — the shell argv of the spawn side,
+//! as a plain child of that process — because running it inside an AppContainer anyway would not
+//! be an opt-out. That is what makes the opt-out leg below the direct counterpart of the confined
+//! denial leg rather than a documentation of it. The attribution leg is the same payload run by
+//! `cmd.exe` straight from the test process, i.e. the one leg this file runs without the re-entry
+//! child at all. Both kinds are asserted, and each says which one it is.
 
 // A test file whose every item is Windows-only must still compile cleanly on Linux, where it holds
 // nothing: the crate-wide `cfg` below is what makes that true rather than an empty `mod`.
@@ -344,7 +345,8 @@ fn test_windows_writes_in_the_temporary_directory_are_allowed() {
 /// A write outside every granted root is denied, creates nothing, and is named as a denial — and
 /// `%USERPROFILE%`, the one directory the policy refuses to grant, is where that is proved. The
 /// three legs are the confined denial, the unconfined run that must succeed in the same fixture,
-/// and the opt-out leg, which on Windows documents the opt-out rather than attributing the denial.
+/// and the opt-out leg, which must **succeed** in that same fixture too: an honoured
+/// `MARMEL_DISABLE_SANDBOX=1` means no AppContainer is involved in the run at all.
 #[test]
 fn test_windows_denies_writes_outside_the_granted_roots() {
     let name = "test_windows_denies_writes_outside_the_granted_roots";
@@ -413,9 +415,10 @@ fn test_windows_denies_writes_outside_the_granted_roots() {
         "{name}: the unconfined run must have created the fixture marker"
     );
 
-    // 3. The opt-out leg. On Windows the re-entry child still runs the pending command through the
-    //    confined launch, so this leg does not undo leg 1: what it asserts is that the opt-out is
-    //    honoured at the re-entry level and named out loud, backend and all.
+    // 3. The opt-out leg, in two parts. `MARMEL_DISABLE_SANDBOX=1` is the operator's one way to
+    //    run without the backend, so the re-entry child has to take the payload out of any
+    //    AppContainer on that path — and the warning that says so must be printed, because an
+    //    opt-out nobody can see is an opt-out nobody can trust.
     let opted = run_child(workspace.path(), "echo opted-out", None, true);
     assert_eq!(
         opted.status.code(),
@@ -432,6 +435,35 @@ fn test_windows_denies_writes_outside_the_granted_roots() {
     assert!(
         opted_stderr.contains("DISABLED") && opted_stderr.contains("AppContainer"),
         "{name}: a skipped backend must be warned about by name, got: {opted_stderr}"
+    );
+    assert!(
+        opted_stderr.contains(SANDBOX_OPTOUT_ENV),
+        "{name}: the opt-out warning must name the variable the operator set, got: {opted_stderr}"
+    );
+
+    // 3b. And the proof leg 1 could not give: the very same kind of write, into the very same
+    //      fixture the sandbox denied, by an opted-out run. This marker is one no earlier leg
+    //      touched, so its creation is the opt-out's doing and nothing else's — which is what an
+    //      honoured opt-out has to mean: the command runs, and it runs in the clear.
+    let opted_marker = fixture.path().join("opt-out-wrote-this");
+    let opted_write = run_child(workspace.path(), &write_payload(&opted_marker), None, true);
+    assert_eq!(
+        opted_write.status.code(),
+        Some(0),
+        "{name}: an opted-out run must be able to write where the confined run could not, \
+         stdout: {} stderr: {}",
+        stdout_of(&opted_write),
+        stderr_of(&opted_write)
+    );
+    assert!(
+        opted_marker.is_file(),
+        "{name}: the opted-out run must have created the marker the confined run could not"
+    );
+    let written = std::fs::read_to_string(&opted_marker)
+        .expect("the opted-out marker must be readable after the leg that wrote it");
+    assert!(
+        written.contains(WRITTEN_MARK),
+        "{name}: the marker must hold what the payload wrote, got: {written}"
     );
 }
 

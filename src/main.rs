@@ -549,7 +549,9 @@ fn is_sandbox_reentry(first: Option<&str>) -> bool {
 /// AppContainer setup, and the confined launch inside [`exec_pending_command`] picks it up,
 /// launches the pending command inside that AppContainer and exits with the child's exit code.
 /// A refusal releases the parked setup instead, so a run that never launched anything does not
-/// leave the workspace DACLs extended.
+/// leave the workspace DACLs extended. An **opt-out** run does neither: enforcement was skipped,
+/// so there is no confinement for the pending command to enter, and [`exec_pending_command`]
+/// launches it unconfined.
 fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
     let cwd_raw = args.next().unwrap_or_else(|| ".".to_string());
     let command = args.next().unwrap_or_default();
@@ -604,7 +606,9 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
 
     match harness::sandbox::reentry_action(&decision, &enforcement) {
         harness::sandbox::ReentryAction::Exec => {
-            exec_pending_command(&command, &cwd, &extra_readonly_paths)
+            // The enforcement verdict travels with the launch, because it is what the launch
+            // depends on: an established confinement is entered, an opt-out is run in the clear.
+            exec_pending_command(&command, &cwd, &extra_readonly_paths, &enforcement)
         }
         harness::sandbox::ReentryAction::Refuse { reason, exit_code } => {
             // On Windows the policy judgement parked a prepared AppContainer setup behind the
@@ -676,26 +680,43 @@ fn resolve_program_path(token: &str) -> Option<std::path::PathBuf> {
 /// Launch the pending command in `cwd`, under the sandbox this process has established, and
 /// terminate the re-entry child with the command's exit code. Reached only for a
 /// [`harness::sandbox::ReentryAction::Exec`]. The mechanism is per platform, and the
-/// confinement is the point of each form:
+/// confinement is the point of each form — including the form the **opt-out** takes, which is
+/// what [`harness::sandbox::Enforcement`] decides:
 ///
 /// * **unix** — `execve()` of `sh -c <command>`, so the pending command *becomes* this
-///   already-restricted process, which is why a refusal to exec is a sandbox statement;
-/// * **Windows** — no `execve()`, and no `sh`: the pending command is launched as a child
-///   **inside the AppContainer this process prepared**, through the launch half of the Windows
-///   backend, which releases the policy guards once that child has exited. The setup prepared
-///   by the policy pass above is picked up by that call rather than prepared a second time;
+///   already-restricted process, which is why a refusal to exec is a sandbox statement. The
+///   confinement lives in this process, so this arm never re-reads the enforcement verdict:
+///   `execve()` is the confinement whatever the verdict says;
+/// * **Windows** — no `execve()`, and no `sh`. For [`harness::sandbox::Enforcement::Established`]
+///   the pending command is launched as a child **inside the AppContainer this process
+///   prepared**, through the launch half of the Windows backend, which releases the policy guards
+///   once that child has exited; the setup prepared by the policy pass above is picked up by that
+///   call rather than prepared a second time. For [`harness::sandbox::Enforcement::Skipped`] — the
+///   operator's opt-out, the only legitimate way to run a command unsandboxed — there is no
+///   confinement to launch inside, and the pending command runs as a **plain** child of this
+///   process, on the shell argv the spawn side would have built
+///   ([`harness::pty::windows_shell_argv`]). An opt-out that still ends up in an AppContainer is
+///   not an opt-out; [fail-closed](harness::sandbox) enforcement failures never reach `Exec` at
+///   all, and the confined arm is the honest answer for them too;
 /// * **any other target** — the spawn-and-wait fallback this function used before the re-entry
 ///   became platform-specific.
 ///
 /// `extra_readonly_paths` are the configured extras exactly as they arrived through the
-/// environment. Only the Windows launch consumes them (a setup re-prepared inside that call
-/// repeats the same policy); on unix they were already folded into the ruleset by the
+/// environment. Only the confined Windows launch consumes them (a setup re-prepared inside that
+/// call repeats the same policy); on unix they were already folded into the ruleset by the
 /// enforcement pass, so this arm says what it is ignoring.
 fn exec_pending_command(
     command: &str,
     cwd: &std::path::Path,
     extra_readonly_paths: &[String],
+    enforcement: &harness::sandbox::Enforcement,
 ) -> Result<()> {
+    // The enforcement verdict only decides the Windows launch. On unix the confinement was put
+    // into this process by the enforcement pass, and `execve()` below inherits it; on a target
+    // with no backend there is no verdict to act on.
+    #[cfg(not(target_os = "windows"))]
+    let _ = &enforcement;
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -729,6 +750,77 @@ fn exec_pending_command(
     }
     #[cfg(target_os = "windows")]
     {
+        // The opt-out leg: nothing is confined, because nothing was asked to be. An
+        // [`harness::sandbox::Enforcement::Skipped`] verdict is the operator's own
+        // [`harness::pty::SANDBOX_OPTOUT_ENV`] setting, the only legitimate way to run a command
+        // unsandboxed, and honouring it means running the pending command outside any
+        // AppContainer — confining it anyway is the contradiction this leg exists to remove.
+        // [`harness::sandbox::Enforcement::Established`] is the confined leg below, and
+        // [`harness::sandbox::Enforcement::Failed`] never reaches `Exec` at all
+        // ([`harness::sandbox::reentry_action`] refuses it) so it falls into the confined arm as
+        // the only honest answer for a confinement that exists but was not established.
+        if matches!(enforcement, harness::sandbox::Enforcement::Skipped { .. }) {
+            // The policy pass was skipped for an opt-out run, so nothing should be parked. If
+            // anything is, it is released here: a half-prepared AppContainer left behind would
+            // keep the workspace DACLs extended and the profile registered.
+            if harness::sandbox_windows::discard_windows_policy_setup() {
+                tracing::warn!(
+                    "an AppContainer setup was parked for an opted-out sandbox run: released it \
+                     instead of launching the pending command inside it"
+                );
+            }
+            // The shell resolution is the spawn side's own, reused rather than re-spelled: rule
+            // R1-R5 of `pty::windows_shell_argv` decide the program, whether a `/C` payload is
+            // added, and leave a bare interactive-shell request bare. The confined child of the
+            // unix arm is `sh -c <command>`; the unconfined Windows child is its equivalent.
+            let (program, args) =
+                harness::pty::windows_shell_argv(command, std::env::var("COMSPEC").ok().as_deref());
+            tracing::debug!(
+                program = %program,
+                // The extras were never turned into a policy on this path: the policy pass ran
+                // only when the sandbox was wanted at all.
+                extra_readonly_paths = extra_readonly_paths.len(),
+                "sandbox re-entry: the opt-out runs the pending command unconfined"
+            );
+            let mut child = match std::process::Command::new(&program)
+                .args(&args)
+                .current_dir(cwd)
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(err) => {
+                    // Same register as the exec failure above: the program that could not be
+                    // started, and the cause. This is a spawn failure, not a sandbox statement —
+                    // nothing is being enforced on this path — so it is not blamed on a rule.
+                    tracing::error!(
+                        program = %program,
+                        error = %err,
+                        "sandbox re-entry: the unconfined launch of the pending command failed"
+                    );
+                    eprintln!(
+                        "error: failed to run {program} after the sandbox opt-out: {err}. \
+                         Check that the program exists and is executable."
+                    );
+                    std::process::exit(1)
+                }
+            };
+            let status = match child.wait() {
+                Ok(status) => status,
+                Err(err) => {
+                    tracing::error!(
+                        program = %program,
+                        error = %err,
+                        "sandbox re-entry: the unconfined command could not be waited for"
+                    );
+                    eprintln!(
+                        "error: failed to wait for {program} after the sandbox opt-out: {err}"
+                    );
+                    std::process::exit(1)
+                }
+            };
+            // The command's own exit code is this run's verdict, opt-out included.
+            std::process::exit(status.code().unwrap_or(1))
+        }
         // The confined launch. The AppContainer setup parked behind the `Ok(())` of the
         // enforcement call above is picked up by this call, the command is launched inside it,
         // and the guards are released once the child has exited. `cwd` is passed as the policy
