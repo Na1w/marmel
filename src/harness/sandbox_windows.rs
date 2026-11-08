@@ -2169,6 +2169,13 @@ const STD_HANDLE_SECURITY_ACCESS: u32 = READ_CONTROL | WRITE_DAC;
 /// same object: the grant the copy writes is the grant the **original** std handle is later checked
 /// against, which is the handle the confined child reads and writes through.
 ///
+/// That same rule is why this copy is not a way to *obtain* rights the object never granted: for a
+/// stream object whose descriptor concedes only the rights of a stream, the duplicate is judged by
+/// that descriptor too, and the security calls go on answering `ERROR_ACCESS_DENIED`. No
+/// duplication flag turns a foreign handle into a security-capable one — the object's descriptor is
+/// the only lever — which is what `test_a_foreign_handle_refuses_the_security_read_and_duplication_cannot_repair_it`
+/// pins, and why the grant below is warn-only in production and test-owned in the tests.
+///
 /// The original is deliberately *not* replaced for the launch: the access mask the child inherits is
 /// the source handle's, and only the source names `FILE_READ_DATA` and `FILE_WRITE_DATA` — a
 /// duplicate that asked for the security rights alone would hand the confined child a std handle it
@@ -3206,7 +3213,15 @@ pub fn run_in_appcontainer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Security::Authorization::DENY_ACCESS;
+    use windows_sys::Win32::Security::{
+        CopySid, GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor,
+        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WRITE_OWNER, WriteFile};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
 
     /// The fixture host: one temporary directory playing the role of `%USERPROFILE%`, with the
     /// sensitive directories, the toolchain directories, a temporary directory and a
@@ -3894,13 +3909,16 @@ mod tests {
     }
 
     /// Whether `handle` names an object whose DACL already carries an allow ACE for `sid` covering
-    /// `mask` — the read side of the handle grant, spelled once for the test below.
+    /// `mask` — the read side of the handle grant, spelled once for the tests below.
     ///
-    /// The read runs through [`duplicate_for_security`] for the reason the grant itself runs through
-    /// it: the raw handle of a fresh pipe carries the rights of a stream, not `READ_CONTROL`, and
-    /// `GetSecurityInfo` through such a handle answers `ERROR_ACCESS_DENIED`. A refused read is
-    /// answered here by a panic, because "the DACL could not be read" and "the DACL holds no such
-    /// ACE" are different answers, and this test has to tell them apart.
+    /// The read runs through [`duplicate_for_security`] for the same reason the grant itself does, and
+    /// it works here only because the fixture objects are created by this test with a descriptor that
+    /// concedes `READ_CONTROL` to this process ([`TestDescriptor`]): duplication re-runs the access
+    /// check against the object's own DACL, so it can never add a right that DACL refuses. What that
+    /// means for a handle this process did not create is pinned by
+    /// [`test_a_foreign_handle_refuses_the_security_read_and_duplication_cannot_repair_it`]. A refused
+    /// read is answered here by a panic, because "the DACL could not be read" and "the DACL holds no
+    /// such ACE" are different answers, and the grant test has to tell them apart.
     fn handle_names_sid(handle: HANDLE, sid: PSID, mask: u32) -> bool {
         let secured = match duplicate_for_security(handle) {
             Ok(duplicated) => duplicated,
@@ -4000,43 +4018,354 @@ mod tests {
         found
     }
 
-    /// A real handle, real DACL, real grant: `CreatePipe` gives an object with the default DACL of
-    /// this process, which is exactly the object the confined child could not write to. The grant
-    /// puts the AppContainer ACE on it, and dropping the guard puts the original back.
+    // -----------------------------------------------------------------------
+    // fixture: one object whose security descriptor this test writes itself
+    // -----------------------------------------------------------------------
+
+    /// `SECURITY_DESCRIPTOR_REVISION` spelled locally, for the same reason `ACCESS_ALLOWED_ACE_TYPE`
+    /// is: the constant in `windows_sys::Win32::System::SystemServices` lives in a module this crate
+    /// does not enable.
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+    /// What a fixture object concedes to the process that created it: `READ_CONTROL` for
+    /// `GetSecurityInfo`, `WRITE_DAC` for `SetSecurityInfo`, and the data, attribute and ownership
+    /// rights the access request `CreatePipe` makes for each end maps onto. The two security rights are
+    /// the point — without them the object's DACL is out of reach whatever the handle does — and the
+    /// rest is there so that the create itself passes the same access check.
+    const FIXTURE_CALLER_ACCESS: u32 = READ_CONTROL
+        | WRITE_DAC
+        | WRITE_OWNER
+        | SYNCHRONIZE
+        | FILE_READ_DATA
+        | FILE_WRITE_DATA
+        | FILE_READ_ATTRIBUTES
+        | FILE_WRITE_ATTRIBUTES;
+
+    /// The contrast object's mask: everything a stream handle really carries, and none of what the
+    /// security calls need — the shape of the std handles this process is *given*.
+    const FIXTURE_DATA_ONLY_ACCESS: u32 = SYNCHRONIZE
+        | FILE_READ_DATA
+        | FILE_WRITE_DATA
+        | FILE_READ_ATTRIBUTES
+        | FILE_WRITE_ATTRIBUTES;
+
+    /// The two rights that decide whether a DACL can be read and rewritten at all.
+    const FIXTURE_SECURITY_ACCESS: u32 = READ_CONTROL | WRITE_DAC;
+
+    /// The Win32 code `GetSecurityInfo` answers when asked for the DACL of `handle` and nothing else,
+    /// releasing whatever the read allocated either way.
     ///
-    /// The handle is the raw write end of the pipe, with no security rights in its access mask — the
-    /// shape a std handle of the one-shot path really has, and the reason this grant used to answer
-    /// `SetSecurityInfo failed: Access is denied. (os error 5)`: the call needs `WRITE_DAC` on the
-    /// handle it is given, and a stream handle does not have it. [`duplicate_for_security`] is what
-    /// supplies it, so this test exercises the same path the confined launch does rather than a
-    /// handle this test happens to have opened with the right rights.
+    /// This is the question the foreign-handle test has to ask: the answer is `ERROR_ACCESS_DENIED`
+    /// whenever the object's DACL refuses `READ_CONTROL` to the caller, and no amount of handle
+    /// juggling changes the answer, because the object's DACL is what the access check reads.
+    fn security_read_code(handle: HANDLE) -> WIN32_ERROR {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle names one live object, and every out-parameter is a valid pointer.
+        let code = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                &mut sacl,
+                &mut sd,
+            )
+        };
+        let _ = dacl;
+        let _ = sacl;
+        // SAFETY: `GetSecurityInfo` documents `LocalFree` as the release of the descriptor it hands
+        // back, and `LocalFree(NULL)` is defined to do nothing.
+        unsafe { LocalFree(sd) };
+        code
+    }
+
+    /// One SID owned by this test: `CopySid` wrote it into a `u32`-aligned buffer, which is the
+    /// alignment every `PSID` user demands, and that buffer lives exactly as long as this value.
+    struct OwnedSid {
+        buffer: Vec<u32>,
+    }
+
+    impl OwnedSid {
+        fn copy(sid: PSID) -> Result<Self, WindowsSandboxError> {
+            // SAFETY: `GetLengthSid` only reads the header of a valid SID.
+            let bytes = unsafe { GetLengthSid(sid) };
+            if bytes == 0 {
+                return Err(WindowsSandboxError::Sid {
+                    reason: format!("GetLengthSid failed: {}", last_win32_error()),
+                    code: unsafe { GetLastError() },
+                });
+            }
+            let mut buffer = vec![0u32; bytes.div_ceil(4) as usize];
+            let destination = buffer.as_mut_ptr().cast::<c_void>();
+            // SAFETY: the destination is `bytes` bytes of live, DWORD-aligned memory owned by
+            // `buffer`, and `sid` is a valid SID of the length `GetLengthSid` just reported.
+            if unsafe { CopySid(bytes, destination, sid) } == 0 {
+                return Err(WindowsSandboxError::Sid {
+                    reason: format!("CopySid failed: {}", last_win32_error()),
+                    code: unsafe { GetLastError() },
+                });
+            }
+            Ok(Self { buffer })
+        }
+
+        /// The copied SID. `Vec` never moves the block it allocated once its length is fixed, so the
+        /// address `copy` wrote into is the address this returns.
+        fn sid(&self) -> PSID {
+            self.buffer.as_ptr().cast_mut().cast::<c_void>()
+        }
+    }
+
+    /// The SID this process runs as: the principal a fixture descriptor has to name, because it is
+    /// the caller the access check behind `GetSecurityInfo`, `SetSecurityInfo` and `DuplicateHandle`
+    /// is run against.
+    fn caller_sid() -> Result<OwnedSid, WindowsSandboxError> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `GetCurrentProcess()` is the pseudo-handle `OpenProcessToken` documents, and the
+        // out-parameter is a valid pointer.
+        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        if opened == 0 {
+            return Err(WindowsSandboxError::Sid {
+                reason: format!("OpenProcessToken failed: {}", last_win32_error()),
+                code: unsafe { GetLastError() },
+            });
+        }
+        // Two passes: the size of a `TOKEN_USER` header plus the SID it points at is only known by
+        // asking, and the size probe is documented to answer `ERROR_INSUFFICIENT_BUFFER`.
+        let mut needed = 0u32;
+        // SAFETY: a zero-length buffer with a null pointer is that documented probe.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            let code = unsafe { GetLastError() };
+            // SAFETY: the token handle is this call's to close, and nothing else was opened.
+            unsafe { CloseHandle(token) };
+            return Err(WindowsSandboxError::Sid {
+                reason: format!(
+                    "GetTokenInformation(TokenUser) reported no size: {}",
+                    last_win32_error()
+                ),
+                code,
+            });
+        }
+        // `u64` elements, because a `TOKEN_USER` holds a pointer and therefore wants 8-byte alignment
+        // that a byte buffer is not promised.
+        let mut buffer = vec![0u64; needed.div_ceil(8) as usize];
+        // SAFETY: the buffer is at least `needed` bytes long, which is what the probe asked for.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                needed,
+                &mut needed,
+            )
+        };
+        let read_error = if read == 0 {
+            unsafe { GetLastError() }
+        } else {
+            ERROR_SUCCESS
+        };
+        // SAFETY: the user SID lives in the buffer, not in the token handle, so the handle can go.
+        unsafe { CloseHandle(token) };
+        if read_error != ERROR_SUCCESS {
+            return Err(WindowsSandboxError::Sid {
+                reason: format!(
+                    "GetTokenInformation(TokenUser) failed: {}",
+                    last_win32_error()
+                ),
+                code: read_error,
+            });
+        }
+        // SAFETY: the buffer holds the `TOKEN_USER` header followed by the SID its `Sid` field points
+        // at, both written by `GetTokenInformation` into this one allocation.
+        let sid = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+        OwnedSid::copy(sid)
+    }
+
+    /// An absolute security descriptor this test builds itself, naming exactly one principal: the
+    /// process running the test.
+    ///
+    /// This is the fixture's whole point. A descriptor handed to `SECURITY_ATTRIBUTES::lpSecurityDescriptor`
+    /// is honoured only for an object being **created**, so the object behind the fixture handle is
+    /// governed by a DACL this test wrote, and the two security rights the grant path needs are inside
+    /// it. That is what makes the fixture an object this test may read, rewrite and put back; a handle
+    /// to anything else in the machine is at the mercy of a DACL somebody else wrote (see
+    /// [`test_a_foreign_handle_refuses_the_security_read_and_duplication_cannot_repair_it`]).
+    struct TestDescriptor {
+        /// Boxed so its address stays put while `SECURITY_ATTRIBUTES` points at it.
+        sd: Box<SECURITY_DESCRIPTOR>,
+        /// The DACL `SetEntriesInAclW` allocated for the descriptor, released on drop — the object is
+        /// created from a copy of the descriptor, so the ACL outlives every use here and nothing else.
+        dacl: *mut ACL,
+    }
+
+    impl TestDescriptor {
+        /// Grant `allow` to this process, and — when `deny` is not `0` — refuse it `deny` as well, with
+        /// nobody else on the list. `SetEntriesInAclW` orders a deny ACE ahead of the allow ACEs, so the
+        /// refused rights stay refused.
+        fn for_caller(
+            allow: u32,
+            deny: u32,
+            caller: &OwnedSid,
+        ) -> Result<Self, WindowsSandboxError> {
+            let trustee = trustee_for_sid(caller.sid());
+            let mut entries = vec![EXPLICIT_ACCESS_W {
+                grfAccessPermissions: allow,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: NO_INHERITANCE,
+                Trustee: trustee,
+            }];
+            if deny != 0 {
+                entries.push(EXPLICIT_ACCESS_W {
+                    grfAccessPermissions: deny,
+                    grfAccessMode: DENY_ACCESS,
+                    grfInheritance: NO_INHERITANCE,
+                    Trustee: trustee,
+                });
+            }
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            // SAFETY: `entries` outlives the call, and a null old ACL means "start from these entries
+            // alone" — which is exactly a DACL that names no one but this process.
+            let built = unsafe {
+                SetEntriesInAclW(
+                    entries.len() as u32,
+                    entries.as_ptr(),
+                    std::ptr::null(),
+                    &mut dacl,
+                )
+            };
+            if built != ERROR_SUCCESS {
+                return Err(WindowsSandboxError::AclMutate {
+                    path: "the fixture descriptor".to_string(),
+                    reason: format!("SetEntriesInAclW failed: {}", last_win32_error()),
+                    code: built,
+                });
+            }
+            let mut sd = Box::new(SECURITY_DESCRIPTOR {
+                Revision: 0,
+                Sbz1: 0,
+                Control: 0,
+                Owner: std::ptr::null_mut(),
+                Group: std::ptr::null_mut(),
+                Sacl: std::ptr::null_mut(),
+                Dacl: std::ptr::null_mut(),
+            });
+            // `Box` has no stable `as_mut_ptr`, so the address is taken through a mutable borrow of
+            // the boxed value, which keeps the box as the owner; `PSECURITY_DESCRIPTOR` is a type alias
+            // for `*mut c_void`, hence the cast.
+            let descriptor_ptr = std::ptr::from_mut(&mut *sd).cast::<c_void>();
+            // SAFETY: the pointer names the live, boxed `SECURITY_DESCRIPTOR` this call initialises,
+            // and revision 1 is the only revision the API accepts.
+            let initialised = unsafe {
+                InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION)
+            };
+            let initialised_error = if initialised == 0 {
+                unsafe { GetLastError() }
+            } else {
+                ERROR_SUCCESS
+            };
+            if initialised_error != ERROR_SUCCESS {
+                // SAFETY: the ACL reached no descriptor, so this call releases it itself.
+                unsafe { LocalFree(dacl as *mut c_void) };
+                return Err(WindowsSandboxError::AclMutate {
+                    path: "the fixture descriptor".to_string(),
+                    reason: format!(
+                        "InitializeSecurityDescriptor failed: {}",
+                        last_win32_error()
+                    ),
+                    code: initialised_error,
+                });
+            }
+            // SAFETY: the descriptor is initialised, `descriptor_ptr` still names the boxed
+            // descriptor (the box is not moved), and the ACL handed to it is the one this struct keeps
+            // alive until drop — past every object created from it.
+            let attached =
+                unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, dacl as *const ACL, 0) };
+            let attached_error = if attached == 0 {
+                unsafe { GetLastError() }
+            } else {
+                ERROR_SUCCESS
+            };
+            if attached_error != ERROR_SUCCESS {
+                // SAFETY: as above — no descriptor outlives this function to reference the ACL.
+                unsafe { LocalFree(dacl as *mut c_void) };
+                return Err(WindowsSandboxError::AclMutate {
+                    path: "the fixture descriptor".to_string(),
+                    reason: format!("SetSecurityDescriptorDacl failed: {}", last_win32_error()),
+                    code: attached_error,
+                });
+            }
+            Ok(Self { sd, dacl })
+        }
+
+        /// The attributes block to hand to the create call: this descriptor, and no inheritance — the
+        /// fixture handle stays inside this test, so nothing else can stumble into it.
+        fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: std::ptr::from_mut(&mut *self.sd).cast::<c_void>(),
+                bInheritHandle: 0,
+            }
+        }
+    }
+
+    impl Drop for TestDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: `dacl` is the ACL `SetEntriesInAclW` allocated, and `LocalFree` is its documented
+            // release; the object created from the descriptor holds its own copy.
+            unsafe { LocalFree(self.dacl as *mut c_void) };
+        }
+    }
+
+    /// A real handle, a real DACL, a real grant — on an object this test created with a descriptor it
+    /// wrote itself: `CreatePipe` with a [`TestDescriptor`] that concedes `READ_CONTROL`, `WRITE_DAC`,
+    /// `SYNCHRONIZE` and the data rights to this process. The grant puts the AppContainer ACE on that
+    /// object, and dropping the guard puts the original DACL back.
+    ///
+    /// Why the fixture has to own the descriptor: `grant_std_handle` works through
+    /// [`duplicate_for_security`], and `DuplicateHandle` with an explicit desired-access mask re-runs
+    /// the access check against the **object's** security descriptor for the calling token. A duplicate
+    /// therefore carries only rights that descriptor already concedes — for a handle this process did
+    /// not create (cargo's captured stdio, an anonymous pipe carrying the default DACL of the token)
+    /// there is no duplication flag combination that produces `READ_CONTROL` or `WRITE_DAC`, and the
+    /// security calls answer `ERROR_ACCESS_DENIED` anyway. That case is pinned as its own test,
+    /// [`test_a_foreign_handle_refuses_the_security_read_and_duplication_cannot_repair_it`]; this one
+    /// proves the grant-and-restore path itself, on the only kind of object it can ever succeed on.
+    ///
+    /// Of the two candidate fixtures, (A) `CreatePipe` with explicit `SECURITY_ATTRIBUTES` is chosen
+    /// over (B) `CreateFileW("\\\\.\\NUL", READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES |
+    /// SYNCHRONIZE, …)` for two reasons. `lpSecurityAttributes` is consulted only when the object is
+    /// **created**: opening the existing `NUL` device would leave its own DACL in charge, which is a
+    /// foreign object wearing a different costume, and its rights are the device's, not the caller's
+    /// choice. And the production grant is about a stream object — the anonymous pipes the one-shot
+    /// path hands to the confined child — so a pipe is the object class the test should exercise.
     ///
     /// This test is only compiled where the Windows backend is compiled — the module is behind
     /// `#[cfg(target_os = "windows")]` in `mod.rs`, so it runs on the native Windows CI job.
     #[test]
     fn test_a_real_std_handle_grant_is_applied_and_then_restored() -> Result<(), WindowsSandboxError>
     {
+        let caller = caller_sid()?;
+        let mut descriptor = TestDescriptor::for_caller(FIXTURE_CALLER_ACCESS, 0, &caller)?;
+        let attrs = descriptor.attributes();
         let mut read: HANDLE = std::ptr::null_mut();
         let mut write: HANDLE = std::ptr::null_mut();
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: std::ptr::null_mut(),
-            bInheritHandle: 1,
-        };
-        // SAFETY: two out-parameters plus a security-attributes block the API reads.
-        let made = unsafe {
-            windows_sys::Win32::System::Pipes::CreatePipe(&mut read, &mut write, &attrs, 0)
-        };
+        // SAFETY: two out-parameters plus a security-attributes block naming a live descriptor this
+        // test owns.
+        let made = unsafe { CreatePipe(&mut read, &mut write, &attrs, 0) };
         if made == 0 {
             return Err(WindowsSandboxError::Launch {
                 reason: format!("CreatePipe failed: {}", last_win32_error()),
-                code: 0,
+                code: unsafe { GetLastError() },
             });
         }
         let app_sid = allocate_app_package_sid(&[2, 2])?;
         assert!(
             !handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
-            "the default DACL of a fresh pipe names the user, not the AppContainer identity"
+            "the DACL this test wrote names this process, not the AppContainer identity"
         );
         let grant = grant_std_handle(write, app_sid)?;
         let Some(grant) = grant else {
@@ -4061,10 +4390,123 @@ mod tests {
             !handle_names_sid(write, app_sid, STD_HANDLE_ACCESS),
             "the guard restores the DACL it read: the AppContainer ACE must be gone"
         );
+        assert!(
+            handle_names_sid(write, caller.sid(), FIXTURE_CALLER_ACCESS),
+            "the restored DACL is the one this test wrote: the grant's own ACE must survive the restore"
+        );
         // SAFETY: the SID was allocated by `AllocateAndInitializeSid`, and the two pipe ends were
         // created by this test.
         unsafe {
             FreeSid(app_sid);
+            CloseHandle(read);
+            CloseHandle(write);
+        }
+        Ok(())
+    }
+
+    /// The reality a duplication trick cannot move: an object whose DACL refuses `READ_CONTROL` and
+    /// `WRITE_DAC` to this process refuses them to **every** handle that names it, because
+    /// `DuplicateHandle` with an explicit desired-access mask re-runs the access check against the
+    /// object's own security descriptor for the calling token. Concretely: the fixture below is a pipe
+    /// created with a descriptor that allows the data rights and explicitly denies
+    /// `READ_CONTROL | WRITE_DAC`, and its DACL is out of reach both through the handle the create
+    /// returned and through a duplicate asking for exactly the rights the security calls want.
+    ///
+    /// This is why the **production** stdio grant is warn-only and stays warn-only. The streams the
+    /// one-shot path hands over are pipes this process did not create: the re-entry plumbing's own
+    /// pipes and the ones behind `Stdio::piped()` / `Stdio::null()`, whose descriptors concede the
+    /// rights of a stream and not the security rights. So `grant_std_handle` may legitimately answer
+    /// `ERROR_ACCESS_DENIED`, and `grant_std_handles` (`src/harness/sandbox_windows.rs:2444`, the
+    /// `tracing::warn!` and `eprintln!` pair at `:2455`-`:2456` in this commit — the same two lines at
+    /// `:2328`-`:2329` of `697d7b2`) downgrades exactly that to a warning plus the operator note on
+    /// stderr, instead of failing the run or pretending the stream works. The confined child does not
+    /// depend on that grant to have a terminal: commit `0ff93f5` introduced the inherited-handle
+    /// capability — the `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` that hands the child precisely these
+    /// std handles (`launch_confined`, `stdio_state`) together with the best-effort ACE above — and the
+    /// behaviour is proven end to end by `test_windows_confined_child_prints_on_stdout_and_stderr` and
+    /// `test_windows_runner_confined_child_writes_on_the_inherited_streams` in
+    /// `tests/windows_sandbox.rs`, which read back what a confined child wrote on stdout and stderr.
+    ///
+    /// Nobody should "fix" this by re-adding a duplication flag: the object's descriptor is the only
+    /// lever, which is what the companion test above exercises with a descriptor of its own.
+    #[test]
+    fn test_a_foreign_handle_refuses_the_security_read_and_duplication_cannot_repair_it()
+    -> Result<(), WindowsSandboxError> {
+        let caller = caller_sid()?;
+        // One right of difference from the fixture of the grant test: the data rights stay, the two
+        // security rights are explicitly refused.
+        let mut descriptor =
+            TestDescriptor::for_caller(FIXTURE_DATA_ONLY_ACCESS, FIXTURE_SECURITY_ACCESS, &caller)?;
+        let attrs = descriptor.attributes();
+        let mut read: HANDLE = std::ptr::null_mut();
+        let mut write: HANDLE = std::ptr::null_mut();
+        // SAFETY: two out-parameters plus a security-attributes block naming a live descriptor.
+        let made = unsafe { CreatePipe(&mut read, &mut write, &attrs, 0) };
+        if made == 0 {
+            let code = unsafe { GetLastError() };
+            // The access check behind the create is the same access check as the one behind the
+            // security calls, so a descriptor that refuses the security rights can also refuse the
+            // create outright. That is the fact this test pins, one call earlier than expected.
+            assert_eq!(
+                code,
+                ERROR_ACCESS_DENIED,
+                "CreatePipe must either yield an object with a refused security read or refuse the \
+                 access request itself, got: {}",
+                last_win32_error()
+            );
+            return Ok(());
+        }
+        // The object is perfectly usable for data: what is out of reach is its descriptor, not the
+        // stream. One byte proves the pipe works, so the refusals below cannot be blamed on an object
+        // that never came into being.
+        let mut written = 0u32;
+        // SAFETY: a one-byte buffer, a live write end, and one out-parameter.
+        let wrote =
+            unsafe { WriteFile(write, b"x".as_ptr(), 1, &mut written, std::ptr::null_mut()) };
+        assert!(
+            wrote != 0 && written == 1,
+            "the data rights the fixture descriptor grants must still work: {}",
+            last_win32_error()
+        );
+        let mut buffer = [0u8; 1];
+        let mut got = 0u32;
+        // SAFETY: a one-byte buffer, a live read end, and one out-parameter.
+        let read_ok =
+            unsafe { ReadFile(read, buffer.as_mut_ptr(), 1, &mut got, std::ptr::null_mut()) };
+        assert!(
+            read_ok != 0 && got == 1 && buffer == *b"x",
+            "the byte written through the data rights must come back: {}",
+            last_win32_error()
+        );
+        // (i) the security read through the handle the create returned is refused: that handle carries
+        // the rights of a stream, and the object's DACL does not add the security ones.
+        assert_eq!(
+            security_read_code(write),
+            ERROR_ACCESS_DENIED,
+            "GetSecurityInfo through a data-rights handle must be refused"
+        );
+        // (ii) and duplicating the handle asking for exactly the rights the security calls need does
+        // not repair it: the copy is granted what the object's descriptor concedes, and nothing more.
+        match duplicate_for_security(write) {
+            Err(code) => assert_eq!(
+                code, ERROR_ACCESS_DENIED,
+                "DuplicateHandle(READ_CONTROL | WRITE_DAC) is judged against the object's DACL, which \
+                 refuses both rights to this process"
+            ),
+            Ok(duplicated) => {
+                // Even where the copy itself is granted, the read through it still answers the same
+                // way, because the object's DACL is the thing that decides.
+                assert_eq!(
+                    security_read_code(duplicated),
+                    ERROR_ACCESS_DENIED,
+                    "a duplicate of a foreign handle reads no more of its DACL than the handle did"
+                );
+                // SAFETY: this test created the duplicate, so this test closes it.
+                unsafe { CloseHandle(duplicated) };
+            }
+        }
+        // SAFETY: the two pipe ends were created by this test.
+        unsafe {
             CloseHandle(read);
             CloseHandle(write);
         }
