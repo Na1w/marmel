@@ -1052,8 +1052,9 @@ fn test_sandbox_gate_opt_out_value_must_be_unambiguous() {
     }
 }
 
-/// No sandbox backend on this platform ⇒ skipped, but never silently. Linux (Landlock)
-/// and macOS (Seatbelt) both have one, so only Windows and friends take this branch.
+/// No sandbox backend on this platform ⇒ skipped, but never silently. Linux (Landlock),
+/// macOS (Seatbelt) and Windows (AppContainer) all have one, so only the remaining hosts —
+/// the BSDs and friends — take this branch.
 #[test]
 fn test_sandbox_gate_unsupported_platform_skips_with_warning() {
     let exe = Path::new("/Users/fredrik/target/debug/marmel");
@@ -1077,8 +1078,9 @@ fn test_sandbox_gate_unsupported_platform_skips_with_warning() {
 }
 
 /// The gate no longer asks "am I on Linux": both of its sites ask the one capability flag
-/// in `harness::sandbox`, so a host with a Landlock **or** a Seatbelt backend reaches the
-/// re-entry child. Asserted with the flag as production feeds it, on the current build.
+/// in `harness::sandbox`, so a host with a Landlock **or** a Seatbelt **or** an AppContainer
+/// backend reaches the re-entry child. Asserted with the flag as production feeds it, on the
+/// current build.
 #[test]
 fn test_sandbox_gate_platform_answer_comes_from_the_shared_capability_flag() {
     let flag = crate::harness::sandbox::backend_supports_current_platform();
@@ -1090,13 +1092,17 @@ fn test_sandbox_gate_platform_answer_comes_from_the_shared_capability_flag() {
     });
     assert_eq!(
         flag,
-        cfg!(any(target_os = "linux", target_os = "macos")),
-        "the shared flag must answer true for both backends and false for every other host"
+        cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )),
+        "the shared flag must answer true for all three backends and false for every other host"
     );
     if flag {
         assert!(
             matches!(decision, SandboxDecision::Apply { .. }),
-            "a host that compiles Landlock or Seatbelt must re-enter, got {decision:?}"
+            "a host that compiles Landlock, Seatbelt or AppContainer must re-enter, got {decision:?}"
         );
         assert_eq!(decision.mode(), "sandbox-re-entry");
     } else {
@@ -1227,24 +1233,21 @@ fn test_build_sandboxed_command_logs_its_choice_and_keeps_the_wrapper() {
     let argv = cmd.get_argv();
     assert!(!argv.is_empty(), "the builder must have a program");
 
-    // In a test binary the re-entry is skipped, so unix builds `sh -c <wrapped>`;
-    // Windows has no Landlock at all and takes its own `cmd /C <command>` branch.
+    // In a test binary the re-entry is skipped, so unix builds `sh -c <wrapped>`; Windows
+    // builds its own `%COMSPEC% /C <command>` form from the very same decision object (it has
+    // an AppContainer backend, but a test-harness binary cannot speak the re-entry protocol).
     // Either way the command was chosen by a decision that was logged.
     if cfg!(test) {
         let (program, shell_flag) = expected_sandbox_shell();
         assert_eq!(argv[0].to_string_lossy(), program);
         assert_eq!(argv[1].to_string_lossy(), shell_flag);
-        // Both platforms warn, but from different call sites: the unix skip runs through
-        // `log_sandbox_decision` (the `pty sandbox decision` debug line plus the `SKIPPED`
-        // warn), while the Windows branch warns directly from `build_sandboxed_command` and
-        // never emits that debug line. Only the shared wording is asserted on Windows.
-        let marker = if cfg!(windows) {
-            "SKIPPED"
-        } else {
-            "pty sandbox decision"
-        };
+        // Both platforms log the decision the same way now: `log_sandbox_decision` emits the
+        // `pty sandbox decision` debug line and the matching `SKIPPED` warn on unix and on
+        // Windows alike, so the skip is never silent on either of them.
         assert!(
-            logs.contains("WARN") && logs.contains(marker),
+            logs.contains("WARN")
+                && logs.contains("SKIPPED")
+                && logs.contains("pty sandbox decision"),
             "every skip must leave a visible trace, got {logs:?}"
         );
     }
@@ -1295,6 +1298,11 @@ fn test_sandbox_gate_reentry_argv_uses_the_resolved_exe() {
 /// need the env lock for no added rigour. `ACTIVE_CONFIG` **is** process-global, so the
 /// config legs run under the same serialization lock the config tests use, and the
 /// previously active config (including "none") is restored on the way out.
+///
+/// The published value is encoded with the separator of the spawn family — `:` for unix,
+/// a line feed for Windows, see
+/// [`crate::harness::sandbox::extra_readonly_paths_sep_in_family`] — so the expected value
+/// is spelled out per family instead of assuming one separator for every platform.
 #[test]
 fn test_sandbox_gate_extras_channel_follows_the_config_and_the_decision() {
     let key = crate::harness::sandbox::SANDBOX_EXTRA_RO_PATHS_ENV;
@@ -1330,16 +1338,45 @@ fn test_sandbox_gate_extras_channel_follows_the_config_and_the_decision() {
     );
 
     // 1. A configured list travels verbatim — trimmed, empty entries dropped — and it
-    //    overwrites whatever the parent's environment happened to carry.
+    //    overwrites whatever the parent's environment happened to carry. The joining
+    //    character between the entries is the separator of the spawn family this build was
+    //    made for (`extra_readonly_paths_sep_in_family`), so the expected value is spelled
+    //    out per family instead of being hard-coded to one separator.
     crate::config::set_active(with_paths(&[" /opt/toolchain-a ", "", "/opt/toolchain-b"]));
     let mut cmd = seeded();
     wire_extra_readonly_paths_env(&mut cmd, &reentry, extra_readonly_paths_env_value());
+    let expected = match SpawnFamily::current() {
+        SpawnFamily::Unix => "/opt/toolchain-a:/opt/toolchain-b",
+        SpawnFamily::Windows => "/opt/toolchain-a\n/opt/toolchain-b",
+    };
     assert_eq!(
         cmd.get_env(key)
             .map(|raw| raw.to_string_lossy().into_owned()),
-        Some("/opt/toolchain-a:/opt/toolchain-b".to_string()),
-        "the configured list must be the value the re-entry child sees"
+        Some(expected.to_string()),
+        "the configured list must be the value the re-entry child sees, joined with the \
+         separator this build's family encodes with"
     );
+
+    // 1b. Both spellings are pinned with literal values, whichever platform compiles this
+    //     file, so a change to either half of the channel shows up as a failing assertion
+    //     rather than as a changed encoder. The `paths` list is the one set above.
+    for (family, want) in [
+        (SpawnFamily::Unix, "/opt/toolchain-a:/opt/toolchain-b"),
+        (SpawnFamily::Windows, "/opt/toolchain-a\n/opt/toolchain-b"),
+    ] {
+        assert_eq!(
+            crate::harness::sandbox::extra_readonly_paths_to_env_in_family(
+                &["/opt/toolchain-a", "/opt/toolchain-b"]
+                    .iter()
+                    .map(|path| (*path).to_string())
+                    .collect::<Vec<String>>(),
+                family
+            )
+            .map(|raw| raw.to_string()),
+            Some(want.to_string()),
+            "the channel is joined with the separator of the family that publishes it"
+        );
+    }
 
     // 2. Key present but empty: the variable is REMOVED from the child environment, so
     //    the inherited value cannot widen the child's ruleset.
@@ -1606,6 +1643,387 @@ fn test_windows_child_cwd_strips_only_the_verbatim_prefix() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// The Windows re-entry argv (t-010)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// The Windows spawn side and the Windows re-entry child meet on one argv: the resolved exe,
+// the sentinel, the cwd the child is asked to run in, and the command payload. The builders
+// below are pure and take the decision as a value, so every rule here is asserted on a Linux
+// host with literal Windows inputs — the same reason `windows_shell_argv` and
+// `windows_child_cwd` are pinned here rather than behind `#[cfg(windows)]`, which CI only
+// ever compiles. The confined launch itself is exercised by the Windows integration suite.
+
+/// An `Apply` decision on Windows is the same three-slot contract as on unix — resolved exe,
+/// sentinel, cwd, command — and the two platform-specific differences are exactly the two
+/// that platform demands: the cwd slot loses the `\\?\` verbatim prefix that
+/// `canonicalize()` produces (R C1/C2 of [`windows_child_cwd`], because `cmd.exe` refuses a
+/// verbatim current directory), and the command slot is the payload **verbatim**, because the
+/// unix wrapper's `stty`/`ulimit` preamble is a pair of POSIX builtins with no `cmd.exe`
+/// equivalent.
+#[test]
+fn test_windows_sandbox_reentry_argv_is_three_slots_with_the_payload_verbatim() {
+    // A verbatim resolved exe is passed through untouched: `CreateProcessW` accepts that
+    // spelling in `lpApplicationName`, unlike the current directory.
+    let exe = Path::new(r"C:\Program Files\marmel\marmel-dev.exe");
+    let decision = should_apply_sandbox(&production_inputs(exe));
+    assert!(
+        matches!(decision, SandboxDecision::Apply { .. }),
+        "a resolved exe on a host with a backend must reach the re-entry, got {decision:?}"
+    );
+
+    for payload in [
+        "cargo test --all-targets",
+        r#"git commit -m "fix: route Windows through the re-entry""#,
+        r#"dir "C:\Program Files\a b" & echo %PATH% ^& type a.txt"#,
+        "   ",
+    ] {
+        let (program, args) = windows_sandbox_command_argv(
+            &decision,
+            payload,
+            Path::new(r"\\?\C:\work\proj"),
+            Some(TEST_COMSPEC),
+        )
+        .expect("an Apply decision builds the re-entry argv");
+
+        assert_eq!(program, exe.to_string_lossy());
+        assert_eq!(
+            args.len(),
+            3,
+            "the re-entry contract is three slots: {args:?}"
+        );
+        assert_eq!(args[0], SANDBOX_EXEC_ARG);
+        assert_eq!(args[1], r"C:\work\proj");
+        assert_eq!(
+            args[2], payload,
+            "the payload must reach the re-entry child byte for byte, got {args:?}"
+        );
+        // Not the unix preamble: there is no `stty`/`ulimit` on `cmd.exe`, and re-introducing
+        // it would rewrite a command line nobody asked to rewrite.
+        for posix_builtin in ["stty", "ulimit"] {
+            assert!(
+                !args[2].contains(posix_builtin),
+                "the Windows re-entry must not add the {posix_builtin} preamble, got {:?}",
+                args[2]
+            );
+        }
+    }
+}
+
+/// The cwd slot of the Windows re-entry is the directory the confined command is launched in,
+/// so it must never carry a verbatim prefix — the very rule that keeps `cmd.exe` from quietly
+/// running elsewhere. Asserted for every cwd spelling, including a plain UNC one.
+#[test]
+fn test_windows_reentry_cwd_slot_never_carries_a_verbatim_prefix() {
+    let decision = SandboxDecision::Apply {
+        resolved_exe: PathBuf::from(r"C:\Program Files\marmel\marmel-dev.exe"),
+    };
+    for (given, expected) in [
+        (r"\\?\C:\work\proj", r"C:\work\proj"),
+        (r"\\?\C:\work\proj with space", r"C:\work\proj with space"),
+        (r"\\?\UNC\srv\share\p", r"\\srv\share\p"),
+        (r"\\?\c:\work", r"c:\work"),
+        (r"C:\work\proj", r"C:\work\proj"),
+        ("/tmp/work", "/tmp/work"),
+    ] {
+        let (_, args) = windows_sandbox_command_argv(
+            &decision,
+            "cargo test",
+            Path::new(given),
+            Some(TEST_COMSPEC),
+        )
+        .expect("an Apply decision builds the re-entry argv");
+        assert_eq!(args.len(), 3, "three slots: {args:?}");
+        assert_eq!(
+            args[1], expected,
+            "the cwd slot must be the de-verbatimised directory for {given:?}"
+        );
+        assert!(
+            !args[1].starts_with(r"\\?"),
+            "a verbatim cwd in argv is what `cmd.exe` refuses, got {:?}",
+            args[1]
+        );
+    }
+}
+
+/// A `Skip` decision never emits the sentinel: it runs the plain [`windows_shell_argv`] form
+/// (the interactive-shell spelling of R1 included), so a skipped command is confined by
+/// nothing but is still the command the platform requires — and it is warned about by
+/// [`log_sandbox_decision`] at the call site.
+#[test]
+fn test_windows_skip_decision_never_emits_the_reentry_sentinel() {
+    let exe = Path::new(r"C:\Program Files\marmel\marmel-dev.exe");
+    let skips = [
+        should_apply_sandbox(&SandboxInputs {
+            opt_out: OptOut::Explicit {
+                setting: "marmel.toml: sandbox_disabled = true".to_string(),
+            },
+            ..production_inputs(exe)
+        }),
+        should_apply_sandbox(&SandboxInputs {
+            test_harness_exe: true,
+            ..production_inputs(exe)
+        }),
+        should_apply_sandbox(&SandboxInputs {
+            backend_supported: false,
+            ..production_inputs(exe)
+        }),
+    ];
+    for decision in &skips {
+        assert!(
+            matches!(decision, SandboxDecision::Skip { .. }),
+            "these three legs are the skip cases, got {decision:?}"
+        );
+        for payload in ["cargo test", "cmd", "powershell"] {
+            let (program, args) = windows_sandbox_command_argv(
+                decision,
+                payload,
+                Path::new(r"C:\work"),
+                Some(TEST_COMSPEC),
+            )
+            .expect("a skip decision still produces a spawnable argv");
+            let expected = windows_shell_argv(payload, Some(TEST_COMSPEC));
+            assert_eq!(
+                (program.clone(), args.clone()),
+                expected,
+                "a Windows skip must run exactly the plain shell argv, not a modified one"
+            );
+            assert!(
+                !args.iter().any(|arg| arg == SANDBOX_EXEC_ARG)
+                    && !program.contains(SANDBOX_EXEC_ARG),
+                "a skipped argv must never carry the re-entry sentinel: {args:?}"
+            );
+        }
+    }
+}
+
+/// Both Windows builders refuse to run a required command unsandboxed when the executable
+/// path is unavailable: the same fail-closed message as on unix, naming the sentinel and the
+/// explicit opt-out.
+#[test]
+fn test_windows_unresolved_exe_fails_closed_in_both_windows_builders() {
+    let inputs = SandboxInputs {
+        backend_supported: true,
+        test_harness_exe: false,
+        resolved_exe: None,
+        opt_out: OptOut::None,
+    };
+    let decision = should_apply_sandbox(&inputs);
+    assert_eq!(decision, SandboxDecision::UnresolvedExe);
+
+    let decision = should_apply_sandbox(&inputs);
+    assert_eq!(decision, SandboxDecision::UnresolvedExe);
+
+    let mut refusals = Vec::new();
+    let err = windows_sandbox_command_argv(
+        &decision,
+        "echo hi",
+        Path::new(r"C:\work"),
+        Some(TEST_COMSPEC),
+    )
+    .err();
+    refusals.push(
+        err.expect("an unresolved exe must refuse to build the PTY re-entry argv")
+            .to_string(),
+    );
+    refusals.push(
+        windows_oneshot_sandbox_argv(
+            &decision,
+            "echo hi",
+            Path::new(r"C:\work"),
+            Some(TEST_COMSPEC),
+        )
+        .expect_err("an unresolved exe must refuse to build the one-shot argv")
+        .to_string(),
+    );
+    for text in refusals {
+        assert!(
+            text.contains(SANDBOX_EXEC_ARG) && text.contains(SANDBOX_OPTOUT_ENV),
+            "the refusal must explain both the requirement and the opt-out, got {text}"
+        );
+    }
+}
+
+/// The one-shot form gets the same re-entry, and keeps its own hazard guard: a payload-less
+/// interactive shell is refused for **every** decision, because the re-entry child hands the
+/// payload to `%COMSPEC% /C` just the same and a bare shell would sit at its prompt until the
+/// timeout killed it.
+#[test]
+fn test_windows_oneshot_sandbox_argv_confines_and_still_refuses_a_bare_shell() {
+    let exe = Path::new(r"C:\Program Files\marmel\marmel-dev.exe");
+    let apply = should_apply_sandbox(&production_inputs(exe));
+
+    // Apply: the one-shot command is confined by the re-entry child.
+    let (program, args) = windows_oneshot_sandbox_argv(
+        &apply,
+        "cargo test",
+        Path::new(r"\\?\C:\work\proj"),
+        Some(TEST_COMSPEC),
+    )
+    .expect("a one-shot Apply decision builds the re-entry argv");
+    assert_eq!(program, exe.to_string_lossy());
+    assert_eq!(args.len(), 3, "three slots: {args:?}");
+    assert_eq!(args[0], SANDBOX_EXEC_ARG);
+    assert_eq!(args[1], r"C:\work\proj");
+    assert_eq!(args[2], "cargo test");
+    // No `/C` slot: the confined launch inside the re-entry child adds that itself.
+    assert!(
+        !args.contains(&"/C".to_string()),
+        "the payload is handed over as one slot, got {args:?}"
+    );
+
+    // Skip: the plain one-shot argv, byte for byte as before.
+    let skip = should_apply_sandbox(&SandboxInputs {
+        opt_out: OptOut::Explicit {
+            setting: "MARMEL_DISABLE_SANDBOX".to_string(),
+        },
+        ..production_inputs(exe)
+    });
+    let (program, args) =
+        windows_oneshot_sandbox_argv(&skip, "dir", Path::new(r"C:\work"), Some(TEST_COMSPEC))
+            .expect("a skip decision produces the plain argv");
+    assert_eq!(
+        (program, args),
+        (
+            TEST_COMSPEC.to_string(),
+            vec!["/C".to_string(), "dir".to_string()]
+        ),
+        "a skipped one-shot run is the plain shell command"
+    );
+
+    // The interactive-shell refusal survives both decisions.
+    for decision in [
+        SandboxDecision::Apply {
+            resolved_exe: exe.to_path_buf(),
+        },
+        SandboxDecision::Skip {
+            resolved_exe: Some(exe.to_path_buf()),
+            skip: SandboxSkip::TestHarnessExe,
+        },
+    ] {
+        for shell in ["cmd", "CMD.EXE", "powershell"] {
+            let err = windows_oneshot_sandbox_argv(
+                &decision,
+                shell,
+                Path::new(r"C:\work"),
+                Some(TEST_COMSPEC),
+            )
+            .expect_err("`{shell:?}` is an interactive shell request, not a command");
+            assert!(
+                err.contains("interactive shell"),
+                "the refusal must say why a bare shell cannot be one-shot, got {err}"
+            );
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// The interactive shell under the sandbox re-entry (t-014)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The hand-off the sandbox re-entry performs, asserted for **both** spawn families through the
+/// `SpawnFamily` value dispatch, so the Windows rule is checked on a Linux host.
+///
+/// What the rule set says an interactive-shell request gets: the unix re-entry confines it and
+/// leaves it interactive (`sh -c <payload>`, where a bare `sh` payload runs a nested shell reading
+/// the stdin it inherited), and a `Skip` decision never goes through the re-entry at all. Nothing
+/// in the existing rules says a required interactive shell is refused or skipped — the refusal
+/// belongs to the **one-shot** path (`windows_oneshot_sandbox_argv`, pinned by
+/// `test_windows_oneshot_sandbox_argv_confines_and_still_refuses_a_bare_shell`) — so the Windows
+/// re-entry must confine it and keep it interactive, which is what `ReentryHandoff` spells out and
+/// what the confined launch implements (`sandbox_windows::confined_command_line`: the bare shell,
+/// no `/C`).
+#[test]
+fn test_reentry_handoff_confines_an_interactive_shell_on_both_families() {
+    // A normal command: executed behind the shell's command flag on either family.
+    for family in [SpawnFamily::Unix, SpawnFamily::Windows] {
+        for payload in ["cargo test --all-targets", "dir", "echo hi"] {
+            assert_eq!(
+                reentry_handoff(payload, family),
+                ReentryHandoff::Execute,
+                "`{payload}` is a command, not an interactive-shell request ({family:?})"
+            );
+        }
+    }
+
+    // An R1 request on Windows: the shell **is** the payload, so the hand-off keeps it bare.
+    for shell in [
+        "cmd",
+        "CMD",
+        "cmd.exe",
+        "  CMD.EXE  ",
+        "powershell",
+        "POWERSHELL.EXE",
+        " powershell ",
+    ] {
+        assert_eq!(
+            reentry_handoff(shell, SpawnFamily::Windows),
+            ReentryHandoff::InteractiveShell,
+            "`{shell:?}` is an interactive-shell request on the Windows family"
+        );
+    }
+
+    // The same request on the unix family stays an `sh -c` payload: the interactive-ness of a
+    // bare `sh` comes from the nested shell that payload runs, so the hand-off is `Execute` and
+    // the confinement is applied exactly as for any other command.
+    for shell in ["sh", "bash", "cmd", "powershell"] {
+        assert_eq!(
+            reentry_handoff(shell, SpawnFamily::Unix),
+            ReentryHandoff::Execute,
+            "the unix re-entry never hands over a bare shell: it hands over `sh -c <payload>`"
+        );
+    }
+
+    // A command that merely mentions a shell is not an R1 request: only the bare token is one,
+    // and anything with an argument attached is executed like any other payload.
+    for payload in [
+        "cmd /C echo hi",
+        "powershell -NoProfile",
+        "/bin/sh",
+        "sh -c pwd",
+    ] {
+        assert_eq!(
+            reentry_handoff(payload, SpawnFamily::Windows),
+            ReentryHandoff::Execute,
+            "`{payload}` is not the bare token R1 matches on"
+        );
+    }
+
+    // The rule is decided once: the classification the confined launch reads is the same rule
+    // `windows_shell_argv` applies, so neither half can hold a different shell list.
+    assert!(is_windows_cmd_shell("CMD.EXE"));
+    assert!(is_windows_cmd_shell(" cmd "));
+    assert!(!is_windows_cmd_shell("powershell"));
+    assert!(is_windows_interactive_shell("  PowerShell.Exe  "));
+    assert!(!is_windows_interactive_shell(
+        "powershell -Command Get-Location"
+    ));
+
+    // And the re-entry argv itself is untouched by the choice: an `Apply` decision keeps the
+    // three slots, payload verbatim, for an interactive request too — the confinement happens in
+    // the launch, not by dropping the request.
+    let exe = Path::new(r"C:\Program Files\marmel\marmel-dev.exe");
+    let apply = should_apply_sandbox(&production_inputs(exe));
+    for payload in ["cmd", "powershell", "cargo test"] {
+        let (program, args) = windows_sandbox_command_argv(
+            &apply,
+            payload,
+            Path::new(r"C:\work"),
+            Some(TEST_COMSPEC),
+        )
+        .expect("an interactive-shell request is confined, never refused");
+        assert_eq!(program, exe.to_string_lossy());
+        assert_eq!(
+            args.len(),
+            3,
+            "three slots for an interactive request too: {args:?}"
+        );
+        assert_eq!(args[0], SANDBOX_EXEC_ARG);
+        assert_eq!(args[1], r"C:\work");
+        assert_eq!(args[2], payload, "the payload stays verbatim: {args:?}");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // One-shot outcome reporting and the Windows one-shot argv (t-009)
 // ──────────────────────────────────────────────────────────────────────────
 //
@@ -1664,6 +2082,73 @@ fn test_one_shot_result_non_zero_exit_appends_the_status_line() {
         render_one_shot_result("x\n", OneShotEnd::Exited(None)),
         "x\n[exit status unavailable]"
     );
+}
+
+/// A sandbox refusal (exit `SANDBOX_REFUSE_EXIT_CODE`) must never reach the operator as a bare
+/// exit code: the reason the re-entry child printed stays in the composed output, and the notice
+/// repeats the escape hatch so there is something to act on.
+#[test]
+fn test_one_shot_result_sandbox_refusal_reports_the_reason() {
+    use crate::harness::sandbox::{SANDBOX_REFUSAL_MARKER, SANDBOX_REFUSE_EXIT_CODE};
+
+    let refusal = "error: sandbox refusal: refusing to run the command: the DACL of \
+                   C:\\work\\proj could not be changed: SetNamedSecurityInfoW failed: Access \
+                   is denied. (win32 code = 5) (step = sandbox attempt, class = rule-setup, \
+                   exit code = 73, path = C:\\work\\proj).";
+    let rendered = render_one_shot_result(
+        &format!("echo hi && crunched\r\n{refusal}\r\n"),
+        OneShotEnd::Exited(Some(SANDBOX_REFUSE_EXIT_CODE)),
+    );
+
+    // Every field the operator needs is in the text the tool result hands over.
+    assert!(rendered.contains("echo hi"), "{rendered}");
+    assert!(
+        rendered.contains(r"the DACL of C:\work\proj"),
+        "the reason must survive sanitisation: {rendered}"
+    );
+    assert!(rendered.contains("win32 code = 5"), "{rendered}");
+    assert!(rendered.contains("step = sandbox attempt"), "{rendered}");
+    assert!(rendered.contains("class = rule-setup"), "{rendered}");
+    assert!(rendered.contains(SANDBOX_REFUSAL_MARKER), "{rendered}");
+    // ... and the notice: the code, a pointer to the reason, and the way out.
+    assert!(
+        rendered.contains("[exit code: 73 sandbox refusal: the reason is above"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(SANDBOX_OPTOUT_ENV),
+        "the refusal notice must name the escape hatch: {rendered}"
+    );
+    assert!(
+        rendered.ends_with("run the command unsandboxed)]"),
+        "{rendered}"
+    );
+}
+
+/// The other half of the guarantee: when the child's reason never made it into the captured
+/// output (a pipe that did not drain, output trimmed by whoever displayed it), the notice says
+/// so out loud and points at the two places it can still be found — the log file and the
+/// opt-out variable.
+#[test]
+fn test_one_shot_result_sandbox_refusal_without_a_captured_reason() {
+    use crate::harness::sandbox::SANDBOX_REFUSE_EXIT_CODE;
+
+    let rendered = render_one_shot_result(
+        "echo hi\n",
+        OneShotEnd::Exited(Some(SANDBOX_REFUSE_EXIT_CODE)),
+    );
+
+    assert!(rendered.starts_with("echo hi\n"), "{rendered}");
+    assert!(
+        rendered.contains("no reason reached this output"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(".marmel/marmel.log"),
+        "the notice must name the log the reason is written to: {rendered}"
+    );
+    assert!(rendered.contains(SANDBOX_OPTOUT_ENV), "{rendered}");
+    assert!(rendered.contains("[exit code: 73"), "{rendered}");
 }
 
 /// Timeout: the partial output captured so far survives, followed by the existing timeout

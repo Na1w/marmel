@@ -310,6 +310,12 @@ where
 fn main() -> Result<()> {
     let mut raw_args = std::env::args().skip(1);
     if is_sandbox_reentry(raw_args.next().as_deref()) {
+        // The re-entry child answers `exit 73` long before the run's own subscriber is installed
+        // (and this branch never reaches that install), so without a subscriber of its own the
+        // refusal reason it reports lands in no log file — only in the stderr the parent
+        // captures. Install the child's file subscriber first, so every refusal it makes is on
+        // disk with its causal chain.
+        install_reentry_log_subscriber();
         return run_sandbox_reentry(&mut raw_args);
     }
 
@@ -536,14 +542,22 @@ fn is_sandbox_reentry(first: Option<&str>) -> bool {
 }
 
 /// The sandbox re-entry path: apply the backend this host has — Landlock on Linux, Seatbelt
-/// on macOS — to this process, then exec the pending command — **only if enforcement was
-/// actually established**. The order is
+/// on macOS, the Windows AppContainer on Windows — to this process, then run the pending
+/// command in that confinement — **only if enforcement was actually established**. The order is
 /// load-bearing: resolve the cwd canonically ([`canonical_sandbox_cwd`]); honour the
 /// explicit opt-out ([`harness::pty::SANDBOX_OPTOUT_ENV`]) *before* any enforcement call,
 /// saying so out loud ([`harness::sandbox::optout_warning`]); otherwise attempt
 /// enforcement; then ask [`harness::sandbox::reentry_action`], which on
 /// [`harness::sandbox::ReentryAction::Refuse`] never runs the command unsandboxed:
 /// stderr gets the reason; exit code [`harness::sandbox::SANDBOX_REFUSE_EXIT_CODE`] (non-zero).
+///
+/// The two halves of the Windows backend meet here: the policy pass parks the prepared
+/// AppContainer setup, and the confined launch inside [`exec_pending_command`] picks it up,
+/// launches the pending command inside that AppContainer and exits with the child's exit code.
+/// A refusal releases the parked setup instead, so a run that never launched anything does not
+/// leave the workspace DACLs extended. An **opt-out** run does neither: enforcement was skipped,
+/// so there is no confinement for the pending command to enter, and [`exec_pending_command`]
+/// launches it unconfined.
 fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
     let cwd_raw = args.next().unwrap_or_else(|| ".".to_string());
     let command = args.next().unwrap_or_default();
@@ -590,16 +604,46 @@ fn run_sandbox_reentry(args: &mut impl Iterator<Item = String>) -> Result<()> {
             &extra_readonly_paths,
         ) {
             Ok(()) => harness::sandbox::Enforcement::Established,
-            Err(err) => harness::sandbox::Enforcement::Failed {
-                reason: err.to_string(),
-            },
+            Err(err) => {
+                // The structured fields travel with the reason, because only the reason string
+                // survives the re-entry decision ([`harness::sandbox::reentry_action`]) and the
+                // stderr line that carries it: a refusal that lost its step, class and path is
+                // not actionable for the person who hits it, and not findable in a log afterwards.
+                harness::sandbox::Enforcement::Failed {
+                    reason: harness::sandbox::refusal_detail(
+                        &err,
+                        harness::sandbox::RefusalStep::Attempt,
+                    ),
+                }
+            }
         },
     };
 
     match harness::sandbox::reentry_action(&decision, &enforcement) {
-        harness::sandbox::ReentryAction::Exec => exec_pending_command(&command, &cwd),
+        harness::sandbox::ReentryAction::Exec => {
+            // The enforcement verdict travels with the launch, because it is what the launch
+            // depends on: an established confinement is entered, an opt-out is run in the clear.
+            exec_pending_command(&command, &cwd, &extra_readonly_paths, &enforcement)
+        }
         harness::sandbox::ReentryAction::Refuse { reason, exit_code } => {
-            tracing::error!("refusing sandbox re-entry: {reason}");
+            // On Windows the policy judgement parked a prepared AppContainer setup behind the
+            // `Ok(())` it just returned, and that setup carries live grants on the workspace
+            // DACLs plus a registered AppContainer profile. Nothing is going to launch a
+            // confined child from this process any more, so release them before exiting —
+            // otherwise the refusal leaves the workspace ACL-extended and the profile behind
+            // until process teardown.
+            #[cfg(target_os = "windows")]
+            {
+                harness::sandbox_windows::discard_windows_policy_setup();
+            }
+            // The record spells the step and the workspace root the refusal was decided for; the
+            // class, the path and the backend's Win32 code are carried inside the reason text,
+            // which is the part the operator also sees on stderr.
+            tracing::error!(
+                step = harness::sandbox::RefusalStep::Attempt.name(),
+                workspace_root = %cwd.display(),
+                "sandbox refusal: re-entry refused to run the command: {reason}"
+            );
             eprintln!("{}", harness::sandbox::refusal_message(&reason));
             std::process::exit(exit_code)
         }
@@ -655,12 +699,55 @@ fn resolve_program_path(token: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Exec `sh -c <command>` in `cwd`. Reached only for a
-/// [`harness::sandbox::ReentryAction::Exec`].
-fn exec_pending_command(command: &str, cwd: &std::path::Path) -> Result<()> {
+/// Launch the pending command in `cwd`, under the sandbox this process has established, and
+/// terminate the re-entry child with the command's exit code. Reached only for a
+/// [`harness::sandbox::ReentryAction::Exec`]. The mechanism is per platform, and the
+/// confinement is the point of each form — including the form the **opt-out** takes, which is
+/// what [`harness::sandbox::Enforcement`] decides:
+///
+/// * **unix** — `execve()` of `sh -c <command>`, so the pending command *becomes* this
+///   already-restricted process, which is why a refusal to exec is a sandbox statement. The
+///   confinement lives in this process, so this arm never re-reads the enforcement verdict:
+///   `execve()` is the confinement whatever the verdict says;
+/// * **Windows** — no `execve()`, and no `sh`. For [`harness::sandbox::Enforcement::Established`]
+///   the pending command is launched as a child **inside the AppContainer this process
+///   prepared**, through the launch half of the Windows backend, which releases the policy guards
+///   once that child has exited; the setup prepared by the policy pass above is picked up by that
+///   call rather than prepared a second time. For [`harness::sandbox::Enforcement::Skipped`] — the
+///   operator's opt-out, the only legitimate way to run a command unsandboxed — there is no
+///   confinement to launch inside, and the pending command runs as a **plain** child of this
+///   process, on the shell argv the spawn side would have built
+///   ([`harness::pty::windows_shell_argv`]). An opt-out that still ends up in an AppContainer is
+///   not an opt-out; [fail-closed](harness::sandbox) enforcement failures never reach `Exec` at
+///   all, and the confined arm is the honest answer for them too;
+/// * **any other target** — the spawn-and-wait fallback this function used before the re-entry
+///   became platform-specific.
+///
+/// `extra_readonly_paths` are the configured extras exactly as they arrived through the
+/// environment. Only the confined Windows launch consumes them (a setup re-prepared inside that
+/// call repeats the same policy); on unix they were already folded into the ruleset by the
+/// enforcement pass, so this arm says what it is ignoring.
+fn exec_pending_command(
+    command: &str,
+    cwd: &std::path::Path,
+    extra_readonly_paths: &[String],
+    enforcement: &harness::sandbox::Enforcement,
+) -> Result<()> {
+    // The enforcement verdict only decides the Windows launch. On unix the confinement was put
+    // into this process by the enforcement pass, and `execve()` below inherits it; on a target
+    // with no backend there is no verdict to act on.
+    #[cfg(not(target_os = "windows"))]
+    let _ = &enforcement;
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // The extras list is consumed by the enforcement pass above, not by this step: it never
+        // reaches `execve()`, which takes a program, argv and environment only.
+        tracing::debug!(
+            extra_readonly_paths = extra_readonly_paths.len(),
+            "sandbox re-entry: replacing this process with the pending command"
+        );
         // `exec()` only returns when it failed, i.e. the process is still unsandboxed
         // or about to be — so it terminates the process instead of continuing.
         let err = std::process::Command::new("sh")
@@ -683,8 +770,114 @@ fn exec_pending_command(command: &str, cwd: &std::path::Path) -> Result<()> {
         eprintln!("error: failed to exec {program} under the active sandbox: {err}.{cause}");
         std::process::exit(1)
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
     {
+        // The opt-out leg: nothing is confined, because nothing was asked to be. An
+        // [`harness::sandbox::Enforcement::Skipped`] verdict is the operator's own
+        // [`harness::pty::SANDBOX_OPTOUT_ENV`] setting, the only legitimate way to run a command
+        // unsandboxed, and honouring it means running the pending command outside any
+        // AppContainer — confining it anyway is the contradiction this leg exists to remove.
+        // [`harness::sandbox::Enforcement::Established`] is the confined leg below, and
+        // [`harness::sandbox::Enforcement::Failed`] never reaches `Exec` at all
+        // ([`harness::sandbox::reentry_action`] refuses it) so it falls into the confined arm as
+        // the only honest answer for a confinement that exists but was not established.
+        if matches!(enforcement, harness::sandbox::Enforcement::Skipped { .. }) {
+            // The policy pass was skipped for an opt-out run, so nothing should be parked. If
+            // anything is, it is released here: a half-prepared AppContainer left behind would
+            // keep the workspace DACLs extended and the profile registered.
+            if harness::sandbox_windows::discard_windows_policy_setup() {
+                tracing::warn!(
+                    "an AppContainer setup was parked for an opted-out sandbox run: released it \
+                     instead of launching the pending command inside it"
+                );
+            }
+            // The shell resolution is the spawn side's own, reused rather than re-spelled: rule
+            // R1-R5 of `pty::windows_shell_argv` decide the program, whether a `/C` payload is
+            // added, and leave a bare interactive-shell request bare. The confined child of the
+            // unix arm is `sh -c <command>`; the unconfined Windows child is its equivalent.
+            let (program, args) =
+                harness::pty::windows_shell_argv(command, std::env::var("COMSPEC").ok().as_deref());
+            tracing::debug!(
+                program = %program,
+                // The extras were never turned into a policy on this path: the policy pass ran
+                // only when the sandbox was wanted at all.
+                extra_readonly_paths = extra_readonly_paths.len(),
+                "sandbox re-entry: the opt-out runs the pending command unconfined"
+            );
+            let mut child = match std::process::Command::new(&program)
+                .args(&args)
+                .current_dir(cwd)
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(err) => {
+                    // Same register as the exec failure above: the program that could not be
+                    // started, and the cause. This is a spawn failure, not a sandbox statement —
+                    // nothing is being enforced on this path — so it is not blamed on a rule.
+                    tracing::error!(
+                        program = %program,
+                        error = %err,
+                        "sandbox re-entry: the unconfined launch of the pending command failed"
+                    );
+                    eprintln!(
+                        "error: failed to run {program} after the sandbox opt-out: {err}. \
+                         Check that the program exists and is executable."
+                    );
+                    std::process::exit(1)
+                }
+            };
+            let status = match child.wait() {
+                Ok(status) => status,
+                Err(err) => {
+                    tracing::error!(
+                        program = %program,
+                        error = %err,
+                        "sandbox re-entry: the unconfined command could not be waited for"
+                    );
+                    eprintln!(
+                        "error: failed to wait for {program} after the sandbox opt-out: {err}"
+                    );
+                    std::process::exit(1)
+                }
+            };
+            // The command's own exit code is this run's verdict, opt-out included.
+            std::process::exit(status.code().unwrap_or(1))
+        }
+        // The confined launch. The AppContainer setup parked behind the `Ok(())` of the
+        // enforcement call above is picked up by this call, the command is launched inside it,
+        // and the guards are released once the child has exited. `cwd` is passed as the policy
+        // root because that is the root the setup was prepared for: the spawn side handed over
+        // the workspace, and the policy pass anchored on the same canonicalised directory.
+        match harness::sandbox_windows::run_in_appcontainer(cwd, extra_readonly_paths, cwd, command)
+        {
+            // The child's own exit code is this run's verdict, so it is the exit code of the
+            // re-entry child too: a confined command that exits 3 does not report 0.
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                // The confinement itself failed, so the command never ran confined. Report it in
+                // the same register as the unix exec failure — the sandbox is named, and the
+                // reason is the backend's own — and exit with the refusal code rather than
+                // running the command in the clear or reporting success.
+                tracing::error!(
+                    step = harness::sandbox::RefusalStep::ConfinedLaunch.name(),
+                    kind = harness::sandbox::SandboxError::kind(&err),
+                    workspace_root = %cwd.display(),
+                    "sandbox refusal: the confined launch failed: {err}"
+                );
+                eprintln!(
+                    "{}",
+                    harness::sandbox::refusal_line(
+                        harness::sandbox::RefusalStep::ConfinedLaunch,
+                        &err,
+                    )
+                );
+                std::process::exit(harness::sandbox::SANDBOX_REFUSE_EXIT_CODE);
+            }
+        }
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = extra_readonly_paths;
         let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg(command)
@@ -778,6 +971,44 @@ fn session_flag_error(args: &CliArgs, cfg: &config::Config) -> Option<&'static s
 
 fn rotate_log(path: &std::path::Path, max_bytes: u64, backups: u32) {
     harness::workspace::rotate_log_file(path, max_bytes, backups);
+}
+
+/// The log subscriber of the **re-entry child** of every sandboxed command.
+///
+/// That child exists to do the sandbox handshake and hand the pending command over: `main`
+/// returns into [`run_sandbox_reentry`] before [`setup_panic_hook`] installs anything, and this
+/// branch never reaches that install. Every `tracing` call on the re-entry path — the backend's
+/// failure records, the refusal itself, the note about a partially enforced policy — was
+/// therefore a no-op, and the only copy of the refusal reason existed in the child's stderr.
+///
+/// This subscriber writes to the same log file the rest of the run uses
+/// ([`harness::workspace::Workspace::log_path`]), with the same filter the run uses (`RUST_LOG`,
+/// defaulting to `info`). The file is opened in append mode and deliberately **not** rotated
+/// here: the parent process owns the rotation it does at boot, and append-sharing is how the
+/// child's records reach the same file without either process holding it exclusive.
+///
+/// A log file that cannot be opened leaves the child with no subscriber rather than with an
+/// error: the refusal is still printed to stderr, and a diagnostic channel that is unavailable
+/// must never become a reason to refuse the run.
+fn install_reentry_log_subscriber() {
+    let log_path = harness::workspace::Workspace::new()
+        .map(|ws| ws.log_path())
+        .unwrap_or_else(|_| std::path::PathBuf::from(".marmel/marmel.log"));
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(file)
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tui_markdown=error")),
+        )
+        .try_init();
 }
 
 /// Report the shared HTTP client's construction verdict exactly once, at startup.

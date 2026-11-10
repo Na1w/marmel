@@ -1,11 +1,23 @@
-//! Sandbox policy and the fail-closed enforcement contract shared by both backends
-//! (Landlock on Linux, Seatbelt on macOS).
+//! Sandbox policy and the fail-closed enforcement contract shared by the three backends
+//! (Landlock on Linux, Seatbelt on macOS, AppContainer on Windows).
 //!
 //! The allow-list published here is shared: on macOS the same policy is rendered into an SBPL
 //! profile by `harness::sbpl` and enforced by the Seatbelt backend
-//! (`harness::sandbox_seatbelt.rs`, `#[cfg(target_os = "macos")]`), and the backend actually used
+//! (`harness::sandbox_seatbelt.rs`, `#[cfg(target_os = "macos")]`), on Windows it is rendered into
+//! an AppContainer policy and matching ACEs by `harness::sandbox_windows`
+//! (`harness::sandbox_windows.rs`, `#[cfg(target_os = "windows")]`), and the backend actually used
 //! is chosen by `attempt_backend` per platform rather than at the call site. Every statement
-//! below about how an attempt is judged holds for both backends.
+//! below about how an attempt is judged holds for every backend.
+//!
+//! One difference in *where* enforcement bites belongs here, because the rest of this file keeps to
+//! backend-neutral wording. On Linux and macOS the re-entry process confines **itself**
+//! (`restrict_self()` respectively `sandbox(2)`). Windows cannot do that — an AppContainer
+//! identity is carried by the process at creation, and no Win32 call downgrades a running
+//! process's own token into that identity — so confinement is established by launching the command
+//! **inside** a fresh AppContainer: the re-entry child is the confinement site, and the confined
+//! process is the command launched by `sandbox_windows::run_in_appcontainer`. The policy judgement
+//! on Windows therefore says "this run is confined and here is the confinement", not "this process
+//! itself is restricted".
 //!
 //! Restricts child processes (such as spawned PTY shells) to the workspace root, /tmp and standard build
 //! caches (~/.cargo, ~/.cache); system toolchains (/usr, /bin, /lib, ~/.rustup) and the package stores
@@ -33,7 +45,7 @@
 //! **not** restricted). "This host has no backend" and "enforcement failed" are hard errors, never
 //! warnings, and [`reentry_action`] turns any failure into a refusal to exec: a stderr message plus a
 //! non-zero exit. The Linux wording of that refusal names Landlock; the mapping is backend-neutral,
-//! so a Seatbelt failure reaches the same refusal and the same exit code.
+//! so a Seatbelt or AppContainer failure reaches the same refusal and the same exit code.
 //!
 //! The only legitimate way to run unsandboxed is the operator's explicit opt-out
 //! ([`SANDBOX_OPTOUT_ENV`], parsed fail-closed by [`is_optout_value`] and surfaced by
@@ -57,7 +69,8 @@ use landlock::{
 /// `sysexits.h`: the security facility the command requires is not available.
 pub const SANDBOX_REFUSE_EXIT_CODE: i32 = 73;
 
-/// Why enforcement failed, whichever backend is active here (Landlock on Linux, Seatbelt on macOS).
+/// Why enforcement failed, whichever backend is active here (Landlock on Linux, Seatbelt on macOS,
+/// AppContainer on Windows).
 ///
 /// Every variant is terminal for the caller: the command must not be run. The
 /// reason string is always non-empty and is what the caller logs.
@@ -92,6 +105,19 @@ impl SandboxError {
             SandboxError::Unavailable { reason }
             | SandboxError::RuleSetup { reason, .. }
             | SandboxError::Enforcement { reason } => reason,
+        }
+    }
+
+    /// The object this failure is about, when the failure names one.
+    ///
+    /// Only [`SandboxError::RuleSetup`] carries a path, and the object-level backends fill it for
+    /// every rule failure — which makes it the thing an operator acts on: an ACL failure reported
+    /// against `C:\work\proj` is fixed at that directory, not somewhere else. It is also the
+    /// `path` field of the log record.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            SandboxError::RuleSetup { path, .. } => Some(path),
+            SandboxError::Unavailable { .. } | SandboxError::Enforcement { .. } => None,
         }
     }
 }
@@ -244,19 +270,52 @@ pub fn opt_out_from_value(raw: Option<&str>) -> crate::harness::pty::OptOut {
 /// The environment channel carrying the operator's extra read-only sandbox paths
 /// from the spawning process to the re-entry child, which never loads a config file.
 ///
-/// The value is the configured list joined by `SANDBOX_EXTRA_RO_PATHS_SEP` in the
-/// configured order, published by `crate::harness::pty::build_sandboxed_command` and
-/// read back by [`extra_readonly_paths_from_env`]. Unset or empty means "no
-/// additions", so a run without the key sees no variable at all. The argv contract is
-/// deliberately untouched: it stays the sentinel, the cwd and the wrapped command,
-/// because a new slot would change the arity both ends of the protocol depend on.
-/// Note the separator limitation: a configured path that itself contains `:` cannot
-/// be transported intact — it arrives split into two entries.
+/// The value is the configured list joined by the separator of this platform's encoding
+/// ([`extra_readonly_paths_sep_in_family`]) in the configured order, published by
+/// `crate::harness::pty::build_sandboxed_command` and read back by
+/// [`extra_readonly_paths_from_env`]. Unset or empty means "no additions", so a run without
+/// the key sees no variable at all. The argv contract is deliberately untouched: it stays the
+/// sentinel, the cwd and the wrapped command, because a new slot would change the arity both
+/// ends of the protocol depend on.
+///
+/// The separator is a platform decision, not a free choice (see
+/// [`SANDBOX_EXTRA_RO_PATHS_SEP`] and [`SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS`] for why a
+/// Windows list cannot be joined with `:` at all), and the publisher and the reader both take
+/// it from the one definition below, so the two ends cannot disagree about it.
 pub const SANDBOX_EXTRA_RO_PATHS_ENV: &str = "MARMEL_SANDBOX_EXTRA_RO_PATHS";
 
-/// Separator between the entries of [`SANDBOX_EXTRA_RO_PATHS_ENV`]: the same one
-/// `PATH` uses on every platform this sandbox runs on.
+/// Separator between the entries of [`SANDBOX_EXTRA_RO_PATHS_ENV`] in the **unix** encoding:
+/// the same one `PATH` uses, unchanged from the first version of this channel, because a unix
+/// path cannot contain a `:`, so a `:`-joined unix list is unambiguous.
+///
+/// On Windows the same character is part of every absolute path (`C:\Users\x\.cargo`), so
+/// joining a Windows list with `:` splits *inside* the drive letter and the re-entry child is
+/// handed `C` and `\Users\x\.cargo` as two entries — a ruleset derived from a path nobody
+/// configured. [`SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS`] is the Windows answer.
 const SANDBOX_EXTRA_RO_PATHS_SEP: &str = ":";
+
+/// The entry separator of the **Windows** encoding: a line feed. It has to be a character
+/// that cannot occur in a Windows path, and the Win32 file namespace rejects the control
+/// characters below `0x20` (LF included) in a name — so LF never appears in one. Neither end
+/// of this channel hands the value to a shell that could rewrite it either: the builder and
+/// `std::env::var` pass it over verbatim.
+const SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS: &str = "\n";
+
+/// The entry separator of one spawn family, as a **value** — the [`SpawnFamily`]
+/// value-dispatch idiom of `pty.rs`: it lets the pure halves below encode and decode the
+/// **Windows** form on a Linux host with literal `C:\…` inputs, instead of hiding the
+/// difference behind a `#[cfg(windows)]` body that CI only ever compiles.
+///
+/// [`SpawnFamily`]: crate::harness::pty::SpawnFamily
+#[must_use]
+pub(crate) const fn extra_readonly_paths_sep_in_family(
+    family: crate::harness::pty::SpawnFamily,
+) -> &'static str {
+    match family {
+        crate::harness::pty::SpawnFamily::Unix => SANDBOX_EXTRA_RO_PATHS_SEP,
+        crate::harness::pty::SpawnFamily::Windows => SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS,
+    }
+}
 
 /// The extra read-only paths published by the spawning process, read from the
 /// environment. Call sites must use this instead of re-reading the variable.
@@ -265,14 +324,26 @@ pub fn extra_readonly_paths_from_env() -> Vec<String> {
     extra_readonly_paths_from_value(std::env::var(SANDBOX_EXTRA_RO_PATHS_ENV).ok().as_deref())
 }
 
-/// Pure half of [`extra_readonly_paths_from_env`]: split on
-/// `SANDBOX_EXTRA_RO_PATHS_SEP`, trim each entry and drop the empty ones, keeping
-/// the configured order. Unset, empty or a value made only of separators and blanks
-/// yields no paths at all.
+/// Pure half of [`extra_readonly_paths_from_env`]: split on the separator of the platform
+/// doing the reading ([`SANDBOX_EXTRA_RO_PATHS_SEP`] for unix,
+/// [`SANDBOX_EXTRA_RO_PATHS_SEP_WINDOWS`] for Windows), trim each entry and drop the empty
+/// ones, keeping the configured order. Unset, empty or a value made only of separators and
+/// blanks yields no paths at all.
 #[must_use]
 pub fn extra_readonly_paths_from_value(raw: Option<&str>) -> Vec<String> {
+    extra_readonly_paths_from_value_in_family(raw, crate::harness::pty::SpawnFamily::current())
+}
+
+/// Family-pinned half of [`extra_readonly_paths_from_value`]: decode `raw` with the
+/// separator of `family`, so the Windows encoding (`C:\Users\x\.cargo` + LF + `D:\tools`)
+/// round-trips on any host.
+#[must_use]
+pub(crate) fn extra_readonly_paths_from_value_in_family(
+    raw: Option<&str>,
+    family: crate::harness::pty::SpawnFamily,
+) -> Vec<String> {
     raw.unwrap_or_default()
-        .split(SANDBOX_EXTRA_RO_PATHS_SEP)
+        .split(extra_readonly_paths_sep_in_family(family))
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(str::to_string)
@@ -283,14 +354,36 @@ pub fn extra_readonly_paths_from_value(raw: Option<&str>) -> Vec<String> {
 /// the value to publish for `paths`, trimmed and with empty entries dropped, or `None`
 /// when there is nothing to publish — the common case, in which the variable must stay
 /// unset so the child behaves exactly as it did before this channel existed.
+///
+/// The separator is the one this platform's encoding needs, taken from
+/// [`extra_readonly_paths_sep_in_family`] — the same definition
+/// [`extra_readonly_paths_from_value`] splits on, so the two ends of the channel cannot
+/// disagree about it.
 #[must_use]
 pub fn extra_readonly_paths_to_env(paths: &[String]) -> Option<String> {
+    extra_readonly_paths_to_env_in_family(paths, crate::harness::pty::SpawnFamily::current())
+}
+
+/// Family-pinned half of [`extra_readonly_paths_to_env`]: encode `paths` with the separator
+/// of `family`, so the Windows form (LF between `C:\Users\x\.cargo` and `D:\tools`) is
+/// produced and asserted on any host.
+#[must_use]
+pub(crate) fn extra_readonly_paths_to_env_in_family(
+    paths: &[String],
+    family: crate::harness::pty::SpawnFamily,
+) -> Option<String> {
+    render_entries(paths, extra_readonly_paths_sep_in_family(family))
+}
+
+/// The shared body of both publish halves: trim each entry, drop the empty ones and join
+/// with `sep`. `None` when nothing is left to publish.
+fn render_entries(paths: &[String], sep: &str) -> Option<String> {
     let joined = paths
         .iter()
         .map(|path| path.trim())
         .filter(|path| !path.is_empty())
         .collect::<Vec<&str>>()
-        .join(SANDBOX_EXTRA_RO_PATHS_SEP);
+        .join(sep);
     (!joined.is_empty()).then_some(joined)
 }
 
@@ -561,7 +654,9 @@ pub enum Enforcement {
     /// `setting`, e.g. `MARMEL_DISABLE_SANDBOX=1`).
     Skipped { setting: String },
     /// The backend this host selected is enforcing on this process: a Landlock ruleset
-    /// on Linux, a Seatbelt profile on macOS.
+    /// on Linux, a Seatbelt profile on macOS, an AppContainer policy on Windows (where the
+    /// confined process is the command launched inside the container rather than the process
+    /// that judged the policy).
     Established,
     /// Attempted and failed — this process is **not** restricted.
     Failed { reason: String },
@@ -626,15 +721,88 @@ fn refuse(reason: String) -> ReentryAction {
     }
 }
 
+/// The marker every sandbox refusal line carries on its own output.
+///
+/// The re-entry child reports a refusal over stderr and nothing else, and the parent harness
+/// folds that stderr into the `run_command` result (see
+/// [`crate::harness::pty::render_one_shot_result`]). This token is what lets the harness tell a
+/// refusal line apart from the output of the command it was asked to run, so a refusal can be
+/// reported to the operator with its reason instead of as a bare exit code.
+pub const SANDBOX_REFUSAL_MARKER: &str = "sandbox refusal";
+
+/// Where in the re-entry chain a refusal happened, spelled once for the operator and for the
+/// `step` field of the log record.
+///
+/// The two differ in a way the operator has to see: an **attempt** failure means the sandbox
+/// could not be built at all, a **confined launch** failure means the attempt said OK and the
+/// launch of the real command still failed. Telling them apart is half of the diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalStep {
+    /// The enforcement attempt failed: policy, profile, verification or probe.
+    Attempt,
+    /// The confined launch of the pending command failed after the attempt said OK.
+    ConfinedLaunch,
+}
+
+impl RefusalStep {
+    /// The step name carried by the refusal line and by the `step` log field.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Attempt => "sandbox attempt",
+            Self::ConfinedLaunch => "confined launch",
+        }
+    }
+}
+
+/// The structured half of a refusal: the fields a machine needs, as one parenthetical.
+///
+/// It travels **inside** the reason string rather than only in the log record, because the
+/// reason string is the only part of a refusal that survives the re-entry decision
+/// ([`reentry_action`]) and reaches the operator. A refusal that lost its class and its step
+/// cannot be looked up in a log and is not actionable.
+#[must_use]
+fn structured_fields(step: RefusalStep, err: &SandboxError) -> String {
+    let path = err
+        .path()
+        .map(|path| format!(", path = {path}"))
+        .unwrap_or_default();
+    format!(
+        "step = {}, class = {}, exit code = {SANDBOX_REFUSE_EXIT_CODE}{path}",
+        step.name(),
+        err.kind(),
+    )
+}
+
+/// The refusal reason, with its structured fields appended: the backend's own text, then the
+/// step, the machine-readable class, the refusal exit code and (when the failure names one) the
+/// path it is about.
+///
+/// `step` is the caller's claim about where the failure happened; the backend cannot know it.
+#[must_use]
+pub fn refusal_detail(err: &SandboxError, step: RefusalStep) -> String {
+    format!("{err} ({})", structured_fields(step, err))
+}
+
 /// The stderr line printed when a refusal happens — kept here so the message is
 /// identical everywhere and assertable in tests.
 #[must_use]
 pub fn refusal_message(reason: &str) -> String {
     format!(
-        "error: refusing to run the command: {reason}. \
+        "error: {SANDBOX_REFUSAL_MARKER}: refusing to run the command: {reason}. \
          The sandbox is enabled by default on every platform that has a backend; \
          set {SANDBOX_OPTOUT_ENV}=1 to run it unsandboxed."
     )
+}
+
+/// The operator-facing refusal line for a refusal whose error object is still in hand.
+///
+/// The same composition as the re-entry path uses: [`refusal_detail`] then
+/// [`refusal_message`]. Every field — step, class, exit code, path, the backend's own reason and
+/// the opt-out escape hatch — is in this one line.
+#[must_use]
+pub fn refusal_line(step: RefusalStep, err: &SandboxError) -> String {
+    refusal_message(&refusal_detail(err, step))
 }
 
 /// The warning printed when an explicit opt-out is honoured. Running unsandboxed must
@@ -644,7 +812,8 @@ pub fn refusal_message(reason: &str) -> String {
 pub fn optout_warning(setting: &str) -> String {
     format!(
         "warning: sandbox DISABLED by {setting}: this command runs WITHOUT the sandbox backend \
-         this platform would otherwise use (Landlock on Linux, Seatbelt on macOS)."
+         this platform would otherwise use (Landlock on Linux, Seatbelt on macOS, the \
+         AppContainer on Windows)."
     )
 }
 
@@ -764,20 +933,21 @@ fn error_chain<E: std::error::Error>(err: &E) -> String {
     chain
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn attempt_landlock(_workspace_root: &Path, _extra_readonly_paths: &[String]) -> SandboxAttempt {
     // No Landlock exists on this platform, so the sandbox cannot be established at
     // all. That is reported as a failure: the caller must refuse rather than pretend
     // the command ran protected. On macOS this stub is not built at all: Seatbelt is
-    // what the macOS backend of [`attempt_backend`] applies there, and an unused
-    // Landlock stub would be dead code on that target.
+    // what the macOS backend of [`attempt_backend`] applies there, and the same holds
+    // on Windows, whose backend of [`attempt_backend`] asks for an AppContainer instead.
+    // An unused Landlock stub would be dead code on those targets.
     SandboxAttempt::Unavailable {
         reason: format!("{} has no Landlock support", std::env::consts::OS),
     }
 }
 
 /// Whether this build has a sandbox backend at all: **Landlock on Linux, Seatbelt on
-/// macOS**. Windows and every other target answer `false`.
+/// macOS, AppContainer on Windows**. Every other target answers `false`.
 ///
 /// This is the one place the *existence* of a backend is spelled out. The decision sites —
 /// [`crate::harness::pty::SandboxInputs::backend_supported`] on the spawn side and the
@@ -792,7 +962,11 @@ fn attempt_landlock(_workspace_root: &Path, _extra_readonly_paths: &[String]) ->
 /// therefore skips the re-entry — visibly, through [`crate::harness::pty::SandboxSkip`].
 #[must_use]
 pub const fn backend_supports_current_platform() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))
 }
 
 /// Which backend this build asks for, decided by `#[cfg]` alone.
@@ -800,7 +974,7 @@ pub const fn backend_supports_current_platform() -> bool {
 /// One selector per platform, so [`apply_sandbox_with_extra_readonly_paths`] stays
 /// platform-neutral and keeps one and the same fail-closed mapping
 /// ([`sandbox_outcome`]) regardless of which enforcement mechanism the host has. Exactly one of
-/// these is compiled into any build, and a host with neither mechanism still gets an
+/// these is compiled into any build, and a host with no mechanism at all still gets an
 /// [`SandboxAttempt::Unavailable`], which the caller turns into a refusal rather than into an
 /// unsandboxed run.
 #[cfg(target_os = "linux")]
@@ -817,8 +991,26 @@ fn attempt_backend(workspace_root: &Path, extra_readonly_paths: &[String]) -> Sa
     crate::harness::sandbox_seatbelt::attempt_seatbelt(workspace_root, extra_readonly_paths)
 }
 
-/// The selector for every host with neither Landlock nor Seatbelt (Windows, the BSDs, …).
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// The Windows selector: neither `restrict_self()` nor `sandbox(2)` exists here, so confinement is
+/// not something this process can impose on itself. The AppContainer backend of
+/// [`crate::harness::sandbox_windows`] is asked for instead, and it confines the command launched
+/// **inside** a fresh AppContainer — the re-entry child is the confinement site, because Win32 has
+/// no in-place equivalent of confining the calling process.
+///
+/// The judgement this selector runs (`attempt_windows_sandbox`) prepares the profile and the ACEs
+/// the policy needs, and parks them in that module's thread-local hand-off: the prepared
+/// profile/ACL hand-off lives on until the confined child is launched, where
+/// [`crate::harness::sandbox_windows::take_windows_policy_setup`] is how the launch layer picks it
+/// up, and [`crate::harness::sandbox_windows::discard_windows_policy_setup`] releases it when a run
+/// decides not to launch anything confined. [`apply_sandbox`] only makes the judgement; confining
+/// the pending command with it is what `sandbox_windows::run_in_appcontainer` does next.
+#[cfg(target_os = "windows")]
+fn attempt_backend(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
+    crate::harness::sandbox_windows::attempt_windows_sandbox(workspace_root, extra_readonly_paths)
+}
+
+/// The selector for every host with none of Landlock, Seatbelt or AppContainer (the BSDs, …).
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn attempt_backend(workspace_root: &Path, extra_readonly_paths: &[String]) -> SandboxAttempt {
     attempt_landlock(workspace_root, extra_readonly_paths)
 }
@@ -1023,6 +1215,48 @@ mod tests {
         );
     }
 
+    /// The refusal line an operator reads has to carry everything needed to act on it: the
+    /// marker the harness looks for in captured output, the step that failed, the
+    /// machine-readable class, the refusal exit code, the path behind the failure, the code the
+    /// backend reported and the escape hatch. A line missing one of those is not diagnosable.
+    #[test]
+    fn test_refusal_line_carries_every_field_needed_to_diagnose_it() {
+        let err = SandboxError::RuleSetup {
+            path: r"C:\work\proj".to_string(),
+            reason: "SetNamedSecurityInfoW failed: Access is denied. (os error 5) (win32 code = 5)"
+                .to_string(),
+        };
+        let line = refusal_line(RefusalStep::Attempt, &err);
+
+        assert!(line.contains(SANDBOX_REFUSAL_MARKER), "{line}");
+        assert!(line.contains("step = sandbox attempt"), "{line}");
+        assert!(line.contains("class = rule-setup"), "{line}");
+        assert!(line.contains("path = C:\\work\\proj"), "{line}");
+        assert!(
+            line.contains(&format!("exit code = {SANDBOX_REFUSE_EXIT_CODE}")),
+            "{line}"
+        );
+        assert!(line.contains("win32 code = 5"), "the backend code: {line}");
+        assert!(line.contains("SetNamedSecurityInfoW"), "{line}");
+        assert!(line.contains(SANDBOX_OPTOUT_ENV), "{line}");
+        assert_eq!(RefusalStep::ConfinedLaunch.name(), "confined launch");
+    }
+
+    /// A failure that names no object gets no `path` field — the fields are only as complete as
+    /// the backend's verdict, and an invented path would be worse than none.
+    #[test]
+    fn test_refusal_detail_omits_the_path_when_no_object_is_named() {
+        let detail = refusal_detail(
+            &SandboxError::Unavailable {
+                reason: "no AppContainer identity could be made".to_string(),
+            },
+            RefusalStep::ConfinedLaunch,
+        );
+        assert!(!detail.contains("path ="), "{detail}");
+        assert!(detail.contains("step = confined launch"), "{detail}");
+        assert!(detail.contains("class = unavailable"), "{detail}");
+    }
+
     /// The same contract on the macOS leg, where the failure arrives as a
     /// `SandboxAttempt::EnforcementFailed` from `attempt_seatbelt` (a failing
     /// `sandbox_init_with_parameters`, or a probe that answers `Allowed` for a path the
@@ -1171,37 +1405,90 @@ mod tests {
     /// The extra read-only path list survives the environment channel unchanged:
     /// nothing in is nothing out, and separators, blanks and padding never invent an
     /// entry.
+    ///
+    /// Every leg below is pinned to one spawn family, because the separator — and with it
+    /// the question "which characters count as separator noise" — is a per-family decision
+    /// ([`extra_readonly_paths_sep_in_family`]). A leg that just calls the
+    /// current-family half is a leg that silently changes meaning when the file is
+    /// compiled for the other platform, which is exactly how the unix fixtures below once
+    /// failed on `windows-latest`.
     #[test]
     fn test_extra_readonly_paths_parsing_of_an_absent_or_empty_value_yields_nothing() {
+        use crate::harness::pty::SpawnFamily;
+
+        // The unix encoding: `:` joins entries, so a value made of separators, blanks or
+        // both carries no entry at all.
         for raw in [None, Some(""), Some("   "), Some(":"), Some(":: :")] {
             assert_eq!(
-                extra_readonly_paths_from_value(raw),
+                extra_readonly_paths_from_value_in_family(raw, SpawnFamily::Unix),
                 Vec::<String>::new(),
-                "{raw:?} must not produce a single path"
+                "{raw:?} must not produce a single path in the unix encoding"
             );
         }
+
+        // The Windows encoding: a line feed joins entries, so the same shapes stay empty
+        // there too, and the LF spellings that family publishes must be empty as well.
+        for raw in [None, Some(""), Some("   "), Some("\n"), Some("\n \n\n")] {
+            assert_eq!(
+                extra_readonly_paths_from_value_in_family(raw, SpawnFamily::Windows),
+                Vec::<String>::new(),
+                "{raw:?} must not produce a single path in the windows encoding"
+            );
+        }
+
+        // The separator of one family is ordinary path content in the other, which is why
+        // the decoding half must be told which family it is reading for rather than
+        // guessing: a lone `:` is the drive-letter prefix of a Windows entry, while a bare
+        // LF is padding in the unix encoding.
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(":"), SpawnFamily::Windows),
+            vec![":".to_string()],
+            "a colon is a Windows path character, not the Windows separator"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some("\n"), SpawnFamily::Unix),
+            Vec::<String>::new(),
+            "a bare line feed is padding once the separator is the unix one"
+        );
     }
 
     /// One entry, several entries, and the order the operator wrote them in.
+    ///
+    /// Both families are pinned explicitly: the same fixture decoded by the wrong family
+    /// is a list of the wrong size (a `:`-joined unix list decoded by the Windows family is
+    /// **one** entry, a LF-joined Windows list decoded by the unix family is a list of
+    /// path fragments), so the separator belongs in the fixture, not in the platform.
     #[test]
     fn test_extra_readonly_paths_parsing_keeps_every_entry_in_order() {
+        use crate::harness::pty::SpawnFamily;
+
+        // The unix encoding, byte-for-byte the expectations published by the spawn side.
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/nix/store")),
+            extra_readonly_paths_from_value_in_family(Some("/nix/store"), SpawnFamily::Unix),
             vec!["/nix/store".to_string()],
             "a single entry is a single path"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/nix/store:/gnu/store")),
+            extra_readonly_paths_from_value_in_family(
+                Some("/nix/store:/gnu/store"),
+                SpawnFamily::Unix
+            ),
             vec!["/nix/store".to_string(), "/gnu/store".to_string()],
             "entries must keep their order, not be sorted"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/gnu/store:/nix/store")),
+            extra_readonly_paths_from_value_in_family(
+                Some("/gnu/store:/nix/store"),
+                SpawnFamily::Unix
+            ),
             vec!["/gnu/store".to_string(), "/nix/store".to_string()],
             "order must follow the value, whatever it is"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/opt/a:/opt/b:/opt/c")),
+            extra_readonly_paths_from_value_in_family(
+                Some("/opt/a:/opt/b:/opt/c"),
+                SpawnFamily::Unix
+            ),
             vec![
                 "/opt/a".to_string(),
                 "/opt/b".to_string(),
@@ -1209,24 +1496,73 @@ mod tests {
             ],
             "no entry may be dropped between the first and the last"
         );
+
+        // The Windows encoding, joined with a line feed: everything between two LF is
+        // entry content, so a drive-letter colon and every backslash survive verbatim.
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(r"C:\Toolchain A"),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string()],
+            "a single entry is a single path, colon and backslashes intact"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(r"C:\Toolchain A", "\n", r"C:\Toolchain B")),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string(), r"C:\Toolchain B".to_string()],
+            "a LF-joined list must decode to exactly the two configured paths"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(
+                    r"D:\tools",
+                    "\n",
+                    r"C:\tools",
+                    "\n",
+                    r"\\server\share\tools"
+                )),
+                SpawnFamily::Windows
+            ),
+            vec![
+                r"D:\tools".to_string(),
+                r"C:\tools".to_string(),
+                r"\\server\share\tools".to_string()
+            ],
+            "the order of the value wins over any alphabetical guess, and a UNC prefix \
+             is content like any other"
+        );
     }
 
     /// Padding, a leading or trailing separator and an empty middle entry are all
     /// tolerated without producing an empty path that the ruleset would choke on.
+    ///
+    /// Pinned per family, for the same reason as the two tests above.
     #[test]
     fn test_extra_readonly_paths_parsing_trims_and_drops_empty_entries() {
+        use crate::harness::pty::SpawnFamily;
+
+        // The unix encoding.
         assert_eq!(
-            extra_readonly_paths_from_value(Some("  /nix/store  :  /gnu/store  ")),
+            extra_readonly_paths_from_value_in_family(
+                Some("  /nix/store  :  /gnu/store  "),
+                SpawnFamily::Unix
+            ),
             vec!["/nix/store".to_string(), "/gnu/store".to_string()],
             "surrounding blanks are padding, not part of the path"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some("/nix/store:")),
+            extra_readonly_paths_from_value_in_family(Some("/nix/store:"), SpawnFamily::Unix),
             vec!["/nix/store".to_string()],
             "a trailing separator must not add an empty entry"
         );
         assert_eq!(
-            extra_readonly_paths_from_value(Some(":/gnu:/nix/store::/gnu/store")),
+            extra_readonly_paths_from_value_in_family(
+                Some(":/gnu:/nix/store::/gnu/store"),
+                SpawnFamily::Unix
+            ),
             vec![
                 "/gnu".to_string(),
                 "/nix/store".to_string(),
@@ -1234,26 +1570,197 @@ mod tests {
             ],
             "an empty entry anywhere is dropped, the rest is kept in order"
         );
+
+        // The Windows encoding: blanks around a `C:\…` entry are padding, and the LF that
+        // opens or closes a value must not add an entry either.
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(
+                    "  ",
+                    r"C:\Toolchain A",
+                    "  \n\t",
+                    r"C:\Toolchain B",
+                    "  "
+                )),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string(), r"C:\Toolchain B".to_string()],
+            "surrounding blanks are padding, not part of a Windows path"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(r"C:\Toolchain A", "\n")),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string()],
+            "a trailing line feed must not add an empty entry"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(
+                Some(concat!(
+                    "\n",
+                    r"C:\Toolchain A",
+                    "\n\n",
+                    "   ",
+                    "\n",
+                    r"C:\Toolchain B",
+                    "\n"
+                )),
+                SpawnFamily::Windows
+            ),
+            vec![r"C:\Toolchain A".to_string(), r"C:\Toolchain B".to_string()],
+            "a blank entry anywhere is dropped — leading, middle or trailing — the rest \
+             is kept in order"
+        );
     }
 
     /// The publish side is the exact inverse: what the spawn side encodes is what the
-    /// child parses, and an empty list publishes nothing at all.
+    /// child parses, and an empty list publishes nothing at all. Both halves are pinned to
+    /// the family whose encoding is under test, and each family is checked with the entries
+    /// that family's platform can actually have.
     #[test]
     fn test_extra_readonly_paths_env_encoding_round_trips() {
-        for empty in [&[] as &[String], &[String::new()], &["  ".to_string()]] {
-            assert_eq!(
-                extra_readonly_paths_to_env(empty),
-                None,
-                "nothing to say must leave the variable unset"
-            );
+        use crate::harness::pty::SpawnFamily;
+
+        for family in [SpawnFamily::Unix, SpawnFamily::Windows] {
+            for empty in [&[] as &[String], &[String::new()], &["  ".to_string()]] {
+                assert_eq!(
+                    extra_readonly_paths_to_env_in_family(empty, family),
+                    None,
+                    "nothing to say must leave the variable unset"
+                );
+            }
         }
+
+        // The unix encoding: the historical `:` joining, unchanged.
         let paths = vec!["/nix/store".to_string(), "/gnu/store".to_string()];
-        let encoded = extra_readonly_paths_to_env(&paths).expect("a non-empty list is published");
+        let encoded = extra_readonly_paths_to_env_in_family(&paths, SpawnFamily::Unix)
+            .expect("a list is published");
         assert_eq!(encoded, "/nix/store:/gnu/store");
         assert_eq!(
-            extra_readonly_paths_from_value(Some(&encoded)),
+            extra_readonly_paths_from_value_in_family(Some(&encoded), SpawnFamily::Unix),
             paths,
             "the value must parse back to exactly the list that produced it"
+        );
+
+        // The Windows encoding: joined with a line feed, so the drive-letter colon of each
+        // entry survives and round-trips.
+        let win_paths = vec![r"C:\Toolchain A".to_string(), r"C:\Toolchain B".to_string()];
+        let win_encoded = extra_readonly_paths_to_env_in_family(&win_paths, SpawnFamily::Windows)
+            .expect("a list is published");
+        assert_eq!(
+            win_encoded,
+            concat!(r"C:\Toolchain A", "\n", r"C:\Toolchain B"),
+            "the Windows value joins with a line feed, never with a colon"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(&win_encoded), SpawnFamily::Windows),
+            win_paths,
+            "the Windows value must parse back to exactly the list that produced it"
+        );
+    }
+
+    /// The Windows encoding, family-pinned so it is assertable on a Linux host. A Windows
+    /// path contains a `:` in every absolute path (`C:\Users\x`), so the separator unix paths
+    /// use would split a Windows list *inside* the drive letter and hand the re-entry child a
+    /// ruleset nobody configured. A line feed cannot occur in a Win32 path name (the namespace
+    /// rejects the control characters below `0x20`), so it is the separator that keeps a list
+    /// of `C:\…` entries unambiguous — and the unix encoding is untouched, so every unix test
+    /// above stays valid.
+    #[test]
+    fn test_extra_readonly_paths_windows_encoding_round_trips_drive_letter_paths() {
+        use crate::harness::pty::SpawnFamily;
+
+        // The separators are genuinely different per family, and each end takes them from the
+        // one definition.
+        assert_eq!(extra_readonly_paths_sep_in_family(SpawnFamily::Unix), ":");
+        assert_eq!(
+            extra_readonly_paths_sep_in_family(SpawnFamily::Windows),
+            "\n",
+            "a Windows path cannot contain a LF, so it cannot collide with the separator"
+        );
+
+        let paths = vec![r"C:\Users\x\.cargo".to_string(), r"D:\tools".to_string()];
+        let encoded = extra_readonly_paths_to_env_in_family(&paths, SpawnFamily::Windows)
+            .expect("a non-empty list is published");
+        assert_eq!(
+            encoded,
+            format!("{}\n{}", r"C:\Users\x\.cargo", r"D:\tools"),
+            "the Windows value joins with a LF, never with a colon"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(&encoded), SpawnFamily::Windows),
+            paths,
+            "the Windows value must parse back to exactly the two paths that produced it"
+        );
+
+        // The same value decoded with the *unix* separator is the bug this fixes: the drive
+        // letter becomes its own entry, and the LF survives inside the next one. Asserted so
+        // the ambiguity is documented, not guessed.
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(&encoded), SpawnFamily::Unix),
+            vec![
+                "C".to_string(),
+                "\\Users\\x\\.cargo\nD".to_string(),
+                r"\tools".to_string()
+            ],
+            "a colon-split Windows list breaks inside the drive letter — which is why the \
+             reader takes the separator of the family that encoded it"
+        );
+
+        // The unix family keeps its historical separator, and round-trips a unix list.
+        let unix_paths = vec!["/nix/store".to_string(), "/gnu/store".to_string()];
+        let unix_encoded = extra_readonly_paths_to_env_in_family(&unix_paths, SpawnFamily::Unix)
+            .expect("published");
+        assert_eq!(unix_encoded, "/nix/store:/gnu/store");
+        assert_eq!(
+            extra_readonly_paths_from_value_in_family(Some(&unix_encoded), SpawnFamily::Unix),
+            unix_paths
+        );
+
+        // Each family's two halves agree, whichever separator that family uses, and the
+        // entries are the paths that family's platform actually has: a Windows list
+        // round-trips on any host through the Windows encoding, a unix list through the unix
+        // encoding.
+        for (family, list) in [
+            (
+                SpawnFamily::Unix,
+                vec!["/nix/store".to_string(), "/gnu/store".to_string()],
+            ),
+            (
+                SpawnFamily::Windows,
+                vec![r"C:\Users\x\.cargo".to_string(), r"D:\tools".to_string()],
+            ),
+        ] {
+            let encoded =
+                extra_readonly_paths_to_env_in_family(&list, family).expect("a list is published");
+            assert_eq!(
+                extra_readonly_paths_from_value_in_family(Some(&encoded), family),
+                list,
+                "the two halves of one family round-trip with that family's separator"
+            );
+        }
+
+        // The two production halves take the separator from the same one definition, so a
+        // spawn side and a re-entry child of the same build cannot disagree about it. The
+        // entries are the ones this build's own family can express.
+        let built = SpawnFamily::current();
+        let list = if built == SpawnFamily::Windows {
+            vec![r"C:\Users\x\.cargo".to_string(), r"D:\tools".to_string()]
+        } else {
+            vec!["/nix/store".to_string(), "/gnu/store".to_string()]
+        };
+        let encoded = extra_readonly_paths_to_env(&list).expect("a list is published");
+        assert_eq!(
+            encoded,
+            extra_readonly_paths_to_env_in_family(&list, built).expect("published"),
+            "the production encoder is the encoder of the family this build was made for"
+        );
+        assert_eq!(
+            extra_readonly_paths_from_value(Some(&encoded)),
+            list,
+            "the production decoder splits with the separator the production encoder joined \
+             with: a build's own halves always agree"
         );
     }
 
@@ -1671,7 +2178,7 @@ mod tests {
     /// and keep terminating the child. The pre-fix wording named neither the sandbox nor a
     /// path and is asserted away; it is spelled only here, never in `main.rs`, whose text is
     /// the scanned side. The wording is deliberately backend-neutral: which backend is in
-    /// play (Landlock or Seatbelt) is decided per platform, not in this message.
+    /// play (Landlock, Seatbelt or AppContainer) is decided per platform, not in this message.
     #[test]
     fn test_main_rs_exec_failure_names_the_sandbox_and_the_resolved_program() {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
@@ -1687,7 +2194,7 @@ mod tests {
         assert!(
             exec_step.contains("under the active sandbox"),
             "the failure must say a sandbox refused the exec (backend-neutral: Landlock on \
-             Linux, Seatbelt on macOS)"
+             Linux, Seatbelt on macOS, AppContainer on Windows)"
         );
         assert!(
             exec_step.contains("resolve_program_path(\"sh\")"),
@@ -1705,6 +2212,55 @@ mod tests {
         assert!(
             !exec_step.contains("shell in sandbox"),
             "the unactionable pre-fix message must not come back"
+        );
+    }
+
+    /// The opt-out has to reach the **launch**, not stop at the decision. A Windows re-entry child
+    /// that always uses its confined launch would put an opted-out command inside an AppContainer
+    /// too, which is precisely what the documented escape hatch promises never to do. No Linux host
+    /// can run a Windows AppContainer, so the contract is pinned at the source: the exec step must
+    /// read the enforcement verdict, must run an opted-out run through the spawn side's own shell
+    /// rules rather than through the confined launch, must release anything the policy pass parked
+    /// on that path, and must keep the confined launch for an established confinement.
+    #[test]
+    fn test_main_rs_an_opted_out_windows_run_launches_the_pending_command_unconfined() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs must be readable from the crate manifest dir");
+        let exec_step = src
+            .find("fn exec_pending_command(")
+            .map(|from| {
+                let rest = &src[from..];
+                rest[..rest.find("fn boot_manager(").unwrap_or(rest.len())].to_string()
+            })
+            .expect("the exec step must stay one function");
+
+        assert!(
+            exec_step.contains("harness::sandbox::Enforcement::Established")
+                || exec_step.contains("harness::sandbox::Enforcement::Skipped"),
+            "the launch must read the enforcement verdict it was handed"
+        );
+        let opt_out_at = exec_step
+            .find("Enforcement::Skipped")
+            .expect("the opt-out verdict must be the branch the launch takes");
+        let confined_at = exec_step
+            .find("harness::sandbox_windows::run_in_appcontainer(")
+            .expect("the confined launch must stay for an established confinement");
+        assert!(
+            opt_out_at < confined_at,
+            "the opted-out leg must be taken instead of the confined launch, never before it"
+        );
+        assert!(
+            exec_step.contains("harness::pty::windows_shell_argv(")
+                && exec_step.contains(".spawn()")
+                && exec_step.contains("child.wait("),
+            "an opted-out run must be launched on the shared shell rules, as a child this process \
+             waits for and exits with: the opt-out must not be a re-spelled shell"
+        );
+        assert!(
+            exec_step.contains("harness::sandbox_windows::discard_windows_policy_setup(")
+                && exec_step.contains(".current_dir(cwd)"),
+            "the opted-out leg must release a parked AppContainer setup and run the pending \
+             command in the directory the protocol handed over"
         );
     }
 
@@ -1738,8 +2294,9 @@ mod tests {
     /// The sandbox backend is selected per platform by `#[cfg]`, and the enforcement entry point
     /// must go through that selector rather than through one hard-coded backend. Pinned at the
     /// source because a wrong `cfg` combination only ever surfaces on a target this repository
-    /// cannot run on: on Linux there is no Seatbelt, on macOS there is no Landlock, and every
-    /// other host must get neither.
+    /// cannot run on: on Linux there is no Seatbelt, on macOS there is no Landlock, on Windows
+    /// none of them apply and an AppContainer selector does, and every other host must get
+    /// neither.
     #[test]
     fn test_sandbox_backend_is_selected_by_cfg_not_by_call_site() {
         let src = std::fs::read_to_string(concat!(
@@ -1752,10 +2309,11 @@ mod tests {
         let quote = char::from(34);
         let linux = format!("#[cfg(target_os = {quote}linux{quote})]\nfn attempt_backend(");
         let macos = format!("#[cfg(target_os = {quote}macos{quote})]\nfn attempt_backend(");
+        let windows = format!("#[cfg(target_os = {quote}windows{quote})]\nfn attempt_backend(");
         let neither = format!(
-            "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote})))]\nfn attempt_backend("
+            "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote}, target_os = {quote}windows{quote})))]\nfn attempt_backend("
         );
-        for selector in [&linux, &macos, &neither] {
+        for selector in [&linux, &macos, &windows, &neither] {
             assert!(
                 src.contains(selector),
                 "every platform must name exactly one backend selector, missing: {selector}"
@@ -1763,59 +2321,96 @@ mod tests {
         }
         assert_eq!(
             src.matches("\nfn attempt_backend(").count(),
-            3,
-            "the three selectors must be one per platform, never two for the same host"
+            4,
+            "the four selectors must be one per platform, never two for the same host"
         );
 
-        // The call site goes through the selector, so both backends stay behind one contract.
+        // The call site goes through the selector, so every backend stays behind one contract.
         assert!(
             src.contains("let attempt = attempt_backend(workspace_root, &granted);"),
             "the enforcement entry point must call the selected backend, not a fixed one"
         );
         // The Landlock-only half must stay Linux-gated, and the no-Landlock stub must not be
-        // built on macOS: an unused stub is dead code, which this crate denies per target.
+        // built on macOS or Windows: an unused stub is dead code, which this crate denies per
+        // target.
         assert!(
             src.contains(&format!(
-                "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote})))]\nfn attempt_landlock("
+                "#[cfg(not(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote}, target_os = {quote}windows{quote})))]\nfn attempt_landlock("
             )),
-            "the no-Landlock stub must cover exactly the hosts with neither mechanism"
+            "the no-Landlock stub must cover exactly the hosts that have no Landlock, Seatbelt or AppContainer"
         );
 
         // The capability flag the decision sites read must describe exactly the hosts that
         // get a selector here: a narrower flag gates out a backend that exists (that is how
         // macOS never reached Seatbelt), a wider one promises a backend nothing enforces.
+        //
+        // Scoped to the production half of the file and read out of the flag's own body: the
+        // flag test below spells the same platform comparison as its own expectation, so a
+        // needle answered only by that copy would prove nothing about the flag itself.
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module must be split off the production half")
+            .to_string();
         assert!(
-            src.contains("pub const fn backend_supports_current_platform() -> bool {"),
+            production.contains("pub const fn backend_supports_current_platform() -> bool {"),
             "the platform capability flag must exist next to the selectors it describes"
         );
+        let flag_body = production
+            .split_once("pub const fn backend_supports_current_platform() -> bool {")
+            .map(|(_, after_flag)| {
+                let body_end = after_flag
+                    .find("\n}")
+                    .expect("the flag body must end at its closing brace");
+                &after_flag[..body_end]
+            })
+            .expect("the flag must be defined exactly once in the production half");
         assert!(
-            src.contains(&format!(
-                "cfg!(any(target_os = {quote}linux{quote}, target_os = {quote}macos{quote}))"
-            )),
-            "the capability flag must answer for exactly the two platforms that have a backend"
+            flag_body.contains("cfg!(any("),
+            "the flag must answer the platform question with one cfg!(any(…))"
         );
+        for platform in ["linux", "macos", "windows"] {
+            let spelled = format!("target_os = {quote}{platform}{quote}");
+            assert!(
+                flag_body.contains(&spelled),
+                "the flag body must name {platform}, so the flag answers for exactly the three \
+                 platforms that have a backend and no others"
+            );
+        }
     }
 
     /// The capability flag exists so that the *same* answer decides the spawn side and the
     /// re-entry child. Its value must be true exactly on the hosts that compile a backend
-    /// selector here, which is what a Linux host can check about macOS: the flag is the one
-    /// statement of the platform set, and neither gate site is allowed its own.
+    /// selector here, which is what a Linux host can check about macOS and Windows: the flag is
+    /// the one statement of the platform set, and neither gate site is allowed its own.
     #[test]
-    fn test_backend_supports_current_platform_answers_for_both_backends() {
+    fn test_backend_supports_current_platform_answers_for_every_backend() {
         // One statement of the platform question, read by both gate sites: `true` for a host
-        // that compiles a backend selector (Landlock on Linux, Seatbelt on macOS), `false` for
-        // a host that compiles none. The Linux-only answer this helper replaced is exactly the
-        // difference between Seatbelt applying on macOS and never being reached from there.
-        let backend_compiled_in = cfg!(any(target_os = "linux", target_os = "macos"));
+        // that compiles a backend selector (Landlock on Linux, Seatbelt on macOS, AppContainer on
+        // Windows), `false` for a host that compiles none. The Linux-only answer this helper
+        // replaced is exactly the difference between Seatbelt applying on macOS and never being
+        // reached from there, and the same for the AppContainer selector on Windows.
+        let backend_compiled_in = cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        ));
         assert_eq!(
             backend_supports_current_platform(),
             backend_compiled_in,
-            "the flag must answer true for Landlock on Linux and Seatbelt on macOS alike"
+            "the flag must answer true for Landlock on Linux, Seatbelt on macOS and AppContainer \
+             on Windows alike"
         );
         if cfg!(target_os = "macos") {
             assert!(
                 backend_supports_current_platform(),
                 "a macOS host must report a backend, or the Seatbelt selector is never asked"
+            );
+        }
+        if cfg!(target_os = "windows") {
+            assert!(
+                backend_supports_current_platform(),
+                "a Windows host must report a backend, or the AppContainer selector is never asked"
             );
         }
     }

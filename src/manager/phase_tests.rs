@@ -12,6 +12,64 @@ fn temp_marmel() -> std::path::PathBuf {
     dir
 }
 
+/// Test-only serialization lock for every test in this module that reads or writes
+/// the `phase` module's **process-global** session state: `KEEP_SESSION` (read by
+/// `Plan::cleanup_completed`, written by `set_keep_session`),
+/// `TRACKED_MARMEL_FILES` and the plan clocks that `cleanup_completed` resets
+/// through `clear_plan_start`.
+///
+/// The fixture *directories* are already isolated: `temp_marmel()` names each one
+/// uniquely through [`crate::test_scratch::scratch_name`], so no two tests in this
+/// module ever create or delete the same path. The session flags are not:
+/// `KEEP_SESSION` is a single process-wide `AtomicBool`, and
+/// `test_cleanup_completed_respects_keep_session` has to hold it `true` across its
+/// own `cleanup_completed()` call. libtest runs tests concurrently
+/// (`.github/workflows/ci.yml` never passes `--test-threads=1`), so every other
+/// cleanup test in this binary can observe that `true` and be handed the
+/// `Ok(false)` "nothing was cleaned" answer for a cleanup it never asked to skip —
+/// which is what makes `assert!(cleaned, "completed plan must be cleaned up")` and
+/// the equivalent assertion in `test_cleanup_completed_preserves_user_files`
+/// flake under parallel scheduling and pass with `--test-threads=1`.
+///
+/// The poisoning window is wide rather than tight: the flag is set *before*
+/// `cleanup_completed()` acquires `PLAN_MUTEX`, which a sibling cleanup test may
+/// be holding for its entire directory traversal, so `KEEP_SESSION` stays `true`
+/// across a whole unrelated cleanup. Measured on an idle 56-core Linux host (8
+/// toggling threads against 8 cleanup threads, both running the bodies of the two
+/// tests named above): `cleanup_completed()` answered `false` 41 of 1600 times,
+/// ~2.6 % per call. This lock, not the thread count, is what makes the
+/// cleanup assertions deterministic.
+static SESSION_GLOBAL_TEST_SERIAL: std::sync::Mutex<()> = const { std::sync::Mutex::new(()) };
+
+/// Take [`SESSION_GLOBAL_TEST_SERIAL`] for the remainder of the calling test.
+///
+/// Not reentrant: a test must hold it exactly once. The bounded spin below turns
+/// an accidental second acquisition into a loud failure instead of a hung test
+/// binary, mirroring `config::sandbox_env_test_lock`.
+#[must_use = "the guard is what serializes the process-global session state; hold it for the whole test"]
+fn session_global_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    // Poisoning is swallowed on purpose: one failing assertion must not cascade
+    // into every later cleanup test of this binary.
+    for attempt in 0..1_000_u32 {
+        match SESSION_GLOBAL_TEST_SERIAL.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if attempt < 500 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+    panic!(
+        "`SESSION_GLOBAL_TEST_SERIAL` stayed busy for a full second: a test almost certainly \
+         took the (non-reentrant) process-global session lock twice. Keep exactly one guard per \
+         test — the wait it replaces is a single cleanup of a temp directory."
+    );
+}
+
 const PLAN_MD: &str = "# Execution Plan\n\
 - [ ] [t-001] Read configuration module\n\
 - [ ] [t-002] Implement strict replace tool\n\
@@ -2135,6 +2193,8 @@ fn work_state_is_no_plan_for_an_empty_or_whitespace_only_plan_file() {
 
 #[test]
 fn test_cleanup_completed_skips_incomplete_plan() {
+    // `KEEP_SESSION` is process-global and cleanup_completed() answers through it.
+    let _session_global_serial = session_global_test_lock();
     let dir = temp_marmel();
     let plan = Plan::at(&dir);
     plan.create("# Plan\n- [x] [t-001] Done\n- [ ] [t-002] Incomplete\n")
@@ -2150,6 +2210,8 @@ fn test_cleanup_completed_skips_incomplete_plan() {
 
 #[test]
 fn test_cleanup_completed_removes_runtime_and_deletes_empty_dir() {
+    // `KEEP_SESSION` is process-global and cleanup_completed() answers through it.
+    let _session_global_serial = session_global_test_lock();
     let dir = temp_marmel();
     let plan = Plan::at(&dir);
     plan.create("# Plan\n- [ ] [t-001] Task 1\n").unwrap();
@@ -2181,6 +2243,8 @@ fn test_cleanup_completed_removes_runtime_and_deletes_empty_dir() {
 
 #[test]
 fn test_cleanup_completed_preserves_user_files() {
+    // `KEEP_SESSION` is process-global and cleanup_completed() answers through it.
+    let _session_global_serial = session_global_test_lock();
     let dir = temp_marmel();
     let plan = Plan::at(&dir);
     plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
@@ -2230,6 +2294,8 @@ fn test_cleanup_completed_preserves_user_files() {
 
 #[test]
 fn test_cleanup_completed_respects_keep_session() {
+    // This test writes the process-global flag other cleanup tests read.
+    let _session_global_serial = session_global_test_lock();
     let dir = temp_marmel();
     let plan = Plan::at(&dir);
     plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
@@ -2269,6 +2335,8 @@ fn test_find_marmel_dir_and_subpath() {
 
 #[test]
 fn test_track_created_marmel_file_and_cleanup() {
+    // Reads and clears the process-global tracked-files registry.
+    let _session_global_serial = session_global_test_lock();
     let dir = temp_marmel();
     let plan = Plan::at(&dir);
     plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
@@ -2320,4 +2388,92 @@ fn test_prune_empty_subdirectories_preserves_skills() {
     );
 
     fs::remove_dir_all(&dir).ok();
+}
+
+/// Regression guard for the isolation of this module's cleanup tests from the
+/// `phase` module's process-global session state.
+///
+/// Both roles below are the two real tests, replayed on their own threads: the
+/// writers run `test_cleanup_completed_respects_keep_session` (which must hold
+/// `KEEP_SESSION` `true` across its own cleanup) and the readers run
+/// `test_cleanup_completed_removes_runtime_and_deletes_empty_dir`. Each takes
+/// [`SESSION_GLOBAL_TEST_SERIAL`] exactly as its real counterpart does, so no
+/// reader can be handed the writer's `true` — the `Ok(false)` that made
+/// `assert!(cleaned, "completed plan must be cleaned up")` fail in CI. The same
+/// replay without the guards answered `false` for completed cleanups; the writer
+/// below parks for [`KEEP_SESSION_WINDOW`] inside its own window instead of
+/// hoping a reader happens to land there, which turns a real-but-tight race into
+/// a deterministic one. Left to chance (no parking) the same replay answered
+/// `false` for 41 of 1600 completed cleanups on an idle 56-core Linux host.
+#[test]
+fn session_global_lock_keeps_keep_session_out_of_other_tests_cleanups() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TOGGLERS: usize = 3;
+    const CLEANERS: usize = 4;
+    const ROUNDS: usize = 10;
+    /// How long a writer holds the process-global flag `true` while a reader is
+    /// free to run: the scheduler does not have to be unlucky for the two to
+    /// overlap.
+    const KEEP_SESSION_WINDOW: std::time::Duration = std::time::Duration::from_millis(2);
+
+    // The writers: replay test_cleanup_completed_respects_keep_session, guard and
+    // all, on their own threads.
+    let mut toggling = Vec::new();
+    for _ in 0..TOGGLERS {
+        toggling.push(std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                let _serial = session_global_test_lock();
+                let dir = temp_marmel();
+                let plan = Plan::at(&dir);
+                plan.create("# Plan\n- [x] [t-001] Done\n").unwrap();
+                set_keep_session(true);
+                std::thread::sleep(KEEP_SESSION_WINDOW);
+                let cleaned = plan.cleanup_completed().unwrap();
+                set_keep_session(false);
+                assert!(!cleaned, "--keep-session must skip cleanup");
+                fs::remove_dir_all(&dir).ok();
+            }
+        }));
+    }
+
+    // The readers: replay test_cleanup_completed_removes_runtime_and_deletes_empty_dir.
+    let missed = Arc::new(AtomicUsize::new(0));
+    let mut cleaning = Vec::new();
+    for _ in 0..CLEANERS {
+        let missed = Arc::clone(&missed);
+        cleaning.push(std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                let _serial = session_global_test_lock();
+                let dir = temp_marmel();
+                let plan = Plan::at(&dir);
+                plan.create("# Plan\n- [ ] [t-001] Task 1\n").unwrap();
+                plan.check_off("t-001").unwrap();
+                fs::create_dir_all(dir.join("prompts")).unwrap();
+                fs::write(dir.join("prompts/t-001.md"), "prompt").unwrap();
+                fs::write(dir.join("marmel.log"), "log line").unwrap();
+                if !plan.cleanup_completed().unwrap() {
+                    missed.fetch_add(1, Ordering::Relaxed);
+                }
+                fs::remove_dir_all(&dir).ok();
+            }
+        }));
+    }
+    for handle in cleaning {
+        handle.join().expect("a cleanup thread panicked");
+    }
+    for handle in toggling {
+        handle.join().expect("a keep_session thread panicked");
+    }
+
+    let missed = missed.load(Ordering::Relaxed);
+    assert_eq!(
+        missed,
+        0,
+        "{missed} of {} completed cleanups were answered `false` by a sibling test's \
+         process-global `KEEP_SESSION` flag — every cleanup test must hold \
+         `session_global_test_lock()` for its whole body",
+        CLEANERS * ROUNDS,
+    );
 }

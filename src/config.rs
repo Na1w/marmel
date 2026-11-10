@@ -341,12 +341,13 @@ pub struct Config {
     /// clamped into it when read (see [`effective_command_timeout_secs`]).
     /// Default [`DEFAULT_COMMAND_TIMEOUT_SECS`] (60 s).
     pub command_timeout_secs: u64,
-    /// Disable the Landlock sandbox re-entry for harness commands.
+    /// Disable the command sandbox re-entry for harness commands (the Landlock
+    /// sandbox on Linux, Seatbelt on macOS and the AppContainer sandbox on Windows).
     ///
     /// Default `false`: the sandbox is **on** and every command is re-entered
     /// through the resolved executable (fail-closed — see
     /// [`crate::harness::sandbox`], which refuses to exec with
-    /// `SANDBOX_REFUSE_EXIT_CODE` when Landlock cannot be enforced).
+    /// `SANDBOX_REFUSE_EXIT_CODE` whenever confinement cannot be established).
     ///
     /// `true` is an explicit, attributable operator opt-out and is equivalent to
     /// the environment fallback `MARMEL_DISABLE_SANDBOX`
