@@ -528,6 +528,8 @@ command = "/path/to/target/release/zim-search"
 args = ["mcp", "--kiwix-dir", "/path/to/kiwix", "--index", "/path/to/index"]
 ```
 
+When registered, `marmel` automatically captures the server's MCP `initialize` `instructions` (alongside any optional `prompt` field on `[mcp_servers.<name>]`) and injects `## MCP Server Guidance` into the Manager, Planner, PromptBuilder, and specialist prompts so offline archive search is prioritized automatically before external web lookups.
+
 ---
 
 ## Security & Sandboxing

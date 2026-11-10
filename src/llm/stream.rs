@@ -170,7 +170,7 @@ impl StreamConfig {
             presence_penalty: cfg.presence_penalty,
             preserve_thinking: cfg.preserve_thinking,
             recovery: false,
-            mcp_servers: cfg.orchestration.mcp_servers.clone(),
+            mcp_servers: cfg.effective_orchestration_mcp_servers(),
             repetition_threshold: mon.repetition_threshold,
             min_pattern_len: mon.min_pattern_len,
             max_stream_tokens: mon.max_stream_tokens,

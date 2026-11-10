@@ -4,7 +4,7 @@
 //! mission decomposition into `.marmel/execution_plan.md`.
 //!
 //! Allowed tool namespaces: `create_plan`, `read_file`, `grep_search`, `glob`,
-//! `rebirth`, `sleep`.
+//! `rebirth`, `sleep`, `kiwix__*`.
 
 use crate::agents::{Agent, Specialist};
 use async_trait::async_trait;
@@ -31,6 +31,7 @@ impl Specialist for Planner {
             crate::tool_names::TOOL_REBIRTH,
             crate::tool_names::TOOL_SLEEP,
             crate::tool_names::TERMINAL_SLEEP,
+            "kiwix__*",
             crate::tool_names::TOOL_REPLY_TO_ARBITRATOR,
         ]
     }

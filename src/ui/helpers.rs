@@ -139,7 +139,8 @@ pub(crate) fn load_system_prompt_with_plan_and_warning(
              and wait for that specialist to complete before delegating the next pending task.\n",
         );
     }
-    let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &cfg.orchestration.mcp_servers);
+    let mcp_servers = cfg.effective_orchestration_mcp_servers();
+    let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &mcp_servers);
     if !mcp_block.is_empty() {
         prompt.push_str(&mcp_block);
     }

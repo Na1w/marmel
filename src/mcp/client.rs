@@ -84,6 +84,8 @@ pub struct StdioMcpConnection {
     /// `shutdown_timeout`-ed leaves the pump parked there forever. Owning the
     /// handle here makes its lifetime bounded by this connection's.
     stderr_pump: Option<tokio::task::JoinHandle<()>>,
+    /// Optional server usage instructions returned during `initialize`.
+    instructions: Option<String>,
 }
 
 impl StdioMcpConnection {
@@ -153,19 +155,28 @@ impl StdioMcpConnection {
             request_ids: RequestIds::new(),
             request_timeout,
             stderr_pump,
+            instructions: None,
         };
 
-        if let Err(err) = protocol::initialize(&mut conn).await {
-            // The handshake never completed, and this connection is on its way out
-            // as an `Err`: tear it down here instead of leaning on drop glue. A
-            // dropped `Child` only *kills* (`kill_on_drop`) and hands the reap to
-            // the runtime's orphan queue — which is a second thing that can go
-            // wrong on a dying runtime, and is exactly the half-booted leak this
-            // whole path is trying to avoid.
-            let _ = conn.shutdown().await;
-            return Err(err);
+        match protocol::initialize(&mut conn).await {
+            Ok(instructions) => conn.instructions = instructions,
+            Err(err) => {
+                // The handshake never completed, and this connection is on its way out
+                // as an `Err`: tear it down here instead of leaning on drop glue. A
+                // dropped `Child` only *kills* (`kill_on_drop`) and hands the reap to
+                // the runtime's orphan queue — which is a second thing that can go
+                // wrong on a dying runtime, and is exactly the half-booted leak this
+                // whole path is trying to avoid.
+                let _ = conn.shutdown().await;
+                return Err(err);
+            }
         }
         Ok(conn)
+    }
+
+    /// Server instructions returned during the `initialize` handshake, if any.
+    pub fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
     }
 }
 
@@ -451,6 +462,8 @@ pub struct McpRegistry {
     clients: HashMap<String, Arc<McpClient>>,
     /// Discovered tools, keyed by `tool.qualified_name()` (unchanged).
     tools: BTreeMap<String, McpTool>,
+    /// Server usage instructions reported in the `initialize` handshake, keyed by server name.
+    server_instructions: HashMap<String, String>,
 }
 
 /// How far the boot of an [`McpManager`] has come: the readiness signal behind
@@ -627,9 +640,12 @@ impl McpManager {
     /// warned (unchanged); `Err(reason)` = the connection failed, with the reason in the
     /// payload form the `Failed` status wants.
     async fn boot_one(&self, name: &str, cfg: &McpServerConfig) -> Result<bool, String> {
-        let client = if cfg.command.is_some() {
+        let (client, instructions) = if cfg.command.is_some() {
             match StdioMcpConnection::spawn(name, cfg).await {
-                Ok(conn) => Arc::new(McpClient::Stdio(Box::new(Mutex::new(conn)))),
+                Ok(conn) => {
+                    let inst = conn.instructions().map(str::to_string);
+                    (Arc::new(McpClient::Stdio(Box::new(Mutex::new(conn)))), inst)
+                }
                 Err(e) => {
                     tracing::warn!("Failed to start MCP server '{name}': {e:#}");
                     return Err(format!("failed to start MCP server '{name}': {e:#}"));
@@ -637,7 +653,10 @@ impl McpManager {
             }
         } else if cfg.url.is_some() {
             match HttpSseConnection::connect(name, cfg).await {
-                Ok(conn) => Arc::new(McpClient::HttpSse(Mutex::new(conn))),
+                Ok(conn) => {
+                    let inst = conn.instructions().map(str::to_string);
+                    (Arc::new(McpClient::HttpSse(Mutex::new(conn))), inst)
+                }
                 Err(e) => {
                     tracing::warn!("Failed to connect to MCP server '{name}': {e:#}");
                     return Err(format!("failed to connect to MCP server '{name}': {e:#}"));
@@ -659,6 +678,9 @@ impl McpManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for tool in &tools {
             registry.tools.insert(tool.qualified_name(), tool.clone());
+        }
+        if let Some(inst) = instructions {
+            registry.server_instructions.insert(name.to_string(), inst);
         }
         registry.clients.insert(name.to_string(), client);
         drop(registry);
@@ -810,6 +832,34 @@ impl McpManager {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         registry.tools.contains_key(name)
+    }
+
+    /// Return the server usage `instructions` reported by `server_name` during its
+    /// `initialize` handshake, if any.
+    pub fn server_instructions(&self, server_name: &str) -> Option<String> {
+        let registry = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.server_instructions.get(server_name).cloned()
+    }
+
+    /// Record or override server usage `instructions` for `server_name` in the
+    /// registry (used by in-memory test fixtures and direct registrations).
+    pub fn set_server_instructions(&self, server_name: &str, instructions: impl Into<String>) {
+        let text = instructions.into();
+        let trimmed = text.trim();
+        let mut registry = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if trimmed.is_empty() {
+            registry.server_instructions.remove(server_name);
+        } else {
+            registry
+                .server_instructions
+                .insert(server_name.to_string(), trimmed.to_string());
+        }
     }
 
     pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<String> {

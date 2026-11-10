@@ -366,13 +366,21 @@ impl PromptBuilder {
             req.snippets.join("\n---\n")
         };
 
+        let mcp_block = crate::config::get_active()
+            .map(|cfg| {
+                let servers = cfg.effective_specialist_mcp_servers(req.agent_name.as_str());
+                crate::prompts::format_mcp_prompt_block(&cfg, &servers)
+            })
+            .unwrap_or_default();
+
         let user_prompt = format!(
-            "### Incoming Delegation Request\n- **Task ID:** {}\n- **Agent Archetype Hint:** {}\n- **Task Brief:**\n{}\n\n- **Context Snippets:**\n{}\n\n{}",
+            "### Incoming Delegation Request\n- **Task ID:** {}\n- **Agent Archetype Hint:** {}\n- **Task Brief:**\n{}\n\n- **Context Snippets:**\n{}\n\n{}{}",
             req.task_id.as_deref().unwrap_or("unassigned"),
             req.agent_name,
             req.prompt,
             snippets_context,
-            catalog_context
+            catalog_context,
+            mcp_block
         );
 
         let chat_req = ChatRequest {
@@ -470,6 +478,12 @@ impl PromptBuilder {
 
     /// Fast, deterministic, zero-network synthesis combining matching catalog skills and archetype defaults.
     pub fn synthesize_offline(catalog: &Catalog, req: &DelegationRequest) -> AgentBlueprint {
+        let active_mcp = crate::config::get_active().map(|cfg| {
+            let servers = cfg.effective_specialist_mcp_servers(req.agent_name.as_str());
+            let block = crate::prompts::format_mcp_prompt_block(&cfg, &servers);
+            (servers, block)
+        });
+
         if req.agent_name == crate::agents::Agent::Planner {
             let role_name = "planner".to_string();
             let mut system_prompt = crate::prompts::PLANNER_PROMPT.to_string();
@@ -477,17 +491,29 @@ impl PromptBuilder {
             system_prompt.push_str(&catalog.format_agents_for_planner());
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&crate::prompts::format_environment_block());
+            let mut allowed_tools = vec![
+                TOOL_READ_FILE.to_string(),
+                TOOL_GREP_SEARCH.to_string(),
+                TOOL_GLOB.to_string(),
+                TOOL_CREATE_PLAN.to_string(),
+                TOOL_REBIRTH.to_string(),
+            ];
+            if let Some((ref servers, ref mcp_block)) = active_mcp {
+                for mcp_tool in crate::harness::allowed_mcp_tools(servers) {
+                    let qname = mcp_tool.qualified_name();
+                    if !allowed_tools.contains(&qname) {
+                        allowed_tools.push(qname);
+                    }
+                }
+                if !mcp_block.is_empty() {
+                    system_prompt.push_str(mcp_block);
+                }
+            }
             return AgentBlueprint {
                 role_name,
                 reasoning: "Strategic Planner configured with AGENTS archetypes and strictly zero micro-skills".to_string(),
                 selected_skills: Vec::new(),
-                allowed_tools: vec![
-                    TOOL_READ_FILE.to_string(),
-                    TOOL_GREP_SEARCH.to_string(),
-                    TOOL_GLOB.to_string(),
-                    TOOL_CREATE_PLAN.to_string(),
-                    TOOL_REBIRTH.to_string(),
-                ],
+                allowed_tools,
                 system_prompt,
                 task_id: req.task_id.clone(),
             };
@@ -566,6 +592,14 @@ impl PromptBuilder {
         if !allowed_tools.iter().any(|t| t == TOOL_REBIRTH) {
             allowed_tools.push(TOOL_REBIRTH.to_string());
         }
+        if let Some((ref servers, _)) = active_mcp {
+            for mcp_tool in crate::harness::allowed_mcp_tools(servers) {
+                let qname = mcp_tool.qualified_name();
+                if !allowed_tools.contains(&qname) {
+                    allowed_tools.push(qname);
+                }
+            }
+        }
 
         let role_name = format!("{}_specialist", req.agent_name.as_str());
         let mut system_prompt = format!(
@@ -595,6 +629,11 @@ impl PromptBuilder {
             "- **TERMINAL MARKERS:** Always conclude with `{MARKER_COMPLETE}` upon successful completion, or `{MARKER_FAILED}: <reason>` if impossible.\n"
         ));
         system_prompt.push_str("- **LANGUAGE:** You MUST respond and deliver in English only.\n");
+        if let Some((_, ref mcp_block)) = active_mcp
+            && !mcp_block.is_empty()
+        {
+            system_prompt.push_str(mcp_block);
+        }
 
         AgentBlueprint {
             role_name,

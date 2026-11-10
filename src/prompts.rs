@@ -57,8 +57,10 @@ pub fn format_environment_block() -> String {
 /// advertised MCP tool guidance for the given `mcp_servers` allowlist.
 ///
 /// Only servers listed in `mcp_servers` (i.e. servers the target agent is allowed
-/// to use) are included. Returns an empty string when `mcp_servers` is empty or
-/// when no matching server has instructions or live tools.
+/// to use) are included. Combines both the server's self-reported `instructions`
+/// from the MCP `initialize` handshake and any optional `prompt` configured in
+/// `marmel.toml`. Returns an empty string when `mcp_servers` is empty or when no
+/// matching server has instructions or live tools.
 pub fn format_mcp_prompt_block(cfg: &crate::config::Config, mcp_servers: &[String]) -> String {
     if mcp_servers.is_empty() {
         return String::new();
@@ -70,6 +72,9 @@ pub fn format_mcp_prompt_block(cfg: &crate::config::Config, mcp_servers: &[Strin
             continue;
         }
         let server_tools = crate::harness::allowed_mcp_tools(std::slice::from_ref(server_name));
+        let server_instructions = crate::harness::mcp_server_instructions(server_name)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let custom_prompt = cfg
             .mcp_servers
             .get(server_name)
@@ -77,7 +82,7 @@ pub fn format_mcp_prompt_block(cfg: &crate::config::Config, mcp_servers: &[Strin
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        if server_tools.is_empty() && custom_prompt.is_none() {
+        if server_tools.is_empty() && server_instructions.is_none() && custom_prompt.is_none() {
             continue;
         }
 
@@ -88,11 +93,16 @@ pub fn format_mcp_prompt_block(cfg: &crate::config::Config, mcp_servers: &[Strin
                 .map(|t| format!("`{}`", t.qualified_name()))
                 .collect();
             block.push_str(&format!(
-                "- Available MCP tools: {}\n",
+                "- Available MCP tools (invoke with `{server_name}__<tool>` prefix): {}\n",
                 tool_names.join(", ")
             ));
         }
-        if let Some(prompt_text) = custom_prompt {
+        if let Some(ref inst) = server_instructions {
+            block.push_str(&format!("- Server instructions: {inst}\n"));
+        }
+        if let Some(prompt_text) = custom_prompt
+            && server_instructions.as_deref() != Some(prompt_text)
+        {
             block.push_str(prompt_text);
             if !prompt_text.ends_with('\n') {
                 block.push('\n');
@@ -103,7 +113,16 @@ pub fn format_mcp_prompt_block(cfg: &crate::config::Config, mcp_servers: &[Strin
     if sections.is_empty() {
         String::new()
     } else {
-        format!("\n## MCP Server Guidance\n{}", sections.join("\n"))
+        format!(
+            "\n## MCP Server Guidance\n\
+             When a configured MCP server below provides domain tools or instructions relevant to a task \
+             (such as local reference archives, documentation indexes, or specialized search):\n\
+             - **Planning (`planner` / `create_plan`):** When formulating `# Execution Plan` (`.marmel/execution_plan.md`), explicitly shape discovery, research, and implementation tasks around the configured MCP servers and their instructions below — write task lines (`- [ ] [t-xxx] ...`) that direct the assigned specialist to query the relevant MCP tools first before external web lookups.\n\
+             - **Delegation (`delegate_task`):** Include the relevant MCP tools and usage workflow in every delegated task brief.\n\
+             - **Specialist Execution (`researcher`, `coder`, `debugger`, `generalist`, `validator`):** **Prefer using these MCP tools first** before falling back to generic shell commands (`curl`) or external web lookups.\n\n\
+             {}",
+            sections.join("\n")
+        )
     }
 }
 
@@ -170,5 +189,39 @@ mod tests {
         assert!(researcher_block.contains("### MCP Server: `kiwix`"));
         assert!(researcher_block.contains("Use kiwix__search first for offline research."));
         assert!(!researcher_block.contains("Other server instructions."));
+    }
+
+    #[tokio::test]
+    async fn test_format_mcp_prompt_block_includes_server_handshake_instructions() {
+        let mgr = std::sync::Arc::new(crate::mcp::McpManager::new());
+        mgr.set_server_instructions(
+            "kiwix",
+            "Local offline ZIM search engine. Prefer search and read_article before web lookups.",
+        );
+        let gate = crate::harness::build_mcp_gate(&mgr);
+
+        let mut cfg = crate::config::Config::default();
+        cfg.mcp_servers.insert(
+            "kiwix".to_string(),
+            crate::mcp::McpServerConfig {
+                command: Some("zim-search".to_string()),
+                prompt: None,
+                ..Default::default()
+            },
+        );
+
+        let servers = cfg.effective_orchestration_mcp_servers();
+        assert_eq!(servers, vec!["kiwix".to_string()]);
+
+        let block =
+            crate::harness::with_mcp_gate(gate, async { format_mcp_prompt_block(&cfg, &servers) })
+                .await;
+        assert!(block.contains("## MCP Server Guidance"));
+        assert!(block.contains("### MCP Server: `kiwix`"));
+        assert!(block.contains(
+            "- Server instructions: Local offline ZIM search engine. Prefer search and read_article before web lookups."
+        ));
+        assert!(block.contains("Planning (`planner` / `create_plan`):"));
+        assert!(block.contains("Prefer using these MCP tools first"));
     }
 }
