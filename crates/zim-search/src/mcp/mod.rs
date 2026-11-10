@@ -80,6 +80,9 @@ const VECTOR_UNAVAILABLE_NOTE: &str = "semantic vectors: NOT generated because t
 const SEMANTIC_OPT_IN_UNSUPPORTED: &str =
     "Semantic vector indexing is not available in this build: recompile with `cargo build --features semantic`.";
 
+/// Server usage instructions advertised in the MCP `initialize` response.
+pub const MCP_SERVER_INSTRUCTIONS: &str = "Local offline ZIM & Tantivy BM25 search engine over indexed knowledge archives (Wikipedia, StackOverflow, Linux/Arch wikis, documentation, Gutenberg, etc.). Always prefer querying this server FIRST for research, documentation, specifications, algorithms, and reference lookups before falling back to external web lookups or curl. Workflow: call `list_archives` to inspect available archives, `search` (fast BM25 lexical search; pass `archive` from `list_archives` to target a specific archive or omit `archive` to search across all archives), and `read_article` (paginated via `offset_chars` and `limit_chars`) as your primary reference source.";
+
 /// JSON-RPC 2.0 Request representation.
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -173,7 +176,7 @@ pub fn run_mcp_server(manager: ArchiveManager, auto_index: bool) -> Result<()> {
                             "name": "zim-search",
                             "version": "0.1.0"
                         },
-                        "instructions": "Local offline ZIM & Tantivy BM25 search engine over indexed knowledge archives (Wikipedia, StackOverflow, Linux/Arch wikis, Gutenberg, etc.). Prefer `search` (fast BM25 lexical search; pass `archive` from `list_archives` to target a specific archive or omit `archive` to search across all archives) and `read_article` (paginated via `offset_chars` and `limit_chars`) as your primary reference source before external web lookups."
+                        "instructions": MCP_SERVER_INSTRUCTIONS
                     }
                 });
                 send_response(&mut stdout, &response)?;

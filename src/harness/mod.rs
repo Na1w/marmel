@@ -473,8 +473,20 @@ pub fn allowed_mcp_tools(servers: &[String]) -> Vec<crate::mcp::McpTool> {
     gate.manager
         .tools_for_servers(servers)
         .into_iter()
-        .filter(|tool| gate.allowed.contains(tool.qualified_name().as_str()))
+        .filter(|tool| {
+            let qname = tool.qualified_name();
+            gate.allowed.contains(qname.as_str()) || gate.live_registry_serves(qname.as_str())
+        })
         .collect()
+}
+
+/// Return the usage `instructions` reported by `server_name` during its MCP
+/// `initialize` handshake, if `server_name` is policy-valid and present in the
+/// active MCP registry.
+pub fn mcp_server_instructions(server_name: &str) -> Option<String> {
+    crate::mcp::validate_server_name(server_name).ok()?;
+    let gate = current_mcp_gate()?;
+    gate.manager.server_instructions(server_name)
 }
 
 /// Resolve the (`gate`, `manager`) pair that owns `name` for dispatch (see

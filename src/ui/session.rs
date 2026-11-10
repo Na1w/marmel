@@ -203,7 +203,7 @@ pub fn build_manager_context(cfg: &Config, system_prompt: String) -> ContextEngi
 /// carry.
 pub fn sync_manager_tool_schema(ctx: &mut ContextEngine, cfg: &Config) -> usize {
     let previous = ctx.tool_schema_tokens();
-    let advertised = manager_wire_tools(&cfg.orchestration.mcp_servers);
+    let advertised = manager_wire_tools(&cfg.effective_orchestration_mcp_servers());
     ctx.set_tools(&advertised);
     let charged = ctx.tool_schema_tokens();
     if previous != charged {
@@ -1987,6 +1987,21 @@ pub async fn run_session_with_bounds_report(
     renderer.init()?;
     renderer.set_thinking_budgets(cfg);
     crate::debug_log::log_session_start(cfg, &cfg.ui_mode);
+
+    if !cfg.mcp_servers.is_empty()
+        && let Some(mcp_mgr) = crate::harness::get_mcp_manager()
+    {
+        if !mcp_mgr.is_ready() {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                mcp_mgr.await_ready(),
+            )
+            .await;
+        }
+        if mcp_mgr.is_ready() {
+            crate::harness::set_mcp_manager(mcp_mgr);
+        }
+    }
 
     let plan = manager.as_ref().map(|m| m.plan.clone()).unwrap_or_default();
 

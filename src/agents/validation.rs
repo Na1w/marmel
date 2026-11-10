@@ -431,13 +431,7 @@ async fn run_automated_validation_inner(
         .get(Agent::Validator.as_str())
         .map(|vc| vc.mcp_servers.clone())
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            cfg.orchestration
-                .specialists
-                .get(agent.as_str())
-                .map(|sc| sc.mcp_servers.clone())
-        })
-        .unwrap_or_default();
+        .unwrap_or_else(|| cfg.effective_specialist_mcp_servers(agent.as_str()));
 
     let mut full_validator_prompt = validator_prompt.to_string();
     let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &mcp_servers);
@@ -638,8 +632,23 @@ async fn run_plan_validation_inner(
         plan_markdown
     );
 
-    // The plan auditor checks the plan against the project rules (AGENTS.md) too.
+    let mcp_servers = validator_cfg
+        .map(|vc| vc.mcp_servers.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            planner_cfg
+                .map(|sc| sc.mcp_servers.clone())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| cfg.effective_specialist_mcp_servers(Agent::Planner.as_str()));
+
+    // The plan auditor checks the plan against the project rules (AGENTS.md) and
+    // configured MCP server guidance too.
     let mut plan_auditor_prompt = validator_prompt.to_string();
+    let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &mcp_servers);
+    if !mcp_block.is_empty() {
+        plan_auditor_prompt.push_str(&mcp_block);
+    }
     if let Some(instructions) =
         crate::agents::load_project_instructions(&crate::harness::get_workspace_root())
     {
@@ -653,11 +662,6 @@ async fn run_plan_validation_inner(
     let val_entry = registry
         .resolve(Agent::Validator)
         .expect("validator is registered");
-    let mcp_servers = validator_cfg
-        .map(|vc| vc.mcp_servers.clone())
-        .filter(|s| !s.is_empty())
-        .or_else(|| planner_cfg.map(|sc| sc.mcp_servers.clone()))
-        .unwrap_or_default();
     let plan_audit_tools = vec![
         crate::tool_names::TOOL_READ_FILE.to_string(),
         crate::tool_names::TOOL_GREP_SEARCH.to_string(),

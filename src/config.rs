@@ -464,6 +464,50 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Active MCP server names registered under `[mcp_servers.<name>]` that declare a
+    /// transport (`command` or `url`) or custom `prompt`, sorted deterministically.
+    pub fn registered_mcp_server_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .mcp_servers
+            .iter()
+            .filter(|(_, sc)| {
+                sc.command.as_deref().is_some_and(|s| !s.trim().is_empty())
+                    || sc.url.as_deref().is_some_and(|s| !s.trim().is_empty())
+                    || sc.prompt.as_deref().is_some_and(|s| !s.trim().is_empty())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Effective MCP server allowlist for the Manager / Orchestrator:
+    /// uses `orchestration.mcp_servers` when explicitly non-empty, otherwise
+    /// defaults to all active registered `[mcp_servers.<name>]` entries.
+    pub fn effective_orchestration_mcp_servers(&self) -> Vec<String> {
+        if !self.orchestration.mcp_servers.is_empty() {
+            self.orchestration.mcp_servers.clone()
+        } else {
+            self.registered_mcp_server_names()
+        }
+    }
+
+    /// Effective MCP server allowlist for a specialist role (`coder`, `researcher`,
+    /// `debugger`, `validator`, `generalist`, `planner`):
+    /// 1. `orchestration.specialists.<role>.mcp_servers` when explicitly non-empty;
+    /// 2. `effective_orchestration_mcp_servers()` (which itself falls back to all
+    ///    registered `[mcp_servers.<name>]` entries).
+    pub fn effective_specialist_mcp_servers(&self, role: &str) -> Vec<String> {
+        if let Some(sc) = self.orchestration.specialists.get(role)
+            && !sc.mcp_servers.is_empty()
+        {
+            return sc.mcp_servers.clone();
+        }
+        self.effective_orchestration_mcp_servers()
+    }
+}
+
 static ACTIVE_CONFIG: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
 
 pub fn set_active(cfg: Config) {
@@ -3575,6 +3619,46 @@ session_max_bundle_bytes = 4096
                     .mcp_servers,
                 vec!["kiwix".to_string()],
                 "{role} must allowlist kiwix"
+            );
+        }
+        assert_eq!(
+            cfg.effective_specialist_mcp_servers("planner"),
+            vec!["kiwix".to_string()],
+            "planner must inherit kiwix from orchestration.mcp_servers even without a [orchestration.specialists.planner] block"
+        );
+    }
+
+    #[test]
+    fn registering_an_mcp_server_automatically_enables_it_when_allowlists_are_omitted() {
+        let toml_str = r#"
+            [mcp_servers.kiwix]
+            command = "zim-search"
+            args = ["mcp"]
+        "#;
+        let partial: PartialConfig = toml::from_str(toml_str).unwrap();
+        let cfg = merge(Config::default(), partial);
+
+        assert!(
+            cfg.orchestration.mcp_servers.is_empty(),
+            "raw orchestration.mcp_servers stays empty when omitted in TOML"
+        );
+        assert_eq!(
+            cfg.effective_orchestration_mcp_servers(),
+            vec!["kiwix".to_string()],
+            "effective_orchestration_mcp_servers defaults to registered [mcp_servers.<name>]"
+        );
+        for role in [
+            "coder",
+            "researcher",
+            "debugger",
+            "validator",
+            "generalist",
+            "planner",
+        ] {
+            assert_eq!(
+                cfg.effective_specialist_mcp_servers(role),
+                vec!["kiwix".to_string()],
+                "{role} must automatically receive registered MCP servers when no per-role allowlist is set"
             );
         }
     }

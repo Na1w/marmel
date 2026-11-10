@@ -42,23 +42,20 @@ placeholder used elsewhere in this file. The legal keys of a server table are ex
 
 - Tools reach agents qualified as `<server>__<tool>`: `kiwix__search`, `kiwix__read_article`,
   `kiwix__list_archives`, `kiwix__list_articles`, `kiwix__index_archive`, `kiwix__get_archive_info`.
-- A role's `tools` list never grants an MCP tool. Only `orchestration.mcp_servers` (the Manager) and
-  `specialists.<role>.mcp_servers` (a specialist) do. The example allowlists `kiwix` for the Manager
-  (line 143) and for the five specialist blocks it ships — `coder`, `debugger`, `researcher`, `validator`
-  and `generalist` (lines 192, 222, 234, 244, 253); there is no `[orchestration.specialists.planner]`
-  block in the example.
-- The built-in archetypes carry a literal `kiwix__*` wildcard for `coder` (`src/agents/coder.rs:39`),
-  `researcher` (`src/agents/researcher.rs:38`), `debugger` (`src/agents/debugger.rs:42`) and `validator`
-  (`src/agents/validator.rs:65`); `generalist` has `*` (`src/agents/generalist.rs:23`) and the `planner`
-  roster (`src/agents/planner.rs:25-35`) carries no `kiwix__*` entry at all.
-- Both halves are required: the roster wildcard only admits the *names* — the tools exist only when a
-  server named `kiwix` is registered **and** an allowlist names it.
+- When `[mcp_servers.<name>]` is registered, `Config::effective_orchestration_mcp_servers` and
+  `Config::effective_specialist_mcp_servers` automatically enable registered MCP servers when no explicit
+  `orchestration.mcp_servers` or `specialists.<role>.mcp_servers` filter is set, and roles without their
+  own `mcp_servers` key (such as `planner`) inherit `orchestration.mcp_servers`.
+- The built-in archetypes carry a `kiwix__*` wildcard for `coder`, `researcher`, `debugger`, `validator`
+  and `planner`, while `generalist` has `*`.
 
 ### Discovery and lifecycle
 
-- For a registered, allowlisted server, marmel injects a `## MCP Server Guidance` block into the subagent
-  prompt (`format_mcp_prompt_block`, `src/prompts.rs:48-94`) listing the qualified tool names and any
-  per-server `prompt` text — that is how an agent learns the offline corpus exists.
+- During the MCP `initialize` handshake, `zim-search` returns `MCP_SERVER_INSTRUCTIONS` in `result.instructions`,
+  which `marmel` captures in `McpRegistry` and injects via `format_mcp_prompt_block` (`src/prompts.rs`)
+  together with the qualified tool names and any optional per-server `prompt` text from `marmel.toml` —
+  so the Manager, Planner, PromptBuilder, and specialists automatically know to query the offline corpus
+  before external web lookups.
 - Servers boot at startup (`src/main.rs:399-434`, `src/mcp/client.rs:559-666`): stdio talks line-delimited
   JSON-RPC with a 30 s deadline, `url` entries use HTTP/SSE. A boot failure warns and is non-fatal.
 

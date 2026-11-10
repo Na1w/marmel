@@ -239,6 +239,8 @@ pub struct HttpSseConnection {
     /// ([`super::protocol::RequestIds`]); the transport only carries it.
     request_ids: RequestIds,
     request_timeout: Duration,
+    /// Optional server usage instructions returned during `initialize`.
+    instructions: Option<String>,
 }
 
 /// One JSON-RPC request attempt, run once per retry by [`retry_with_backoff`].
@@ -383,10 +385,16 @@ impl HttpSseConnection {
             session_id: None,
             request_ids: RequestIds::new(),
             request_timeout,
+            instructions: None,
         };
 
-        protocol::initialize(&mut conn).await?;
+        conn.instructions = protocol::initialize(&mut conn).await?;
         Ok(conn)
+    }
+
+    /// Server instructions returned during the `initialize` handshake, if any.
+    pub fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
     }
 
     /// One wire-level POST: send the protocol-built envelope, then read the

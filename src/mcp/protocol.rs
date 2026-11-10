@@ -408,15 +408,27 @@ pub(crate) trait JsonRpcTransport {
 
 // ── The protocol operations, written once ─────────────────────────────────
 
+/// Extract the optional `instructions` guidance string from an `initialize` result.
+pub(crate) fn parse_initialize_instructions(result: &Value) -> Option<String> {
+    result
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Run the MCP handshake: `initialize` (reserved id) followed by
-/// `notifications/initialized`.
-pub(crate) async fn initialize<T: JsonRpcTransport>(transport: &mut T) -> Result<()> {
-    let _result = transport
+/// `notifications/initialized`. Returns the server's optional `instructions`
+/// field from the handshake result.
+pub(crate) async fn initialize<T: JsonRpcTransport>(transport: &mut T) -> Result<Option<String>> {
+    let result = transport
         .send_request(&JsonRpcRequest::initialize())
         .await?;
     transport
         .send_notification(&JsonRpcNotification::initialized())
-        .await
+        .await?;
+    Ok(parse_initialize_instructions(&result))
 }
 
 /// `tools/list`: allocate an id, send the envelope, decode the tool list.
@@ -773,5 +785,31 @@ mod tests {
                 r#""params":{"arguments":{"city":"Oslo"},"name":"alpha"}}"#
             )
         );
+    }
+
+    #[tokio::test]
+    async fn initialize_extracts_server_instructions_when_present() {
+        let mut with_inst = RecordingTransport::new(json!({
+            "protocolVersion": "2024-11-05",
+            "instructions": "  Prefer search and read_article first.  "
+        }));
+        let got = initialize(&mut with_inst).await.expect("handshake");
+        assert_eq!(
+            got.as_deref(),
+            Some("Prefer search and read_article first.")
+        );
+
+        let mut blank_inst = RecordingTransport::new(json!({
+            "protocolVersion": "2024-11-05",
+            "instructions": "   "
+        }));
+        assert_eq!(
+            initialize(&mut blank_inst).await.expect("handshake"),
+            None,
+            "blank instructions must normalize to None"
+        );
+
+        let mut no_inst = RecordingTransport::new(json!({"protocolVersion": "2024-11-05"}));
+        assert_eq!(initialize(&mut no_inst).await.expect("handshake"), None);
     }
 }

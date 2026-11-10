@@ -284,9 +284,7 @@ async fn run_specialist_live_inner(
     // wildcard registry namespace such as the Generalist's `"*"` — while
     // [`Agent::Validator`] keeps its verdict tool. The dispatcher-side check below
     // stays as the second line of defence.
-    let mcp_servers = specialist_cfg
-        .map(|sc| sc.mcp_servers.clone())
-        .unwrap_or_default();
+    let mcp_servers = cfg.effective_specialist_mcp_servers(agent.as_str());
     let tools = specialist_advertised_tools(&caller, |name| reg_entry.allows(name), &mcp_servers);
 
     let mut advertised_names = if let Some(ref bp) = ctx.blueprint {
@@ -336,7 +334,7 @@ async fn run_specialist_live_inner(
         enhanced_system_prompt.push_str(custom_specialist_prompt);
     }
     let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &mcp_servers);
-    if !mcp_block.is_empty() {
+    if !mcp_block.is_empty() && !enhanced_system_prompt.contains("## MCP Server Guidance") {
         enhanced_system_prompt.push_str(&mcp_block);
     }
     // The workspace's git state, read from the filesystem only (never by shelling
