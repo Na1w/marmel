@@ -549,13 +549,21 @@ pub fn mirror_collapse_here(engine: &ContextEngine) {
 /// `status` is control state; an unrecognized label is `Unknown`, never a coerced
 /// class).
 pub fn project_status(state: &WorkerState) -> WorkerStatus {
+    // Explicitly aborted, failed or interrupted workers are terminal: they must
+    // never project as InProgress, even if completed_seq was not yet drawn.
+    match state.info.status.as_str() {
+        label if label.starts_with("Aborted") => return WorkerStatus::Aborted,
+        label if label.starts_with("Failed") => return WorkerStatus::Failed,
+        label if label.starts_with("Interrupted") || label == INTERRUPTED_STATUS_LABEL => {
+            return WorkerStatus::Aborted;
+        }
+        _ => {}
+    }
     if state.completed_seq.is_none() {
         return WorkerStatus::InProgress;
     }
     match state.info.status.as_str() {
         "Completed" => WorkerStatus::Completed,
-        label if label.starts_with("Failed") => WorkerStatus::Failed,
-        label if label.starts_with("Aborted") => WorkerStatus::Aborted,
         "Approved" | "Approved (validated)" => WorkerStatus::Completed,
         _ => WorkerStatus::Unknown,
     }
@@ -805,6 +813,19 @@ fn install_one_worker(
 
     match section.status {
         WorkerStatus::InProgress | WorkerStatus::Unknown => {
+            // An intentionally aborted worker must never be restored as an open/active worker.
+            if section.status_label.starts_with("Aborted") {
+                workers::retire_restored_worker(&key, &section.status_label);
+                report.push_notice(NonRestorableNotice {
+                    kind: NonRestorableKind::Other,
+                    subject: key.clone(),
+                    detail: format!(
+                        "worker {key} had been intentionally aborted; it is closed and retired"
+                    ),
+                });
+                return Some(InstallOutcome::Terminal);
+            }
+
             // Keep the entry open (`completed_seq: None`) so
             // `has_active_workers()` and every cancel path still see it, and label
             // it as interrupted. A fresh token is minted here (minting is permitted

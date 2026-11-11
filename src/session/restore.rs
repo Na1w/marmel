@@ -1659,7 +1659,11 @@ fn announce_repairs(member: &str, subject: &str, norm: &NormalizeReport, healed:
     }
     tracing::warn!("{}", repair_sentence(member, norm));
     for rule in &norm.applied {
-        tracing::warn!("{}", rule_sentence(rule, subject, healed));
+        if rule.rule == AppliedRule::N2_REGROUP {
+            tracing::debug!("{}", rule_sentence(rule, subject, healed));
+        } else {
+            tracing::warn!("{}", rule_sentence(rule, subject, healed));
+        }
     }
 }
 

@@ -318,13 +318,21 @@ impl Renderer for RawRenderer {
                 report.workers_unrecoverable.len()
             ),
         );
-        for notice in &report.notices {
+        for notice in report
+            .notices
+            .iter()
+            .filter(|n| crate::session::format::is_actionable_restore_notice(n))
+        {
             self.push_line(
                 "restore-lost",
                 &format!("{:?}: {}: {}", notice.kind, notice.subject, notice.detail),
             );
         }
-        for warning in &report.warnings {
+        for warning in report
+            .warnings
+            .iter()
+            .filter(|w| crate::session::format::is_actionable_restore_warning(w))
+        {
             self.push_line("restore-warning", warning);
         }
         tracing::warn!(

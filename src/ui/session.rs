@@ -1500,16 +1500,23 @@ pub fn boot(
         }
     );
     let mut journal_lines = vec![summary.clone()];
-    journal_lines.extend(repair.notices.iter().map(|notice| {
-        format!(
-            "Not restorable after restart [{:?}] {}: {}",
-            notice.kind, notice.subject, notice.detail
-        )
-    }));
+    journal_lines.extend(
+        repair
+            .notices
+            .iter()
+            .filter(|n| crate::session::format::is_actionable_restore_notice(n))
+            .map(|notice| {
+                format!(
+                    "Not restorable after restart [{:?}] {}: {}",
+                    notice.kind, notice.subject, notice.detail
+                )
+            }),
+    );
     journal_lines.extend(
         repair
             .warnings
             .iter()
+            .filter(|w| crate::session::format::is_actionable_restore_warning(w))
             .map(|warning| format!("Restore warning: {warning}")),
     );
     journal_restore_lines(sink, &journal_lines);

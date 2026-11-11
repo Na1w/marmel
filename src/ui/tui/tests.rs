@@ -2767,6 +2767,47 @@ fn announce_restore_surfaces_every_report_field_in_the_ui() {
 }
 
 #[test]
+fn announce_restore_filters_out_internal_bookkeeping_noise() {
+    let mut r = TuiRenderer::new();
+    let report = crate::session::format::RepairReport {
+        ui_lines_restored: 10,
+        workers_restored: 1,
+        notices: vec![
+            crate::session::format::NonRestorableNotice {
+                kind: crate::session::format::NonRestorableKind::ToolSchemaCharge,
+                subject: "session".to_string(),
+                detail: "re-declared tool schema".to_string(),
+            },
+            crate::session::format::NonRestorableNotice {
+                kind: crate::session::format::NonRestorableKind::HarnessStats,
+                subject: "session".to_string(),
+                detail: "counters restarted".to_string(),
+            },
+        ],
+        warnings: vec![
+            "regrouped tool result call_123 from message index 10 to 11 (worker coder)".to_string(),
+            "the system prompt this process composed was NOT installed: [0]/[1] keep the restored bytes".to_string(),
+            "worker coder-1: history 20 -> 21".to_string(),
+            "genuine warning: thinking budget drifted".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    r.announce_restore(&report);
+
+    let joined = r.messages.join("\n");
+    // Noise is suppressed
+    assert!(!joined.contains("ToolSchemaCharge"));
+    assert!(!joined.contains("HarnessStats"));
+    assert!(!joined.contains("regrouped tool result"));
+    assert!(!joined.contains("the system prompt this process composed was NOT installed"));
+    assert!(!joined.contains("history 20 -> 21"));
+
+    // Real warning is surfaced
+    assert!(joined.contains("[CLI] Restore warning: genuine warning: thinking budget drifted"));
+}
+
+#[test]
 fn announce_restore_with_an_empty_report_still_states_the_restore() {
     let mut r = TuiRenderer::new();
     r.announce_restore(&crate::session::format::RepairReport::default());
@@ -4493,14 +4534,22 @@ fn theme_glyphs_are_the_spec_table_and_the_picker_follows_row_state() {
     // decides the terminal states — and the slot states still outrank the label.
     for label in [
         "Aborted",
+        "Aborted (preempted by steering instruction)",
         "Rejected",
         "Failed",
         "Replan Required (too complex)",
+        "Interrupted by restart",
+        "Retired after restart",
     ] {
         assert_eq!(
             theme::worker_state_glyph(false, false, false, Some(label)),
             Glyph::Failed,
             "{label} is a worker that did not deliver (§7.2 `✗`)"
+        );
+        assert_eq!(
+            theme::worker_state_glyph(true, false, false, Some(label)),
+            Glyph::Failed,
+            "{label} must map to Failed even if projected is_active was true"
         );
     }
     assert_eq!(

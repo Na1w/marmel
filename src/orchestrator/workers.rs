@@ -374,6 +374,7 @@ pub fn retire_restored_worker(worker_key: &str, status_label: &str) -> Option<u6
     ACTIVE_GUARD_REFS.remove(worker_key);
     evict_completed_ring();
     super::notice::reclaim_worker_inbox(worker_key);
+    crate::ui::session::mark_worker_lifecycle_edge();
     seq
 }
 

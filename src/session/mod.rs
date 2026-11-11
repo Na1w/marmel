@@ -51,7 +51,8 @@ pub use format::envelope::{
 pub use format::messages::{MessageRecord, ToolCallRecord, ToolFunctionRecord};
 pub use format::restore::{
     NonRestorableKind, NonRestorableNotice, PinStage, Refusal, RefusalCode, RepairReport,
-    RestoreOutcome, RestoredSession, WorkerRepairCounts,
+    RestoreOutcome, RestoredSession, WorkerRepairCounts, is_actionable_restore_notice,
+    is_actionable_restore_warning,
 };
 pub use format::ui::{
     BudgetWitness, ComposerState, SubagentPanel, UiFile, UiJournalRecord, UiSection, ViewState,
