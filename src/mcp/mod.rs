@@ -23,7 +23,10 @@ pub mod http;
 mod http_tests;
 mod protocol;
 
-pub use client::{McpBootStatus, McpClient, McpManager, McpRegistry, McpServerConfig, McpTool};
+pub use client::{
+    DEFAULT_MCP_IDLE_TIMEOUT, McpBootStatus, McpClient, McpManager, McpRegistry, McpServerConfig,
+    McpTool, ServerSlot,
+};
 pub use http::HttpSseConnection;
 
 /// The separator that composes an MCP server name with a raw tool name

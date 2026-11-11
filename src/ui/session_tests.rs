@@ -4627,6 +4627,7 @@ fn boot_manager_naming(servers: &[&str]) -> std::sync::Arc<crate::mcp::McpManage
                 env: std::collections::HashMap::new(),
                 url: None,
                 prompt: None,
+                ..Default::default()
             },
         );
     }
@@ -4706,6 +4707,7 @@ async fn a_boot_that_refused_every_server_names_the_first_refusal_it_met() {
             env: std::collections::HashMap::new(),
             url: None,
             prompt: None,
+            ..Default::default()
         },
     );
     let handle = tokio::runtime::Handle::current();
