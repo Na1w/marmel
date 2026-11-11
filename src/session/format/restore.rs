@@ -334,3 +334,84 @@ pub fn witness_of(messages: &[MessageRecord]) -> Option<PinWitness> {
         goal_len,
     })
 }
+
+/// Returns true if this warning is actionable and significant enough to surface
+/// to an operator in interactive UI / chat transcripts, rather than being an internal
+/// bookkeeping detail (such as mechanical message index shifts during normalization,
+/// redundant count sentences, or the expected preservation of the session's pinned system prompt).
+pub fn is_actionable_restore_warning(warning: &str) -> bool {
+    // Noise: mechanical re-indexing of messages after placeholder synthesis/prune
+    if warning.starts_with("regrouped tool result ") {
+        return false;
+    }
+    // Noise: normal behavior across restart (keeping the session's pinned system prompt)
+    if warning.starts_with("the system prompt this process composed was NOT installed") {
+        return false;
+    }
+    // Noise: per-worker count line (already covered by worker_counts summary)
+    if warning.starts_with("worker ") && warning.contains(": history ") {
+        return false;
+    }
+    true
+}
+
+/// Returns true if this non-restorable notice is actionable and significant to surface
+/// in interactive UI / chat transcripts. Ephemeral internal memory state like tool schema pricing
+/// and harness stats are normal startup operations across process boundaries.
+pub fn is_actionable_restore_notice(notice: &NonRestorableNotice) -> bool {
+    !matches!(
+        notice.kind,
+        NonRestorableKind::ToolSchemaCharge | NonRestorableKind::HarnessStats
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actionable_restore_filters_noise() {
+        assert!(!is_actionable_restore_warning(
+            "regrouped tool result call_123 from message index 10 to 11 (worker coder)"
+        ));
+        assert!(!is_actionable_restore_warning(
+            "the system prompt this process composed was NOT installed: [0]/[1] keep the restored bytes"
+        ));
+        assert!(!is_actionable_restore_warning(
+            "worker coder-1: history 20 -> 21"
+        ));
+
+        // Genuine warnings must remain actionable
+        assert!(is_actionable_restore_warning(
+            "thinking budget drifted: 8000 -> 4000"
+        ));
+        assert!(is_actionable_restore_warning(
+            "unrecoverable worker 'coder-1' carried no completed_seq"
+        ));
+        assert!(is_actionable_restore_warning(
+            "tool_call_id call_xyz was dispatched but never answered"
+        ));
+
+        // Ephemeral notices are filtered, real losses stay
+        assert!(!is_actionable_restore_notice(&NonRestorableNotice {
+            kind: NonRestorableKind::ToolSchemaCharge,
+            subject: "session".to_string(),
+            detail: "re-declared tool schema".to_string(),
+        }));
+        assert!(!is_actionable_restore_notice(&NonRestorableNotice {
+            kind: NonRestorableKind::HarnessStats,
+            subject: "session".to_string(),
+            detail: "counters restarted".to_string(),
+        }));
+        assert!(is_actionable_restore_notice(&NonRestorableNotice {
+            kind: NonRestorableKind::JoinHandle,
+            subject: "coder".to_string(),
+            detail: "no task exists to join".to_string(),
+        }));
+        assert!(is_actionable_restore_notice(&NonRestorableNotice {
+            kind: NonRestorableKind::PtyProcess,
+            subject: "coder".to_string(),
+            detail: "PTY may still be running".to_string(),
+        }));
+    }
+}

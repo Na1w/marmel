@@ -2767,6 +2767,47 @@ fn announce_restore_surfaces_every_report_field_in_the_ui() {
 }
 
 #[test]
+fn announce_restore_filters_out_internal_bookkeeping_noise() {
+    let mut r = TuiRenderer::new();
+    let report = crate::session::format::RepairReport {
+        ui_lines_restored: 10,
+        workers_restored: 1,
+        notices: vec![
+            crate::session::format::NonRestorableNotice {
+                kind: crate::session::format::NonRestorableKind::ToolSchemaCharge,
+                subject: "session".to_string(),
+                detail: "re-declared tool schema".to_string(),
+            },
+            crate::session::format::NonRestorableNotice {
+                kind: crate::session::format::NonRestorableKind::HarnessStats,
+                subject: "session".to_string(),
+                detail: "counters restarted".to_string(),
+            },
+        ],
+        warnings: vec![
+            "regrouped tool result call_123 from message index 10 to 11 (worker coder)".to_string(),
+            "the system prompt this process composed was NOT installed: [0]/[1] keep the restored bytes".to_string(),
+            "worker coder-1: history 20 -> 21".to_string(),
+            "genuine warning: thinking budget drifted".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    r.announce_restore(&report);
+
+    let joined = r.messages.join("\n");
+    // Noise is suppressed
+    assert!(!joined.contains("ToolSchemaCharge"));
+    assert!(!joined.contains("HarnessStats"));
+    assert!(!joined.contains("regrouped tool result"));
+    assert!(!joined.contains("the system prompt this process composed was NOT installed"));
+    assert!(!joined.contains("history 20 -> 21"));
+
+    // Real warning is surfaced
+    assert!(joined.contains("[CLI] Restore warning: genuine warning: thinking budget drifted"));
+}
+
+#[test]
 fn announce_restore_with_an_empty_report_still_states_the_restore() {
     let mut r = TuiRenderer::new();
     r.announce_restore(&crate::session::format::RepairReport::default());

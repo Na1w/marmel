@@ -2928,13 +2928,21 @@ impl Renderer for TuiRenderer {
     /// the journaled `UiRecord::Status`, is written by the transcript owner
     /// (`ui::session`), which is the only place that holds a `UiTranscript`.
     fn announce_restore(&mut self, report: &crate::session::format::RepairReport) {
-        for notice in &report.notices {
+        for notice in report
+            .notices
+            .iter()
+            .filter(|n| crate::session::format::is_actionable_restore_notice(n))
+        {
             self.messages.push(format!(
                 "[CLI] Not restorable after restart [{:?}] {}: {}",
                 notice.kind, notice.subject, notice.detail
             ));
         }
-        for warning in &report.warnings {
+        for warning in report
+            .warnings
+            .iter()
+            .filter(|w| crate::session::format::is_actionable_restore_warning(w))
+        {
             self.messages
                 .push(format!("[CLI] Restore warning: {warning}"));
         }

@@ -24,7 +24,8 @@ pub use envelope::{
 pub use messages::{MessageRecord, ToolCallRecord, ToolFunctionRecord};
 pub use restore::{
     NonRestorableKind, NonRestorableNotice, NormalizeReport, PinStage, Refusal, RefusalCode,
-    RepairReport, RestoreOutcome, RestoredSession, WorkerRepairCounts, witness_of,
+    RepairReport, RestoreOutcome, RestoredSession, WorkerRepairCounts,
+    is_actionable_restore_notice, is_actionable_restore_warning, witness_of,
 };
 pub use ui::{
     BudgetWitness, ComposerState, FOCUSED_PANELS, QueuePanel, SubagentPanel, UiFile,
