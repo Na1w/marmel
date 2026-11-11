@@ -184,6 +184,14 @@ pub(crate) fn control_subagent(
         } else {
             format!("Resume requested for {key}; the same task continues.")
         })),
-        Err(message) => Ok(ToolResult::err(message)),
+        Err(message) => {
+            if paused && crate::session::retire_interrupted_worker(key).is_some() {
+                Ok(ToolResult::ok(format!(
+                    "Subagent '{key}' was not actively running (interrupted or already finished). It has been retired and cleared from the active registry."
+                )))
+            } else {
+                Ok(ToolResult::err(message))
+            }
+        }
     }
 }

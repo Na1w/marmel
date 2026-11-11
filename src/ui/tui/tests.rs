@@ -4493,14 +4493,22 @@ fn theme_glyphs_are_the_spec_table_and_the_picker_follows_row_state() {
     // decides the terminal states — and the slot states still outrank the label.
     for label in [
         "Aborted",
+        "Aborted (preempted by steering instruction)",
         "Rejected",
         "Failed",
         "Replan Required (too complex)",
+        "Interrupted by restart",
+        "Retired after restart",
     ] {
         assert_eq!(
             theme::worker_state_glyph(false, false, false, Some(label)),
             Glyph::Failed,
             "{label} is a worker that did not deliver (§7.2 `✗`)"
+        );
+        assert_eq!(
+            theme::worker_state_glyph(true, false, false, Some(label)),
+            Glyph::Failed,
+            "{label} must map to Failed even if projected is_active was true"
         );
     }
     assert_eq!(

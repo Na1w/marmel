@@ -73,7 +73,10 @@ where
     loop {
         tokio::select! {
             biased;
-            out = &mut work => return out,
+            out = &mut work => {
+                pump_subagent_panel(rows, renderer);
+                return out;
+            }
             _ = tokio::time::sleep(PANEL_PUMP_INTERVAL) => {
                 pump_subagent_panel(rows, renderer);
             }
@@ -358,6 +361,7 @@ impl StreamSink for RendererSink<'_> {
                         task: Some(task_id.clone()),
                     },
                 ));
+                pump_subagent_panel(&mut *self.subagents, &mut *self.renderer);
                 self.renderer.reset_active_agent();
                 self.renderer.on_event(&Event::Message(format!(
                     "\n[Steering Subtask — {} ({})]\n{}\n{}\n",

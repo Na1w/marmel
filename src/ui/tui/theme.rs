@@ -795,8 +795,15 @@ pub const fn worker_glyph(is_active: bool, paused: bool, queued: bool) -> Glyph 
 /// Terminal status labels that mean "this worker did not deliver" (§7.2 `✗`).
 /// Matched against the leading word of `WorkerEntry::status_label`, the vocabulary
 /// the runner and the review loop actually write: `Aborted`, `Rejected`, `Failed`,
-/// `Replan Required (…)`.
-const FAILED_STATUS_LABELS: [&str; 4] = ["aborted", "failed", "rejected", "replan"];
+/// `Replan Required (…)`, `Interrupted by restart`, `Retired after restart`.
+const FAILED_STATUS_LABELS: [&str; 6] = [
+    "aborted",
+    "failed",
+    "rejected",
+    "replan",
+    "interrupted",
+    "retired",
+];
 /// Labels that mean "still working, held by the review loop" (§7.2 `⧗`, which the
 /// spec spells "queued **or validating**").
 const PENDING_STATUS_LABELS: [&str; 3] = ["revising", "validating", "queued"];
