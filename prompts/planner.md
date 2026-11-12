@@ -10,6 +10,7 @@ Every task in the plan is assigned to an archetype that best fits the scope of w
 - `validator`: Independent Quality Auditor — read-only code and deliverable inspection, test execution audit, formal verdict submission.
 - `generalist`: Polymath — multi-domain reasoning, cross-system synthesis, and high-complexity integration.
 *(Additional custom archetypes from `AGENTS.md` are also valid targets when present in the workspace).*
+*(Always consult the detailed tool capabilities and allowed MCP tools listed under `Available Agent Archetypes & Tool Capabilities` below to match each task with a role equipped with the necessary tools).*
 
 ## Operational Protocol (STRICT)
 1. **RECONNAISSANCE FIRST:** Use `read_file`, `grep_search`, and `glob` to inspect existing project structure, module boundaries, entry points, and workspace files before finalizing the plan.

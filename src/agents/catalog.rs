@@ -670,11 +670,12 @@ impl Catalog {
         out
     }
 
-    /// Formats the catalog's agent archetypes for the Planner's strategic context.
-    /// Excludes micro-skills to keep the planner focused on high-level architecture.
-    pub fn format_agents_for_planner(&self) -> String {
-        let mut out =
-            String::from("## Available Agent Archetypes (from ARCHETYPES.md & defaults)\n");
+    /// Formats the catalog's agent archetypes and their tool capabilities for the Planner's strategic context.
+    /// Excludes internal checkpoint/control tools and micro-skills to keep the planner focused on high-level architecture.
+    pub fn format_agents_for_planner(&self, cfg: Option<&crate::config::Config>) -> String {
+        let mut out = String::from(
+            "## Available Agent Archetypes & Tool Capabilities (from ARCHETYPES.md & defaults)\n",
+        );
         let mut sorted_agents: Vec<&AgentArchetype> = self.agents.values().collect();
         sorted_agents.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -683,6 +684,34 @@ impl Catalog {
                 "- **`{}`** ({}): {}\n",
                 arch.id, arch.name, arch.description
             ));
+
+            let operational_tools: Vec<String> = arch
+                .default_tools
+                .iter()
+                .filter(|t| !matches!(t.as_str(), TOOL_REBIRTH | TOOL_REPLY_TO_ARBITRATOR))
+                .map(|t| format!("`{t}`"))
+                .collect();
+            if !operational_tools.is_empty() {
+                out.push_str(&format!(
+                    "  - Built-in tools: {}\n",
+                    operational_tools.join(", ")
+                ));
+            }
+
+            if let Some(cfg) = cfg {
+                let mcp_servers = cfg.effective_specialist_mcp_servers(&arch.id);
+                let allowed_mcp = crate::harness::allowed_mcp_tools(&mcp_servers);
+                if !allowed_mcp.is_empty() {
+                    let mcp_tool_names: Vec<String> = allowed_mcp
+                        .iter()
+                        .map(|t| format!("`{}`", t.qualified_name()))
+                        .collect();
+                    out.push_str(&format!(
+                        "  - Allowed MCP tools: {}\n",
+                        mcp_tool_names.join(", ")
+                    ));
+                }
+            }
         }
         out
     }
@@ -860,5 +889,25 @@ mod project_instructions_tests {
             // Only a user-level ~/.marmel/AGENTS.md may contribute here.
             assert!(!text.contains(tmp.path().to_str().unwrap()));
         }
+    }
+
+    #[test]
+    fn test_format_agents_for_planner() {
+        let catalog = Catalog::new();
+        let formatted_no_cfg = catalog.format_agents_for_planner(None);
+        assert!(formatted_no_cfg.contains("## Available Agent Archetypes & Tool Capabilities"));
+        assert!(formatted_no_cfg.contains("- **`coder`**"));
+        assert!(formatted_no_cfg.contains("- Built-in tools:"));
+        assert!(formatted_no_cfg.contains("`read_file`"));
+        assert!(formatted_no_cfg.contains("`write_file`"));
+        // Checkpoint/control tools must be filtered out
+        assert!(!formatted_no_cfg.contains(TOOL_REBIRTH));
+        assert!(!formatted_no_cfg.contains(TOOL_REPLY_TO_ARBITRATOR));
+        // No MCP tools without active cfg or registered servers
+        assert!(!formatted_no_cfg.contains("Allowed MCP tools:"));
+
+        let cfg = crate::config::Config::default();
+        let formatted_default_cfg = catalog.format_agents_for_planner(Some(&cfg));
+        assert_eq!(formatted_no_cfg, formatted_default_cfg);
     }
 }
