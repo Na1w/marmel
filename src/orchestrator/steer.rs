@@ -29,7 +29,7 @@ pub const STEER_ARBITRATOR_SYSTEM_PROMPT: &str = include_str!("../../prompts/ste
 /// Wall-clock bound on one arbitrator decision call, in seconds. Named because the WARN that
 /// reports a lost round trip must be able to state it (see
 /// [`arbitrate_steer_context_stream`]).
-const STEER_CALL_TIMEOUT_SECS: u64 = 60;
+pub const STEER_CALL_TIMEOUT_SECS: u64 = 180;
 
 /// A per-subtask decision, matching caesar `SteerSubtaskDecision`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -932,7 +932,7 @@ Your task: Formulate a direct, helpful, and concise answer to the user in the EX
     // round, so it must not queue behind the specialist sessions the round is
     // arbitrating — and it must not inherit the Manager class either.
     let reply = match tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(STEER_CALL_TIMEOUT_SECS),
         pool::with_call_context(
             steer_arbitrator_call_context(),
             client.chat_stream(&req, |chunk| {

@@ -1138,7 +1138,7 @@ mod tests {
             );
             // Behavioural proof that the loop waited instead of spinning, deliberately free of
             // any wall-clock threshold (load-sensitive on CI, and `tokio::time::pause()` would
-            // fast-forward the 50 ms SSE poll, the 2 s preempt-ack and the 60 s call timeout
+            // fast-forward the 50 ms SSE poll, the 2 s preempt-ack and the arbitrator call timeout
             // living on this same current-thread runtime). The clock-independent half of the
             // invariant lives in `floored_sleep_is_allowed_by_the_budget_at_any_clock`, which
             // drives the injected-clock seam (`SleepBudget::new_at` / `allow_at`).

@@ -119,7 +119,7 @@ static REPLIED_SEQ: AtomicU64 = AtomicU64::new(0);
 ///
 /// A notice is posted while a specialist is mid-flight and must survive the
 /// longest realistic gap between two drain points — one streamed model turn (the
-/// streaming path itself is capped by a 60 s timeout) plus its tool round, whose
+/// streaming path itself is capped by a 180 s timeout) plus its tool round, whose
 /// builds/test suites run for minutes, optionally followed by validator
 /// fix-loop rounds. An hour (3600 s) sits above that envelope and accommodates
 /// long-running builds and multi-step investigation while still guaranteeing that
@@ -1198,7 +1198,7 @@ where
     // specialist's own tool round (`reply_to_arbitrator`), so inheriting the
     // `Specialist` class here would self-deadlock once the cap is reached.
     let reply_res = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(crate::orchestrator::steer::STEER_CALL_TIMEOUT_SECS),
         pool::with_call_context(
             notice_eval_call_context(worker_tag),
             client.chat_stream(&req, |chunk| {

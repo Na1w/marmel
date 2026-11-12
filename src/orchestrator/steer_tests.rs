@@ -1487,3 +1487,13 @@ fn steer_production_region_retypes_no_sleep_default_or_clamp_literals() {
         "the sleep-tool detection must keep reusing the crate::tool_names alias table"
     );
 }
+
+#[test]
+fn test_steer_call_timeout_is_at_least_three_minutes() {
+    const {
+        assert!(
+            STEER_CALL_TIMEOUT_SECS >= 180,
+            "steer call timeout must allow at least 180s for slow or thinking models before queuing"
+        );
+    }
+}
