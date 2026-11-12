@@ -420,7 +420,7 @@ impl ToolDef {
             kind: "function".to_string(),
             function: ToolFunctionDef {
                 name: TOOL_REPLY_TO_ARBITRATOR.to_string(),
-                description: "Send a direct message or clarification back to the arbitrator in response to a specific steering notice."
+                description: "Send your final response or clarification back to the arbitrator for a specific steering notice. IMPORTANT: Each notice accepts only ONE reply. Do not send preliminary acknowledgments; call this tool only when your investigation, fix, or answer is complete."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",

@@ -2084,7 +2084,9 @@ pub fn kill_process_group(pid: i32) -> Result<(), std::io::Error> {
     } else {
         let err = std::io::Error::last_os_error();
         // ESRCH just means the group is already gone — that's fine.
-        if err.raw_os_error() == Some(libc::ESRCH) {
+        // On macOS/BSD, EPERM is also returned when the process group no longer
+        // exists or the target is no longer a group leader.
+        if err.raw_os_error() == Some(libc::ESRCH) || err.raw_os_error() == Some(libc::EPERM) {
             Ok(())
         } else {
             Err(err)
