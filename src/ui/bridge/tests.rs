@@ -872,6 +872,43 @@ fn test_bridge_match_rule_resolves_whole_effective_tokens_with_and_semantics() {
     );
 }
 
+#[test]
+fn test_bridge_match_rule_resolves_steer_task_worker() {
+    let _lock = crate::orchestrator::workers::TEST_WORKERS_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let guard = crate::orchestrator::register_active_worker_with_token(
+        Some("steer-task-audio-noise".to_string()),
+        "debugger".to_string(),
+        "Audio noise investigation".to_string(),
+        Some(token.clone()),
+    );
+    let key = crate::orchestrator::active_worker_entries()
+        .into_iter()
+        .find(|(_, info)| info.task_id.as_deref() == Some("steer-task-audio-noise"))
+        .expect("the steer worker must be in the active read model")
+        .0;
+
+    assert_eq!(
+        action::addressed_worker_keys(Some("debugger"), Some("steer-task-audio-noise")),
+        vec![key.clone()],
+        "agent + steer task must match the steer worker"
+    );
+    assert_eq!(
+        action::addressed_worker_keys(None, Some("steer-task-audio-noise")),
+        vec![key.clone()],
+        "steer task alone must match the steer worker"
+    );
+    assert_eq!(
+        action::notice_targets(&forward_notice("steer-task-audio-noise", Some("debugger"))),
+        action::NoticeTargeting::Addresses(vec![key.clone()]),
+    );
+
+    drop(guard);
+}
+
 /// A `ForwardNotice` subtask for the targeting assertions.
 fn forward_notice(
     tool_call_id: &str,

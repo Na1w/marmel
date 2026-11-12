@@ -1606,9 +1606,11 @@ async fn test_ui_session_persists_the_visible_turn_to_the_bundle() {
         Arc::new(marmennill::harness::HarnessStats::new()),
     ));
     let mut renderer = ScriptedRenderer::new(vec!["First goal".to_string(), "/abort".to_string()]);
-    marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr))
-        .await
-        .expect("session succeeds");
+    marmennill::harness::with_workspace_root(tmp.path(), async {
+        marmennill::ui::run_session(&cfg, &mut renderer, None, Some(mgr)).await
+    })
+    .await
+    .expect("session succeeds");
 
     let bundle = plan.session_bundle_path();
     let members = bundle_members(&bundle);

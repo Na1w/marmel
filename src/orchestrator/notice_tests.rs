@@ -385,6 +385,21 @@ fn test_worker_routing_identity_resolves_authoritative_fields() {
     assert_eq!(uuid_key.agent_name, "researcher");
     assert_eq!(uuid_key.task_id.as_deref(), Some("t-004"));
 
+    // Synthetic steer tasks (`{agent}-steer-task-{name}`) are recognized by structure.
+    let steer_worker = worker_routing_identity("debugger-steer-task-audio-noise");
+    assert_eq!(steer_worker.natural_key, "debugger-steer-task-audio-noise");
+    assert_eq!(steer_worker.agent_name, "debugger");
+    assert_eq!(
+        steer_worker.task_id.as_deref(),
+        Some("steer-task-audio-noise")
+    );
+    assert!(steer_worker.routes("debugger"));
+    assert!(steer_worker.routes("steer-task-audio-noise"));
+    assert!(steer_worker.routes("[steer-task-audio-noise]"));
+    assert!(steer_worker.routes("debugger-steer-task-audio-noise"));
+    assert!(!steer_worker.routes("steer-task-graphics-regression"));
+    assert!(!steer_worker.routes("coder"));
+
     // Exact-match routing decisions, asserted directly on the identity.
     assert!(validator.routes("validator"));
     assert!(validator.routes("validator-coder"));

@@ -121,9 +121,10 @@ static REPLIED_SEQ: AtomicU64 = AtomicU64::new(0);
 /// longest realistic gap between two drain points — one streamed model turn (the
 /// streaming path itself is capped by a 60 s timeout) plus its tool round, whose
 /// builds/test suites run for minutes, optionally followed by validator
-/// fix-loop rounds. Ten minutes sits above that envelope, and the bound also
-/// guarantees that a notice never outlives the worker/session it was meant for.
-pub const NOTICE_TTL_MS: u64 = 10 * 60 * 1000;
+/// fix-loop rounds. An hour (3600 s) sits above that envelope and accommodates
+/// long-running builds and multi-step investigation while still guaranteeing that
+/// stale notices are eventually reclaimed.
+pub const NOTICE_TTL_MS: u64 = 60 * 60 * 1000;
 
 /// How long an **empty** per-worker inbox entry survives before it is reclaimed.
 /// Equal to the notice TTL: an inbox only ever stays empty because its notices
@@ -570,7 +571,10 @@ fn split_natural_key(natural_key: &str) -> (String, Option<String>) {
             continue;
         }
         let tail = &natural_key[idx + 1..];
-        if crate::plan_parse::is_task_id_token(tail) {
+        if crate::plan_parse::is_task_id_token(tail)
+            || tail.starts_with("steer-task-")
+            || tail.starts_with("task-")
+        {
             return (natural_key[..idx].to_string(), Some(tail.to_string()));
         }
     }
@@ -1043,7 +1047,8 @@ pub fn render_notice_for_worker(notice: &SteerNotice) -> String {
     format!(
         "[Steering Notice from Arbitrator — ID: {notice_id}]:\n\"{inquiry}\"\n\n\
          To reply to the Arbitrator regarding this notice, invoke the `{reply_tool}` tool with `notice_id: \"{notice_id}\"` and your `message`.\n\
-         Reply to this notice id only — a reply naming another id, or no id, is rejected.",
+         Reply to this notice id only — a reply naming another id, or no id, is rejected.\n\
+         IMPORTANT: Replying resolves this notice (single-shot per notice). Do NOT send an interim acknowledgment; reply ONLY when you have completed your work and have your final answer or findings ready.",
         notice_id = notice.notice_id,
         inquiry = notice.user_inquiry,
         reply_tool = crate::tool_names::TOOL_REPLY_TO_ARBITRATOR,

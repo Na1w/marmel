@@ -941,7 +941,14 @@ async fn dispatch_specialist_async(
         TOOL_READ_FILE | TERMINAL_READ_FILE => fs::read_file(&tool.arguments),
         TOOL_WRITE_FILE | TERMINAL_WRITE_FILE => fs::write_file(&tool.arguments),
         TOOL_REPLACE | TERMINAL_REPLACE => fs::replace(&tool.arguments),
-        TOOL_RUN_COMMAND | TERMINAL_RUN_COMMAND => pty::run_command(&tool.arguments),
+        TOOL_RUN_COMMAND | TERMINAL_RUN_COMMAND => {
+            let args = tool.arguments.clone();
+            tokio::task::spawn_blocking(move || pty::run_command(&args))
+                .await
+                .map_err(|e| {
+                    ToolError::Execution(anyhow::anyhow!("run_command task join error: {e}"))
+                })?
+        }
         TOOL_GREP_SEARCH | TERMINAL_GREP_SEARCH => search::grep_search(&tool.arguments),
         TOOL_GLOB | TERMINAL_GLOB => search::glob(&tool.arguments),
         TOOL_PTY_SPAWN => pty::pty_spawn(&tool.arguments),
