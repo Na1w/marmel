@@ -199,7 +199,7 @@ impl StdioMcpConnection {
         self.instructions.as_deref()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn request_timeout(&self) -> std::time::Duration {
         self.request_timeout
     }
