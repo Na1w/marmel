@@ -153,12 +153,12 @@ pub struct McpToolRejection {
 /// one connect + two POSTs: milliseconds to a couple of seconds. 10 s absorbs the
 /// cold-start cases that are real on this host (a JVM/Node runtime warming up, a
 /// first container start, a network mount) without turning a tool call into an
-/// open-ended stall, and it stays **far below the transport's own 30 s request
-/// deadline** (`MCP_REQUEST_TIMEOUT`, `src/mcp/http.rs:42` — pinned by
-/// `src/mcp/http_tests.rs:414-419`, and untouched here), so a wedged registry costs
+/// open-ended stall, and it stays **far below the transport's own 180 s request
+/// deadline** (`DEFAULT_MCP_REQUEST_TIMEOUT`, `src/mcp/http.rs:42` — pinned by
+/// `src/mcp/http_tests.rs:414-419`), so a wedged registry costs
 /// the caller one bounded wait instead of the whole request budget twice: one tool
-/// call is at worst `MCP_READY_TIMEOUT` (boot) + `MCP_REQUEST_TIMEOUT` (the call
-/// itself), never a 60 s "is it still going".
+/// call is at worst `MCP_READY_TIMEOUT` (boot) + request deadline (the call
+/// itself), never an unbounded stall.
 ///
 /// It is never paid by startup or by advertising: the wait lives on the dispatch
 /// path only ([`McpDispatchGate::gate_is_ready`]), and [`allowed_mcp_tools`] stays

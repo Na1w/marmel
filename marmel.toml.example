@@ -289,12 +289,11 @@ model = "deepseek-v4-flash:cloud"
 # before the call is sent to the MCP server, so the server always receives the
 # original unprefixed tool name.
 #
-# The legal keys of a server table are exactly `command`, `args`, `env`, `url`
-# and `prompt`: there is NO `enabled`, `timeout` or `headers` key (a typo'd key
-# is dropped in silence, not an error). Exactly one transport per server —
-# `command` wins when both `command` and `url` are set. `prompt` is optional
-# free-form text injected into the system prompt of every agent allowed to use
-# that server (it also accepts the aliases `instructions` and `system_prompt`);
+# The legal keys of a server table are `command`, `args`, `env`, `url`,
+# `prompt`, `idle_timeout_secs` and `request_timeout_secs`: exactly one transport
+# per server — `command` wins when both `command` and `url` are set. `prompt` is
+# optional free-form text injected into the system prompt of every agent allowed
+# to use that server (it also accepts the aliases `instructions` and `system_prompt`);
 # none of the three examples below set it.
 
 # Example 1 — local stdio server (spawns `npx`).
@@ -327,11 +326,10 @@ args = ["mcp", "--kiwix-dir", "/mnt/extradisk/kiwix", "--index", "/mnt/extradisk
 # is startup-only (main.rs:80-84) — the child is spawned once, speaks MCP as
 # synchronous line-delimited JSON-RPC 2.0 over stdio, and is never respawned.
 #
-# OPERATIONAL CAVEAT: an MCP request runs against the fixed 30 s transport
-# deadline shared by the stdio line read and the SSE event read
-# (`mcp::http::MCP_REQUEST_TIMEOUT`, src/mcp/http.rs:39-42). Nothing raises it —
-# there is no `timeout` key — so a cold `index_archive` (a whole-archive index
-# build) can outlive the deadline and come back as a tool error while the server
-# carries on working. Pre-build the index out of band and let the tools read what
-# is already indexed:
+# OPERATIONAL NOTE: an MCP request runs against the transport deadline shared by
+# the stdio line read and the SSE event read (`DEFAULT_MCP_REQUEST_TIMEOUT`, 180 s).
+# This can be configured per server via `request_timeout_secs = <seconds>`
+# (or aliases `timeout_secs` / `timeout`). For long-running operations like
+# cold whole-archive indexing, configure `request_timeout_secs` accordingly or
+# pre-build the index out of band:
 #   wip/target/release/zim-search index /mnt/extradisk/kiwix --index /mnt/extradisk/kiwixidx
