@@ -21,6 +21,9 @@ use super::protocol::{
     self, JsonRpcNotification, JsonRpcRequest, JsonRpcTransport, RequestIds, decode_reply,
 };
 
+/// Default idle duration before closing an inactive MCP connection (5 minutes).
+pub const DEFAULT_MCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Server configuration entry for an MCP server in marmel.toml.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,6 +40,9 @@ pub struct McpServerConfig {
     /// every agent allowed to use this MCP server.
     #[serde(alias = "instructions", alias = "system_prompt")]
     pub prompt: Option<String>,
+    /// Idle timeout in seconds before closing the inactive connection.
+    /// Defaults to 300 seconds (5 minutes). Set to 0 to disable idle closing.
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// Discovered MCP Tool definition.
@@ -351,6 +357,11 @@ impl StdioMcpConnection {
         }
         Ok(())
     }
+
+    /// Check if the child process is still alive.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
 }
 
 /// The one piece of teardown that a drop glue may lawfully do: nothing awaiting,
@@ -447,9 +458,197 @@ impl McpClient {
             }
         }
     }
+
+    /// Check if the underlying connection has died (for stdio: child process exited).
+    pub async fn is_dead(&self) -> bool {
+        match self {
+            McpClient::Stdio(lock) => {
+                let mut conn = lock.lock().await;
+                !conn.is_alive()
+            }
+            McpClient::HttpSse(_) => false,
+            #[cfg(test)]
+            McpClient::Mock(_) => false,
+        }
+    }
 }
 
-/// The live half of the MCP registry: one client per booted server, plus every tool
+/// Helper function to establish an active connection to an MCP server.
+pub(crate) async fn connect_client(
+    name: &str,
+    cfg: &McpServerConfig,
+) -> Result<(Arc<McpClient>, Option<String>), String> {
+    if cfg.command.is_some() {
+        match StdioMcpConnection::spawn(name, cfg).await {
+            Ok(conn) => {
+                let inst = conn.instructions().map(str::to_string);
+                Ok((Arc::new(McpClient::Stdio(Box::new(Mutex::new(conn)))), inst))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start MCP server '{name}': {e:#}");
+                Err(format!("failed to start MCP server '{name}': {e:#}"))
+            }
+        }
+    } else if cfg.url.is_some() {
+        match HttpSseConnection::connect(name, cfg).await {
+            Ok(conn) => {
+                let inst = conn.instructions().map(str::to_string);
+                Ok((Arc::new(McpClient::HttpSse(Mutex::new(conn))), inst))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to MCP server '{name}': {e:#}");
+                Err(format!("failed to connect to MCP server '{name}': {e:#}"))
+            }
+        }
+    } else {
+        Err(format!(
+            "MCP server '{name}' has neither command nor url configured"
+        ))
+    }
+}
+
+/// Connection slot for a configured MCP server, supporting on-demand connection
+/// and automatic idle timeout teardown.
+pub struct ServerSlot {
+    pub name: String,
+    pub config: McpServerConfig,
+    state: Mutex<ServerSlotState>,
+}
+
+struct ServerSlotState {
+    client: Option<Arc<McpClient>>,
+    last_used: std::time::Instant,
+}
+
+impl ServerSlot {
+    pub fn new(name: String, config: McpServerConfig, client: Option<Arc<McpClient>>) -> Self {
+        Self {
+            name,
+            config,
+            state: Mutex::new(ServerSlotState {
+                client,
+                last_used: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Effective idle timeout duration. If `idle_timeout_secs` is `Some(0)`, idle closing is disabled.
+    /// If `None`, defaults to [`DEFAULT_MCP_IDLE_TIMEOUT`] (300 seconds).
+    pub fn effective_idle_timeout(&self) -> Option<std::time::Duration> {
+        match self.config.idle_timeout_secs {
+            Some(0) => None,
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            None => Some(DEFAULT_MCP_IDLE_TIMEOUT),
+        }
+    }
+
+    /// Returns whether this server currently has an active connection.
+    pub async fn is_connected(&self) -> bool {
+        let state = self.state.lock().await;
+        state.client.is_some()
+    }
+
+    /// Explicitly disconnect and shut down the active client, if any.
+    pub async fn disconnect(&self) {
+        let old_client = {
+            let mut state = self.state.lock().await;
+            state.client.take()
+        };
+        if let Some(client) = old_client {
+            let _ = client.shutdown().await;
+        }
+    }
+
+    /// Touch the slot's `last_used` timestamp.
+    pub async fn touch(&self) {
+        let mut state = self.state.lock().await;
+        state.last_used = std::time::Instant::now();
+    }
+
+    /// Close the connection if it has been idle for longer than the configured timeout
+    /// or if the child process has exited. Returns true if a connection was closed.
+    pub async fn reap_if_idle(&self) -> bool {
+        let timeout = match self.effective_idle_timeout() {
+            Some(t) => t,
+            None => return false,
+        };
+
+        let mut state = self.state.lock().await;
+        if let Some(ref client) = state.client {
+            let is_dead = client.is_dead().await;
+            let is_idle = state.last_used.elapsed() >= timeout;
+
+            if is_dead || is_idle {
+                let reason = if is_dead {
+                    "child process exited"
+                } else {
+                    "idle timeout"
+                };
+                tracing::info!(
+                    target: "mcp",
+                    "MCP server '{}' disconnecting ({reason}, last used {:?} ago)",
+                    self.name,
+                    state.last_used.elapsed()
+                );
+                let old = state.client.take();
+                drop(state);
+                if let Some(client) = old {
+                    let _ = client.shutdown().await;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Retrieve the live client or connect on demand.
+    pub async fn get_or_connect(&self) -> Result<Arc<McpClient>> {
+        let mut state = self.state.lock().await;
+
+        if let Some(ref client) = state.client {
+            let is_dead = client.is_dead().await;
+            let is_expired = match self.effective_idle_timeout() {
+                Some(timeout) => state.last_used.elapsed() >= timeout,
+                None => false,
+            };
+
+            if is_dead || is_expired {
+                let reason = if is_dead {
+                    "child process exited"
+                } else {
+                    "idle timeout"
+                };
+                tracing::info!(
+                    target: "mcp",
+                    "MCP server '{}' connection expired ({reason}, {:?} since last use), reconnecting",
+                    self.name,
+                    state.last_used.elapsed()
+                );
+                let old = state.client.take();
+                if let Some(client) = old {
+                    let _ = client.shutdown().await;
+                }
+            }
+        }
+
+        if state.client.is_none() {
+            tracing::info!(
+                target: "mcp",
+                "Connecting to MCP server '{}' on-demand",
+                self.name
+            );
+            let (client, _) = connect_client(&self.name, &self.config)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            state.client = Some(client);
+        }
+
+        state.last_used = std::time::Instant::now();
+        Ok(Arc::clone(state.client.as_ref().expect("client was set")))
+    }
+}
+
+/// The live half of the MCP registry: one server slot per booted server, plus every tool
 /// discovered from it (keyed by [`McpTool::qualified_name`]).
 ///
 /// It is wrapped in a `std::sync::RwLock` (see the `inner` field of [`McpManager`]): readers
@@ -457,9 +656,8 @@ impl McpClient {
 /// held across an await.
 #[derive(Default)]
 pub struct McpRegistry {
-    /// Live clients, keyed by the configured server name (the `HashMap` key of today's
-    /// `McpManager::clients`, unchanged).
-    clients: HashMap<String, Arc<McpClient>>,
+    /// Server connection slots, keyed by configured server name.
+    server_slots: HashMap<String, Arc<ServerSlot>>,
     /// Discovered tools, keyed by `tool.qualified_name()` (unchanged).
     tools: BTreeMap<String, McpTool>,
     /// Server usage instructions reported in the `initialize` handshake, keyed by server name.
@@ -537,6 +735,8 @@ pub struct McpManager {
     /// `JoinHandle` is what waits for that to have happened.
     /// `None` for an eager [`boot`](Self::boot) manager, which spawns nothing.
     boot_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Background reaper task that monitors idle MCP servers and closes connections.
+    reaper_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for McpManager {
@@ -558,6 +758,7 @@ impl McpManager {
             boot_tx,
             boot_rx,
             boot_task: std::sync::Mutex::new(None),
+            reaper_task: std::sync::Mutex::new(None),
         }
     }
 
@@ -576,12 +777,14 @@ impl McpManager {
         let manager = Arc::new(Self::with_status(McpBootStatus::Booting));
         let owned = servers.clone();
         let task = handle.spawn(Self::boot_all(Arc::clone(&manager), owned));
-        let mut slot = manager
-            .boot_task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = Some(task);
-        drop(slot);
+        {
+            let mut slot = manager
+                .boot_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some(task);
+        }
+        manager.start_reaper(handle);
         manager
     }
 
@@ -640,36 +843,18 @@ impl McpManager {
     /// warned (unchanged); `Err(reason)` = the connection failed, with the reason in the
     /// payload form the `Failed` status wants.
     async fn boot_one(&self, name: &str, cfg: &McpServerConfig) -> Result<bool, String> {
-        let (client, instructions) = if cfg.command.is_some() {
-            match StdioMcpConnection::spawn(name, cfg).await {
-                Ok(conn) => {
-                    let inst = conn.instructions().map(str::to_string);
-                    (Arc::new(McpClient::Stdio(Box::new(Mutex::new(conn)))), inst)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to start MCP server '{name}': {e:#}");
-                    return Err(format!("failed to start MCP server '{name}': {e:#}"));
-                }
-            }
-        } else if cfg.url.is_some() {
-            match HttpSseConnection::connect(name, cfg).await {
-                Ok(conn) => {
-                    let inst = conn.instructions().map(str::to_string);
-                    (Arc::new(McpClient::HttpSse(Mutex::new(conn))), inst)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to connect to MCP server '{name}': {e:#}");
-                    return Err(format!("failed to connect to MCP server '{name}': {e:#}"));
-                }
-            }
-        } else {
+        if cfg.command.is_none() && cfg.url.is_none() {
             return Ok(false);
-        };
+        }
+
+        let (client, instructions) = connect_client(name, cfg).await?;
 
         // `tools/list` failures stay swallowed, exactly as the original `if let Ok(…)` did:
         // a server that answers `initialize` but not `tools/list` still contributes its
         // client. `unwrap_or_default()` is that same swallow (empty tool list).
         let tools = client.list_tools().await.unwrap_or_default();
+
+        let slot = Arc::new(ServerSlot::new(name.to_string(), cfg.clone(), Some(client)));
 
         // Registration happens in one write, with no await inside the guard.
         let mut registry = self
@@ -682,7 +867,7 @@ impl McpManager {
         if let Some(inst) = instructions {
             registry.server_instructions.insert(name.to_string(), inst);
         }
-        registry.clients.insert(name.to_string(), client);
+        registry.server_slots.insert(name.to_string(), slot);
         drop(registry);
         Ok(true)
     }
@@ -797,7 +982,61 @@ impl McpManager {
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.clients.len()
+        registry.server_slots.len()
+    }
+
+    /// Returns the number of servers that currently have an active (connected) process.
+    pub async fn active_server_count(&self) -> usize {
+        let slots: Vec<Arc<ServerSlot>> = {
+            let registry = self
+                .inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.server_slots.values().map(Arc::clone).collect()
+        };
+        let mut count = 0;
+        for slot in slots {
+            if slot.is_connected().await {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Inspect and reap all servers whose connections have exceeded their idle timeout.
+    pub async fn reap_idle_servers(&self) {
+        let slots: Vec<Arc<ServerSlot>> = {
+            let registry = self
+                .inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.server_slots.values().map(Arc::clone).collect()
+        };
+        for slot in slots {
+            slot.reap_if_idle().await;
+        }
+    }
+
+    /// Start the idle reaper background task if not already running.
+    pub fn start_reaper(self: &Arc<Self>, handle: &tokio::runtime::Handle) {
+        let mut slot = self
+            .reaper_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            let weak = Arc::downgrade(self);
+            let task = handle.spawn(async move {
+                let check_interval = std::time::Duration::from_secs(10);
+                loop {
+                    tokio::time::sleep(check_interval).await;
+                    let Some(mgr) = weak.upgrade() else {
+                        break;
+                    };
+                    mgr.reap_idle_servers().await;
+                }
+            });
+            *slot = Some(task);
+        }
     }
 
     pub fn tools(&self) -> Vec<McpTool> {
@@ -866,7 +1105,7 @@ impl McpManager {
         // Clone out of the registry under the read guard, then release it: a guard held
         // across the `tools/call` await would block every synchronous advertiser in the
         // process for the lifetime of the round trip.
-        let (tool, client) = {
+        let (tool, slot) = {
             let registry = self
                 .inner
                 .read()
@@ -876,14 +1115,31 @@ impl McpManager {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| anyhow!("unknown MCP tool '{name}'"))?;
-            let client = registry
-                .clients
+            let slot = registry
+                .server_slots
                 .get(&tool.server_name)
                 .map(Arc::clone)
                 .ok_or_else(|| anyhow!("MCP server '{}' is not running", tool.server_name))?;
-            (tool, client)
+            (tool, slot)
         };
-        client.call_tool(&tool.name, arguments).await
+        let client = slot.get_or_connect().await?;
+        let res = client.call_tool(&tool.name, arguments).await;
+        if res.is_ok() {
+            slot.touch().await;
+        } else {
+            let should_disconnect = if client.is_dead().await {
+                true
+            } else if let Err(ref e) = res {
+                let err_str = e.to_string();
+                err_str.contains("closed stdout stream") || err_str.contains("Broken pipe")
+            } else {
+                false
+            };
+            if should_disconnect {
+                slot.disconnect().await;
+            }
+        }
+        res
     }
 
     /// Bounded wait for the (already aborted) boot task inside
@@ -939,6 +1195,18 @@ impl McpManager {
         // `main.rs` does it first, but a caller that forgets does not orphan anything.
         self.shutdown_boot_task();
 
+        // Stop the idle reaper task.
+        let reaper = {
+            let mut slot = self
+                .reaper_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.take()
+        };
+        if let Some(task) = reaper {
+            task.abort();
+        }
+
         // (2) Take the already-aborted handle and await it, bounded. Awaiting is the
         // point: the aborted future — including any half-booted stdio connection and
         // its `kill_on_drop(true)` child — is dropped by the runtime *before* this
@@ -961,19 +1229,19 @@ impl McpManager {
             );
         }
 
-        // (3) Every client that did come up. One shared deadline keeps the whole
+        // (3) Every connected client. One shared deadline keeps the whole
         // pass bounded instead of spending one budget per server.
-        let clients: Vec<Arc<McpClient>> = {
+        let slots: Vec<Arc<ServerSlot>> = {
             let registry = self
                 .inner
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.clients.values().map(Arc::clone).collect()
+            registry.server_slots.values().map(Arc::clone).collect()
         };
         let sweep = std::time::Instant::now() + Self::CLIENT_SWEEP_BUDGET;
-        for client in clients {
+        for slot in slots {
             let left = sweep.saturating_duration_since(std::time::Instant::now());
-            if tokio::time::timeout(left, client.shutdown()).await.is_err() {
+            if tokio::time::timeout(left, slot.disconnect()).await.is_err() {
                 tracing::debug!(
                     "MCP client teardown exceeded its {} ms slice; the child was \
                     killed but may not have been reaped",
@@ -1008,7 +1276,15 @@ mod tests {
     /// Seed one client under `server`, mirroring the other half of `boot_one`.
     fn seed_client(manager: &McpManager, server: &str, client: Arc<McpClient>) {
         let mut registry = manager.inner.write().expect("registry write lock");
-        registry.clients.insert(server.to_string(), client);
+        let slot = Arc::new(ServerSlot::new(
+            server.to_string(),
+            McpServerConfig {
+                idle_timeout_secs: Some(0),
+                ..Default::default()
+            },
+            Some(client),
+        ));
+        registry.server_slots.insert(server.to_string(), slot);
     }
 
     #[test]
@@ -2136,5 +2412,134 @@ mod tests {
         );
         let pid = fixture_pid(&pid_path).await;
         assert_reaped(pid, "the failed-handshake child").await;
+    }
+
+    #[cfg(unix)]
+    fn responsive_server(tool_name: &str) -> McpServerConfig {
+        let script = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *\"method\":\"initialize\"*)
+      echo '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":"2024-11-05"}}}}'
+      ;;
+    *\"method\":\"tools/list\"*)
+      id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+      echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"tools\":[{{\"name\":\"{tool_name}\",\"description\":\"desc\"}}]}}}}"
+      ;;
+    *\"method\":\"tools/call\"*)
+      id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+      echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"success_from_{tool_name}\"}}]}}}}"
+      ;;
+  esac
+done"#
+        );
+        McpServerConfig {
+            command: Some("sh".to_string()),
+            args: vec!["-c".to_string(), script],
+            ..Default::default()
+        }
+    }
+
+    /// An idle server connection is reaped after its configured idle timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_server_is_reaped_after_timeout() {
+        let mut servers = HashMap::new();
+        let mut cfg = responsive_server("my_tool");
+        cfg.idle_timeout_secs = Some(1); // 1 second timeout
+        servers.insert("ondemand_srv".to_string(), cfg);
+
+        let manager = McpManager::spawn_boot(&tokio::runtime::Handle::current(), &servers);
+        let verdict = manager.await_ready().await;
+        assert_eq!(verdict, McpBootStatus::Ready);
+        assert_eq!(manager.booted_server_count(), 1);
+        assert_eq!(manager.active_server_count().await, 1);
+
+        // Before timeout, server remains active
+        manager.reap_idle_servers().await;
+        assert_eq!(manager.active_server_count().await, 1);
+
+        // After timeout has passed, reaping drops the connection
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        manager.reap_idle_servers().await;
+        assert_eq!(manager.active_server_count().await, 0);
+        // The server is still registered in the registry
+        assert_eq!(manager.booted_server_count(), 1);
+        assert!(manager.has_tool("ondemand_srv__my_tool"));
+
+        manager.shutdown().await;
+    }
+
+    /// When a reaped server's tool is invoked, it reconnects on-demand and succeeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaped_server_reconnects_on_demand_and_answers() {
+        let mut servers = HashMap::new();
+        let mut cfg = responsive_server("calc");
+        cfg.idle_timeout_secs = Some(1);
+        servers.insert("calc_srv".to_string(), cfg);
+
+        let manager = McpManager::spawn_boot(&tokio::runtime::Handle::current(), &servers);
+        let verdict = manager.await_ready().await;
+        assert_eq!(verdict, McpBootStatus::Ready);
+        assert_eq!(manager.active_server_count().await, 1);
+
+        // Sleep to let it expire and reap it
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        manager.reap_idle_servers().await;
+        assert_eq!(manager.active_server_count().await, 0);
+
+        // Call tool on the disconnected server — should reconnect on demand!
+        let res = manager
+            .call_tool("calc_srv__calc", &json!({"expr": "2+2"}))
+            .await
+            .expect("on-demand call should succeed");
+        assert_eq!(res, "success_from_calc");
+        assert_eq!(manager.active_server_count().await, 1);
+
+        // Subsequent rapid call reuses the connection without reconnecting
+        let res2 = manager
+            .call_tool("calc_srv__calc", &json!({"expr": "3+3"}))
+            .await
+            .expect("second call should reuse connection");
+        assert_eq!(res2, "success_from_calc");
+        assert_eq!(manager.active_server_count().await, 1);
+
+        // Another idle period reaps it again
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        manager.reap_idle_servers().await;
+        assert_eq!(manager.active_server_count().await, 0);
+
+        // And it can reconnect yet again!
+        let res3 = manager
+            .call_tool("calc_srv__calc", &json!({"expr": "4+4"}))
+            .await
+            .expect("reconnecting after second reap");
+        assert_eq!(res3, "success_from_calc");
+        assert_eq!(manager.active_server_count().await, 1);
+
+        manager.shutdown().await;
+    }
+
+    /// Setting idle_timeout_secs to Some(0) disables idle closing completely.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_timeout_zero_keeps_server_connected() {
+        let mut servers = HashMap::new();
+        let mut cfg = responsive_server("pin");
+        cfg.idle_timeout_secs = Some(0); // 0 = disabled
+        servers.insert("pinned_srv".to_string(), cfg);
+
+        let manager = McpManager::spawn_boot(&tokio::runtime::Handle::current(), &servers);
+        let verdict = manager.await_ready().await;
+        assert_eq!(verdict, McpBootStatus::Ready);
+        assert_eq!(manager.active_server_count().await, 1);
+
+        // Sleep and reap — connection must remain open
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        manager.reap_idle_servers().await;
+        assert_eq!(manager.active_server_count().await, 1);
+
+        manager.shutdown().await;
     }
 }

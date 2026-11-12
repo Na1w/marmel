@@ -5235,6 +5235,7 @@ fn mcp_boot_manager(names: &[&str]) -> std::sync::Arc<crate::mcp::McpManager> {
                 env: std::collections::HashMap::new(),
                 url: None,
                 prompt: None,
+                ..Default::default()
             },
         );
     }
@@ -5307,6 +5308,7 @@ fn the_configured_server_count_is_seeded_from_the_config_once() {
             env: std::collections::HashMap::new(),
             url: None,
             prompt: None,
+            ..Default::default()
         },
     );
     r.set_thinking_budgets(&cfg);
