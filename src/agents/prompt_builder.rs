@@ -478,9 +478,10 @@ impl PromptBuilder {
 
     /// Fast, deterministic, zero-network synthesis combining matching catalog skills and archetype defaults.
     pub fn synthesize_offline(catalog: &Catalog, req: &DelegationRequest) -> AgentBlueprint {
-        let active_mcp = crate::config::get_active().map(|cfg| {
+        let active_cfg = crate::config::get_active();
+        let active_mcp = active_cfg.as_ref().map(|cfg| {
             let servers = cfg.effective_specialist_mcp_servers(req.agent_name.as_str());
-            let block = crate::prompts::format_mcp_prompt_block(&cfg, &servers);
+            let block = crate::prompts::format_mcp_prompt_block(cfg, &servers);
             (servers, block)
         });
 
@@ -488,7 +489,7 @@ impl PromptBuilder {
             let role_name = "planner".to_string();
             let mut system_prompt = crate::prompts::PLANNER_PROMPT.to_string();
             system_prompt.push_str("\n\n");
-            system_prompt.push_str(&catalog.format_agents_for_planner());
+            system_prompt.push_str(&catalog.format_agents_for_planner(active_cfg.as_ref()));
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&crate::prompts::format_environment_block());
             let mut allowed_tools = vec![
@@ -1801,7 +1802,12 @@ mod tests {
         assert!(
             blueprint
                 .system_prompt
-                .contains("Available Agent Archetypes")
+                .contains("Available Agent Archetypes & Tool Capabilities")
+        );
+        assert!(
+            blueprint
+                .system_prompt
+                .contains("- Built-in tools: `read_file`, `write_file`")
         );
         assert!(!blueprint.system_prompt.contains("Active Domain Skills"));
     }
