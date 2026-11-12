@@ -879,11 +879,27 @@ impl ChatClient {
         .await;
 
         match attempt {
-            Ok(reply) => Ok(reply),
+            Ok(reply) => {
+                pool::mark_backend_healthy(&self.backend_url);
+                Ok(reply)
+            }
             // Deltas had already reached the caller: the attempt terminated as
             // `Truncated` with its partial accumulation instead of being re-sent.
-            Err(ChatError::Interrupted { reply, .. }) => Ok(*reply),
+            Err(ChatError::Interrupted { reply, .. }) => {
+                pool::mark_backend_healthy(&self.backend_url);
+                Ok(*reply)
+            }
             Err(e) => {
+                if matches!(
+                    e,
+                    ChatError::Transport(_)
+                        | ChatError::HttpStatus {
+                            status: 502..=504,
+                            ..
+                        }
+                ) {
+                    pool::mark_backend_unhealthy(&self.backend_url);
+                }
                 tracing::debug!(
                     "LLM turn terminated as {}: {e}",
                     e.terminal_outcome().as_str()

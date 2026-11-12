@@ -49,6 +49,7 @@ use std::future;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -405,6 +406,119 @@ pub fn has_spare_session_capacity(backend_url: &str, model: &str) -> bool {
 /// Number of pool entries currently open. Test/diagnostic only.
 pub fn open_pool_count() -> usize {
     POOLS.len()
+}
+
+/// Cooldown duration for a backend marked unhealthy after transport/network failure.
+pub const BACKEND_UNHEALTHY_COOLDOWN_SECS: u64 = 30;
+
+static UNHEALTHY_BACKENDS: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
+static RR_UNMETERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Mark a backend URL as temporarily unhealthy (e.g. after a transport failure).
+pub fn mark_backend_unhealthy(backend_url: &str) {
+    let key = config::backend_key(backend_url);
+    UNHEALTHY_BACKENDS.insert(key, Instant::now());
+}
+
+/// Mark a backend URL as healthy again (e.g. after a successful response or stream chunk).
+pub fn mark_backend_healthy(backend_url: &str) {
+    let key = config::backend_key(backend_url);
+    UNHEALTHY_BACKENDS.remove(&key);
+}
+
+/// Check if a backend URL is currently considered healthy.
+pub fn is_backend_healthy(backend_url: &str) -> bool {
+    let key = config::backend_key(backend_url);
+    if let Some(entry) = UNHEALTHY_BACKENDS.get(&key) {
+        if entry.elapsed() < Duration::from_secs(BACKEND_UNHEALTHY_COOLDOWN_SECS) {
+            return false;
+        }
+        drop(entry);
+        UNHEALTHY_BACKENDS.remove(&key);
+    }
+    true
+}
+
+/// Reset the unhealthy backends registry. Test/diagnostic only.
+pub fn reset_unhealthy_backends() {
+    UNHEALTHY_BACKENDS.clear();
+}
+
+/// Select the best backend for a new worker from an ordered list of candidate URLs.
+///
+/// Priority/Spillover policy:
+/// 1. Evaluates candidates in configured order (Primary -> Secondary/Spillover -> ...).
+/// 2. If a healthy candidate has spare session capacity ([`has_spare_session_capacity`]),
+///    it is selected immediately. This ensures sequential tasks stay on the primary
+///    host (maximizing KV-cache reuse), and only spill over when the primary is busy
+///    or unhealthy.
+/// 3. If none of the candidates are capped (all unmetered), rotates healthy candidates
+///    round-robin so load is distributed evenly across backends.
+/// 4. If capped candidates are all currently full (0 free permits), chooses the
+///    healthy candidate with the shortest waiting queue ([`PoolEntry::waiting`]), or the
+///    first healthy candidate if equal.
+/// 5. If all candidates are marked unhealthy (e.g. network partition), fails open
+///    by picking the first candidate (or first with capacity) so the system can attempt recovery.
+pub fn select_worker_backend(candidates: &[String], model: &str) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].clone());
+    }
+
+    // Check if any candidate has a configured cap:
+    let any_capped = candidates
+        .iter()
+        .any(|c| config::effective_max_sessions(c).is_some_and(|l| l >= config::MIN_MAX_SESSIONS));
+
+    if any_capped {
+        // Pass 1: First healthy candidate with spare capacity in priority order.
+        for candidate in candidates {
+            if is_backend_healthy(candidate) && has_spare_session_capacity(candidate, model) {
+                return Some(candidate.clone());
+            }
+        }
+
+        // Pass 2: If none have spare capacity, pick healthy candidate with shortest waiting queue.
+        let mut best_healthy: Option<(&String, usize)> = None;
+        for candidate in candidates {
+            if is_backend_healthy(candidate) {
+                let key = pool_key(candidate, model);
+                let waiting = POOLS.get(&key).map(|e| e.waiting()).unwrap_or(0);
+                match best_healthy {
+                    None => best_healthy = Some((candidate, waiting)),
+                    Some((_, best_waiting)) if waiting < best_waiting => {
+                        best_healthy = Some((candidate, waiting));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some((best, _)) = best_healthy {
+            return Some(best.clone());
+        }
+    } else {
+        // Unmetered mode: round-robin among healthy candidates.
+        let healthy: Vec<&String> = candidates
+            .iter()
+            .filter(|c| is_backend_healthy(c))
+            .collect();
+        if !healthy.is_empty() {
+            let idx = RR_UNMETERED.fetch_add(1, Ordering::Relaxed) % healthy.len();
+            return Some(healthy[idx].clone());
+        }
+    }
+
+    // Pass 3: All candidates marked unhealthy; fail open by picking the first candidate with
+    // spare capacity, or simply the first candidate.
+    for candidate in candidates {
+        if has_spare_session_capacity(candidate, model) {
+            return Some(candidate.clone());
+        }
+    }
+
+    Some(candidates[0].clone())
 }
 
 /// Take a FIFO ticket for this key's queue.
@@ -1036,6 +1150,7 @@ mod tests {
 
     fn reset_pool_state() {
         reset_pools_for_test();
+        reset_unhealthy_backends();
         bus::reset_cancellation();
     }
 
@@ -2283,6 +2398,151 @@ mod tests {
                 "token must be readable inside its scope"
             );
             assert!(current_worker_token().is_none(), "scope must not leak");
+        });
+    }
+
+    #[test]
+    fn test_select_worker_backend_single_candidate() {
+        let candidates = vec!["http://single:8000/v1".to_string()];
+        let selected = select_worker_backend(&candidates, "test-model");
+        assert_eq!(selected, Some("http://single:8000/v1".to_string()));
+    }
+
+    #[test]
+    fn test_select_worker_backend_priority_spillover() {
+        pool_test(async {
+            let host_a = "http://host-a:8080/v1".to_string();
+            let host_b = "http://host-b:8080/v1".to_string();
+            let candidates = vec![host_a.clone(), host_b.clone()];
+            let model = "test-model";
+
+            // Configure cap of 1 for both host-a and host-b:
+            let mut cfg = config::Config::default();
+            cfg.orchestration
+                .concurrency
+                .by_backend
+                .insert(host_a.clone(), 1);
+            cfg.orchestration
+                .concurrency
+                .by_backend
+                .insert(host_b.clone(), 1);
+            config::set_active(cfg);
+
+            // 1. Initially, host-a has spare capacity (1 slot free), so it is selected (primary).
+            let choice1 = select_worker_backend(&candidates, model).expect("selection succeeds");
+            assert_eq!(choice1, host_a, "primary host A must be chosen when free");
+
+            // 2. Worker 1 acquires the slot on host-a:
+            let entry_a = entry_for(&host_a, model).expect("pool exists");
+            let permit_a = entry_a.semaphore().clone().acquire_owned().await.unwrap();
+            assert_eq!(entry_a.available(), 0);
+
+            // 3. Worker 2 arrives while host-a is busy (0 free slots).
+            // It must spill over to host-b!
+            let choice2 = select_worker_backend(&candidates, model).expect("selection succeeds");
+            assert_eq!(
+                choice2, host_b,
+                "must spill over to secondary host B when primary is full"
+            );
+
+            // 4. Worker 1 finishes and releases permit on host-a:
+            drop(permit_a);
+            assert_eq!(entry_a.available(), 1);
+
+            // 5. Worker 3 arrives, host-a has spare capacity again -> host-a is chosen!
+            let choice3 = select_worker_backend(&candidates, model).expect("selection succeeds");
+            assert_eq!(
+                choice3, host_a,
+                "must return to primary host A when it has free slots again"
+            );
+
+            // 6. Test health check: mark host-a unhealthy (e.g. transport failure).
+            mark_backend_unhealthy(&host_a);
+            assert!(!is_backend_healthy(&host_a));
+
+            // Even though host-a has 1 free permit, it is unhealthy, so host-b is chosen!
+            let choice4 = select_worker_backend(&candidates, model).expect("selection succeeds");
+            assert_eq!(
+                choice4, host_b,
+                "must skip unhealthy host A and select host B"
+            );
+
+            // 7. Mark host-a healthy again:
+            mark_backend_healthy(&host_a);
+            assert!(is_backend_healthy(&host_a));
+            let choice5 = select_worker_backend(&candidates, model).expect("selection succeeds");
+            assert_eq!(
+                choice5, host_a,
+                "must select host A again after it recovers"
+            );
+
+            // Clean up:
+            config::set_active(config::Config::default());
+        });
+    }
+
+    #[test]
+    fn test_select_worker_backend_both_full_picks_shortest_queue() {
+        pool_test(async {
+            let host_a = "http://queue-a:8080/v1".to_string();
+            let host_b = "http://queue-b:8080/v1".to_string();
+            let candidates = vec![host_a.clone(), host_b.clone()];
+            let model = "test-model";
+
+            let mut cfg = config::Config::default();
+            cfg.orchestration
+                .concurrency
+                .by_backend
+                .insert(host_a.clone(), 1);
+            cfg.orchestration
+                .concurrency
+                .by_backend
+                .insert(host_b.clone(), 1);
+            config::set_active(cfg);
+
+            let entry_a = entry_for(&host_a, model).unwrap();
+            let entry_b = entry_for(&host_b, model).unwrap();
+
+            // Occupy both slots:
+            let _permit_a = entry_a.semaphore().clone().acquire_owned().await.unwrap();
+            let _permit_b = entry_b.semaphore().clone().acquire_owned().await.unwrap();
+
+            // Put a waiter in host-a's queue:
+            let _ticket_a1 = queue_ticket(&entry_a);
+            assert_eq!(entry_a.waiting(), 1);
+            assert_eq!(entry_b.waiting(), 0);
+
+            // Both are full, but host-b has 0 waiting vs host-a's 1 waiting:
+            let choice = select_worker_backend(&candidates, model).unwrap();
+            assert_eq!(
+                choice, host_b,
+                "must pick host with shortest waiting queue when both are full"
+            );
+
+            config::set_active(config::Config::default());
+        });
+    }
+
+    #[test]
+    fn test_select_worker_backend_unmetered_round_robin() {
+        pool_test(async {
+            let host_a = "http://rr-a:8080/v1".to_string();
+            let host_b = "http://rr-b:8080/v1".to_string();
+            let candidates = vec![host_a.clone(), host_b.clone()];
+            let model = "test-model";
+
+            // Unmetered config (no caps):
+            config::set_active(config::Config::default());
+
+            let mut selections = Vec::new();
+            for _ in 0..4 {
+                selections.push(select_worker_backend(&candidates, model).unwrap());
+            }
+
+            // Must alternate between candidates:
+            assert_ne!(selections[0], selections[1]);
+            assert_eq!(selections[0], selections[2]);
+            assert_eq!(selections[1], selections[3]);
         });
     }
 }

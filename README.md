@@ -214,6 +214,7 @@ Marmel loads the first configuration file found from this list (files are not me
 | Field | Default | Description |
 |---|---|---|
 | `backend_url` | `http://localhost:8000/v1` | Base URL for OpenAI-compatible chat completions (no trailing slash). |
+| `backend_urls` | `[]` | Optional list of backend URLs evaluated in priority order (primary -> spillover/fallback). |
 | `auth_token` | `""` | Optional Bearer token for authentication. |
 | `model` | `qwen-3.8-27b` | Model identifier requested from the backend. |
 | `temperature` | `0.7` | Sampling temperature. |
@@ -239,7 +240,7 @@ Marmel loads the first configuration file found from this list (files are not me
 | `[monitoring]` | — | Settings for repetition breakers and token ceilings (`repetition_threshold = 5`, `min_pattern_len = 5`). |
 | `[orchestration]` | — | Top-level concurrency and delegation settings (`max_recursion_depth = 3`). |
 | `[orchestration.concurrency]` | _unset_ | Concurrency caps per backend URL and model pair. |
-| `[orchestration.specialists.<role>]` | — | Per-role configuration overrides (`model`, `backend_url`, `tools`, `mcp_servers`, `reasoning_effort`, `max_validator_iterations`). |
+| `[orchestration.specialists.<role>]` | — | Per-role configuration overrides (`model`, `backend_url`, `backend_urls`, `tools`, `mcp_servers`, `reasoning_effort`, `max_validator_iterations`). |
 | `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`, `prompt`, `idle_timeout_secs`, `request_timeout_secs`). |
 
 ### Example `marmel.toml`
