@@ -240,7 +240,7 @@ Marmel loads the first configuration file found from this list (files are not me
 | `[orchestration]` | — | Top-level concurrency and delegation settings (`max_recursion_depth = 3`). |
 | `[orchestration.concurrency]` | _unset_ | Concurrency caps per backend URL and model pair. |
 | `[orchestration.specialists.<role>]` | — | Per-role configuration overrides (`model`, `backend_url`, `tools`, `mcp_servers`, `reasoning_effort`, `max_validator_iterations`). |
-| `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`, `prompt`, `idle_timeout_secs`). |
+| `[mcp_servers.<name>]` | — | External MCP server registration (`command`, `args`, `env`, `url`, `prompt`, `idle_timeout_secs`, `request_timeout_secs`). |
 
 ### Example `marmel.toml`
 
@@ -284,6 +284,7 @@ External MCP servers (stdio and HTTP/SSE) are managed on demand with an idle-tim
 - **On-Demand:** Server connections are established on demand and do not consume idle resources indefinitely.
 - **Connection Cache:** Active connections are cached across consecutive tool calls to avoid launch overhead.
 - **Idle Timeout (`idle_timeout_secs`):** Connections inactive for longer than `idle_timeout_secs` (default `300` seconds / 5 minutes) are automatically closed by a background reaper. Set `idle_timeout_secs = 0` to disable idle teardown. Subsequent calls reconnect transparently.
+- **Request Timeout (`request_timeout_secs`):** Per-request deadline for tool executions and MCP protocol handshakes (default `180` seconds / 3 minutes). Can also be specified as `timeout_secs` or `timeout`.
 
 ### Reasoning Effort (`reasoning_effort`)
 

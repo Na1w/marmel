@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use super::http::{HttpSseConnection, MCP_REQUEST_TIMEOUT};
+use super::http::{DEFAULT_MCP_REQUEST_TIMEOUT, HttpSseConnection};
 use super::protocol::{
     self, JsonRpcNotification, JsonRpcRequest, JsonRpcTransport, RequestIds, decode_reply,
 };
@@ -43,6 +43,20 @@ pub struct McpServerConfig {
     /// Idle timeout in seconds before closing the inactive connection.
     /// Defaults to 300 seconds (5 minutes). Set to 0 to disable idle closing.
     pub idle_timeout_secs: Option<u64>,
+    /// Request timeout in seconds for tool calls and protocol requests.
+    /// Defaults to 180 seconds (3 minutes).
+    #[serde(alias = "timeout_secs", alias = "timeout")]
+    pub request_timeout_secs: Option<u64>,
+}
+
+impl McpServerConfig {
+    /// Effective request timeout duration. Defaults to [`DEFAULT_MCP_REQUEST_TIMEOUT`] (180 seconds).
+    pub fn request_timeout(&self) -> std::time::Duration {
+        match self.request_timeout_secs {
+            Some(secs) => std::time::Duration::from_secs(secs),
+            None => DEFAULT_MCP_REQUEST_TIMEOUT,
+        }
+    }
 }
 
 /// Discovered MCP Tool definition.
@@ -76,7 +90,7 @@ pub struct StdioMcpConnection {
     /// ([`super::protocol::RequestIds`]); the transport only carries it.
     request_ids: RequestIds,
     /// Per-response deadline shared with the HTTP transport
-    /// (`crate::mcp::http::MCP_REQUEST_TIMEOUT`).
+    /// ([`DEFAULT_MCP_REQUEST_TIMEOUT`]).
     request_timeout: std::time::Duration,
     /// The detached stderr pump this connection spawned at
     /// [`spawn_with`](Self::spawn_with), kept as an owned handle so
@@ -96,12 +110,12 @@ pub struct StdioMcpConnection {
 
 impl StdioMcpConnection {
     pub async fn spawn(server_name: &str, cfg: &McpServerConfig) -> Result<Self> {
-        Self::spawn_with(server_name, cfg, MCP_REQUEST_TIMEOUT).await
+        Self::spawn_with(server_name, cfg, cfg.request_timeout()).await
     }
 
     /// Spawn with an explicit response deadline. Production callers go through
-    /// [`Self::spawn`] (shared `MCP_REQUEST_TIMEOUT`); the seam keeps the
-    /// deadline behaviour testable without waiting 30 s.
+    /// [`Self::spawn`] (uses `cfg.request_timeout()`); the seam keeps the
+    /// deadline behaviour testable without waiting 180 s.
     pub(crate) async fn spawn_with(
         server_name: &str,
         cfg: &McpServerConfig,
@@ -183,6 +197,11 @@ impl StdioMcpConnection {
     /// Server instructions returned during the `initialize` handshake, if any.
     pub fn instructions(&self) -> Option<&str> {
         self.instructions.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_timeout(&self) -> std::time::Duration {
+        self.request_timeout
     }
 }
 
@@ -540,6 +559,12 @@ impl ServerSlot {
             Some(secs) => Some(std::time::Duration::from_secs(secs)),
             None => Some(DEFAULT_MCP_IDLE_TIMEOUT),
         }
+    }
+
+    /// Effective request timeout duration.
+    /// Defaults to [`DEFAULT_MCP_REQUEST_TIMEOUT`] (180 seconds).
+    pub fn effective_request_timeout(&self) -> std::time::Duration {
+        self.config.request_timeout()
     }
 
     /// Returns whether this server currently has an active connection.
@@ -2541,5 +2566,43 @@ done"#
         assert_eq!(manager.active_server_count().await, 1);
 
         manager.shutdown().await;
+    }
+
+    #[test]
+    fn mcp_server_config_request_timeout_parsing_and_defaults() {
+        let default_cfg = McpServerConfig::default();
+        assert_eq!(default_cfg.request_timeout(), DEFAULT_MCP_REQUEST_TIMEOUT);
+
+        let toml_str = r#"
+            command = "echo"
+            request_timeout_secs = 60
+        "#;
+        let cfg: McpServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.request_timeout(), std::time::Duration::from_secs(60));
+
+        let toml_str2 = r#"
+            command = "echo"
+            timeout_secs = 45
+        "#;
+        let cfg2: McpServerConfig = toml::from_str(toml_str2).unwrap();
+        assert_eq!(cfg2.request_timeout(), std::time::Duration::from_secs(45));
+
+        let toml_str3 = r#"
+            command = "echo"
+            timeout = 90
+        "#;
+        let cfg3: McpServerConfig = toml::from_str(toml_str3).unwrap();
+        assert_eq!(cfg3.request_timeout(), std::time::Duration::from_secs(90));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_connection_respects_config_request_timeout() {
+        let mut cfg = responsive_server("my_tool");
+        cfg.request_timeout_secs = Some(15);
+        let conn = StdioMcpConnection::spawn("custom-timeout", &cfg)
+            .await
+            .expect("spawn");
+        assert_eq!(conn.request_timeout(), std::time::Duration::from_secs(15));
     }
 }

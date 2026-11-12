@@ -27,7 +27,7 @@ pub use client::{
     DEFAULT_MCP_IDLE_TIMEOUT, McpBootStatus, McpClient, McpManager, McpRegistry, McpServerConfig,
     McpTool, ServerSlot,
 };
-pub use http::HttpSseConnection;
+pub use http::{DEFAULT_MCP_REQUEST_TIMEOUT, HttpSseConnection, MCP_REQUEST_TIMEOUT};
 
 /// The separator that composes an MCP server name with a raw tool name
 /// (`{server_name}{NAME_SEPARATOR}{raw_tool_name}`).

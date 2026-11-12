@@ -36,10 +36,11 @@ use crate::net::{
     BACKOFF_BASE_MS, MAX_ATTEMPTS, PumpNext, RetryOp, Retryable, pump_next, retry_with_backoff,
 };
 
-/// Flat request/response deadline of the MCP transports: the per-event SSE
+/// Default flat request/response deadline of the MCP transports: the per-event SSE
 /// timeout of this transport and the per-line read timeout of the stdio
-/// transport.
-pub(crate) const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// transport. Defaults to 180 seconds (3 minutes).
+pub const DEFAULT_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+pub const MCP_REQUEST_TIMEOUT: Duration = DEFAULT_MCP_REQUEST_TIMEOUT;
 
 /// Options the MCP transport hands to the shared client builder.
 ///
@@ -357,12 +358,12 @@ impl HttpSseConnection {
             .as_ref()
             .ok_or_else(|| anyhow!("missing `url` for HTTP MCP server '{server_name}'"))?;
 
-        Self::establish(server_name, url, MCP_REQUEST_TIMEOUT).await
+        Self::establish(server_name, url, cfg.request_timeout()).await
     }
 
     /// Test seam: same handshake with an explicit request deadline, so the
     /// shared builder's total timeout and the retry schedule can be exercised
-    /// without waiting 30 s per attempt.
+    /// without waiting 180 s per attempt.
     #[cfg(test)]
     pub(crate) async fn connect_with_timeout(
         server_name: &str,
@@ -370,6 +371,11 @@ impl HttpSseConnection {
         request_timeout: Duration,
     ) -> Result<Self> {
         Self::establish(server_name, url, request_timeout).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 
     /// Build the reqwest client through the shared builder and run the

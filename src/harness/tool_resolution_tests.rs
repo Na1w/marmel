@@ -942,7 +942,7 @@ fn delayed_scripted_server(tools: &[&str]) -> ScriptedServer {
 /// lands for as long as the child holds its stdout open. The hold must outlive every
 /// readiness wait the test makes — each leg pays its **own** full budget, so the legs
 /// together take `2 x MCP_READY_TIMEOUT` — and it must stay well under the transport's
-/// own `MCP_REQUEST_TIMEOUT` (30 s) handshake deadline, so that nothing but the
+/// own `DEFAULT_MCP_REQUEST_TIMEOUT` (180 s) handshake deadline, so that nothing but the
 /// readiness budget can end these waits.
 #[cfg(unix)]
 fn unresponsive_server() -> ScriptedServer {
@@ -1169,7 +1169,7 @@ fn a_failed_boot_answers_the_model_with_the_boot_failure_reason() {
 ///
 /// Each leg runs against its **own** boot, and sequentially: they cannot share one
 /// manager inside a single task, because the blocking half (`dispatch_for`) holds the
-/// thread it runs on and lets the *transport's* own `MCP_REQUEST_TIMEOUT` (30 s)
+/// thread it runs on and lets the *transport's* own `DEFAULT_MCP_REQUEST_TIMEOUT` (180 s)
 /// publish a `Failed` verdict in the middle of the async half's wait — and
 /// `tokio::time::timeout` polls its **inner** future first, so a late verdict would
 /// answer the call instead of the budget this gate is supposed to have enforced. A

@@ -11,6 +11,7 @@
 #[cfg(test)]
 mod tests {
 
+    use crate::mcp::McpServerConfig;
     use crate::mcp::http::{
         HttpSseConnection, MCP_REQUEST_TIMEOUT, McpError, http_client_options, is_retryable_status,
     };
@@ -411,12 +412,12 @@ mod tests {
         );
 
         // The MCP-specific settings survive, as parameters of the shared builder.
-        assert_eq!(MCP_REQUEST_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(MCP_REQUEST_TIMEOUT, Duration::from_secs(180));
         let opts = http_client_options(MCP_REQUEST_TIMEOUT);
         assert_eq!(
             opts.total_timeout,
-            Some(Duration::from_secs(30)),
-            "MCP keeps its own 30 s total request timeout"
+            Some(Duration::from_secs(180)),
+            "MCP keeps its own 180 s total request timeout"
         );
         assert_eq!(
             opts.connect_timeout, None,
@@ -1017,5 +1018,19 @@ mod tests {
             MAX_ATTEMPTS as usize,
             "a reqwest total timeout (from the shared builder) is a retryable transport failure"
         );
+    }
+
+    #[tokio::test]
+    async fn http_connection_respects_config_request_timeout() {
+        let (server, _bodies) = mount_recording_endpoint(EndpointBehaviour::JsonToolsList).await;
+        let cfg = McpServerConfig {
+            url: Some(format!("{}/mcp", server.uri())),
+            request_timeout_secs: Some(42),
+            ..Default::default()
+        };
+        let conn = HttpSseConnection::connect("test-http", &cfg)
+            .await
+            .expect("connect");
+        assert_eq!(conn.request_timeout(), Duration::from_secs(42));
     }
 }

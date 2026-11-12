@@ -1,7 +1,7 @@
 //! Shared reqwest client construction — the single place both clients are built.
 //!
 //! The LLM client wants `connect_timeout(10s)` and no total timeout; the MCP
-//! transport wants `timeout(30s)` and no connect timeout. Each caller
+//! transport wants `timeout(180s)` by default (configurable per server) and no connect timeout. Each caller
 //! keeps the client-level settings it genuinely needs by passing them in as
 //! [`HttpClientOptions`]; per-request concerns (auth headers, `Accept`,
 //! `Mcp-Session-Id`, bodies) stay at the call sites.
