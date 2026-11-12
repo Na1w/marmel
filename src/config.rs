@@ -215,12 +215,18 @@ pub struct SpecialistConfig {
     pub model: Option<String>,
     /// Optional backend URL override for this specialist.
     pub backend_url: Option<String>,
+    /// Optional backend URLs override for this specialist (evaluated in priority order).
+    #[serde(default)]
+    pub backend_urls: Vec<String>,
     /// Optional auth token override for this specialist.
     pub auth_token: Option<String>,
     /// Optional model override for this specialist's validator.
     pub validator_model: Option<String>,
     /// Optional backend URL override for this specialist's validator.
     pub validator_backend_url: Option<String>,
+    /// Optional backend URLs override for this specialist's validator (evaluated in priority order).
+    #[serde(default)]
+    pub validator_backend_urls: Vec<String>,
     /// Optional auth token override for this specialist's validator.
     pub validator_auth_token: Option<String>,
     /// Optional reasoning-effort override for this specialist's validator
@@ -246,6 +252,32 @@ pub struct SpecialistConfig {
     /// Optional custom prompt / instructions appended to this specialist's system prompt.
     #[serde(alias = "instructions", alias = "system_prompt", alias = "base_prompt")]
     pub prompt: Option<String>,
+}
+
+impl SpecialistConfig {
+    /// Candidate backend URLs for this specialist, respecting specialist overrides
+    /// and falling back to global config.
+    pub fn effective_backend_urls(&self, global: &Config) -> Vec<String> {
+        if !self.backend_urls.is_empty() {
+            self.backend_urls.clone()
+        } else if let Some(url) = &self.backend_url {
+            vec![url.clone()]
+        } else {
+            global.effective_backend_urls()
+        }
+    }
+
+    /// Candidate backend URLs for this specialist's validator, respecting specialist overrides
+    /// and falling back to the specialist's or global backends.
+    pub fn effective_validator_backend_urls(&self, global: &Config) -> Vec<String> {
+        if !self.validator_backend_urls.is_empty() {
+            self.validator_backend_urls.clone()
+        } else if let Some(url) = &self.validator_backend_url {
+            vec![url.clone()]
+        } else {
+            self.effective_backend_urls(global)
+        }
+    }
 }
 
 /// What `git_workflow_policy` says about the git-workflow prompt behaviour.
@@ -325,6 +357,9 @@ impl std::str::FromStr for GitWorkflowPolicy {
 #[serde(default)]
 pub struct Config {
     pub backend_url: String,
+    /// Backend URLs evaluated in priority order (primary -> spillover).
+    #[serde(default)]
+    pub backend_urls: Vec<String>,
     pub auth_token: String,
     pub model: String,
     pub temperature: f32,
@@ -430,6 +465,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             backend_url: "http://localhost:8000/v1".to_string(),
+            backend_urls: Vec::new(),
             auth_token: String::new(),
             model: "qwen-3.8-27b".to_string(),
             temperature: 0.7,
@@ -505,6 +541,18 @@ impl Config {
             return sc.mcp_servers.clone();
         }
         self.effective_orchestration_mcp_servers()
+    }
+
+    /// Returns the configured backend URLs in priority order.
+    /// Falls back to `vec![self.backend_url.clone()]` when `backend_urls` is empty.
+    pub fn effective_backend_urls(&self) -> Vec<String> {
+        if !self.backend_urls.is_empty() {
+            self.backend_urls.clone()
+        } else if !self.backend_url.is_empty() {
+            vec![self.backend_url.clone()]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -968,6 +1016,8 @@ fn resolve_config_path(explicit_path: Option<&str>) -> Option<PathBuf> {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PartialConfig {
     pub backend_url: Option<String>,
+    #[serde(default)]
+    pub backend_urls: Vec<String>,
     pub auth_token: Option<String>,
     pub model: Option<String>,
     pub temperature: Option<f32>,
@@ -1046,10 +1096,19 @@ struct PartialConcurrencyConfig {
 }
 
 fn merge(mut base: Config, partial: PartialConfig) -> Config {
+    if !partial.backend_urls.is_empty() {
+        base.backend_urls = partial.backend_urls;
+        if partial.backend_url.is_none() && !base.backend_urls.is_empty() {
+            base.backend_url = base.backend_urls[0].clone();
+        }
+    }
     if let Some(v) = partial.backend_url
         && !v.is_empty()
     {
-        base.backend_url = v;
+        base.backend_url = v.clone();
+        if base.backend_urls.is_empty() {
+            base.backend_urls = vec![v];
+        }
     }
     if let Some(v) = partial.auth_token
         && !v.is_empty()
@@ -3702,6 +3761,109 @@ session_max_bundle_bytes = 4096
             home_dir_from_env(Some(OsString::from("")), Some(OsString::from(""))),
             None,
             "empty variables must return None rather than a relative PathBuf::new()"
+        );
+    }
+
+    #[test]
+    fn test_backend_urls_parse_and_merge() {
+        // Case 1: Default config has single backend_url and empty backend_urls list,
+        // effective_backend_urls falls back to [backend_url].
+        let def = Config::default();
+        assert_eq!(def.backend_url, "http://localhost:8000/v1");
+        assert!(def.backend_urls.is_empty());
+        assert_eq!(
+            def.effective_backend_urls(),
+            vec!["http://localhost:8000/v1".to_string()]
+        );
+
+        // Case 2: TOML with single backend_url (backward compatibility).
+        let toml_single = r#"backend_url = "http://192.168.1.10:8000/v1""#;
+        let partial: PartialConfig = toml::from_str(toml_single).expect("parses");
+        let cfg = merge(Config::default(), partial);
+        assert_eq!(cfg.backend_url, "http://192.168.1.10:8000/v1");
+        assert_eq!(
+            cfg.effective_backend_urls(),
+            vec!["http://192.168.1.10:8000/v1".to_string()]
+        );
+
+        // Case 3: TOML with backend_urls list in priority order.
+        let toml_multi = r#"
+            backend_urls = [
+                "http://192.168.1.10:8000/v1",
+                "http://192.168.1.11:8000/v1",
+            ]
+        "#;
+        let partial: PartialConfig = toml::from_str(toml_multi).expect("parses");
+        let cfg = merge(Config::default(), partial);
+        assert_eq!(
+            cfg.backend_urls,
+            vec![
+                "http://192.168.1.10:8000/v1".to_string(),
+                "http://192.168.1.11:8000/v1".to_string(),
+            ]
+        );
+        // backend_url is automatically updated to the primary URL:
+        assert_eq!(cfg.backend_url, "http://192.168.1.10:8000/v1");
+        assert_eq!(
+            cfg.effective_backend_urls(),
+            vec![
+                "http://192.168.1.10:8000/v1".to_string(),
+                "http://192.168.1.11:8000/v1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_specialist_backend_urls_override() {
+        let toml_str = r#"
+            backend_urls = ["http://global-a/v1", "http://global-b/v1"]
+
+            [orchestration.specialists.coder]
+            module = "src/agents/coder.rs"
+            backend_urls = ["http://coder-a/v1", "http://coder-b/v1"]
+            validator_backend_urls = ["http://coder-val-a/v1"]
+
+            [orchestration.specialists.researcher]
+            module = "src/agents/researcher.rs"
+            backend_url = "http://researcher-solo/v1"
+
+            [orchestration.specialists.generalist]
+            module = "src/agents/generalist.rs"
+        "#;
+        let partial: PartialConfig = toml::from_str(toml_str).expect("parses");
+        let cfg = merge(Config::default(), partial);
+
+        // Coder has explicit backend_urls and validator_backend_urls:
+        let coder = cfg.orchestration.specialists.get("coder").unwrap();
+        assert_eq!(
+            coder.effective_backend_urls(&cfg),
+            vec!["http://coder-a/v1", "http://coder-b/v1"]
+        );
+        assert_eq!(
+            coder.effective_validator_backend_urls(&cfg),
+            vec!["http://coder-val-a/v1"]
+        );
+
+        // Researcher has single backend_url:
+        let researcher = cfg.orchestration.specialists.get("researcher").unwrap();
+        assert_eq!(
+            researcher.effective_backend_urls(&cfg),
+            vec!["http://researcher-solo/v1"]
+        );
+        assert_eq!(
+            researcher.effective_validator_backend_urls(&cfg),
+            vec!["http://researcher-solo/v1"]
+        );
+
+        // Generalist has no overrides, inherits global:
+        let generalist = cfg.orchestration.specialists.get("generalist").unwrap();
+        assert_eq!(
+            generalist.effective_backend_urls(&cfg),
+            vec!["http://global-a/v1", "http://global-b/v1"]
+        );
+        assert_eq!(
+            generalist.effective_validator_backend_urls(&cfg),
+            vec!["http://global-a/v1", "http://global-b/v1"]
         );
     }
 }

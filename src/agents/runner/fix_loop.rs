@@ -659,21 +659,36 @@ pub fn resolve_validator_backend(
         .orchestration
         .specialists
         .get(crate::agents::Agent::Validator.as_str());
-    let backend = specialist_cfg
-        .and_then(|sc| sc.validator_backend_url.as_ref())
-        .or_else(|| validator_cfg.and_then(|vc| vc.backend_url.as_ref()))
-        .unwrap_or(&cfg.backend_url)
-        .to_string();
-    let token = specialist_cfg
-        .and_then(|sc| sc.validator_auth_token.as_ref())
-        .or_else(|| validator_cfg.and_then(|vc| vc.auth_token.as_ref()))
-        .unwrap_or(&cfg.auth_token)
-        .to_string();
     let model = specialist_cfg
         .and_then(|sc| sc.validator_model.as_ref())
         .or_else(|| validator_cfg.and_then(|vc| vc.model.as_ref()))
         .cloned()
         .unwrap_or_else(|| cfg.model.clone());
+    let candidates = specialist_cfg
+        .and_then(|sc| {
+            if !sc.validator_backend_urls.is_empty() {
+                Some(sc.validator_backend_urls.clone())
+            } else {
+                sc.validator_backend_url.as_ref().map(|u| vec![u.clone()])
+            }
+        })
+        .or_else(|| {
+            validator_cfg.and_then(|vc| {
+                if !vc.backend_urls.is_empty() {
+                    Some(vc.backend_urls.clone())
+                } else {
+                    vc.backend_url.as_ref().map(|u| vec![u.clone()])
+                }
+            })
+        })
+        .unwrap_or_else(|| cfg.effective_backend_urls());
+    let backend = crate::orchestrator::pool::select_worker_backend(&candidates, &model)
+        .unwrap_or_else(|| cfg.backend_url.clone());
+    let token = specialist_cfg
+        .and_then(|sc| sc.validator_auth_token.as_ref())
+        .or_else(|| validator_cfg.and_then(|vc| vc.auth_token.as_ref()))
+        .unwrap_or(&cfg.auth_token)
+        .to_string();
     // Per-validator dial: the specialist's `validator_reasoning_effort` (the key
     // that sits next to `validator_model`) wins; otherwise the top-level
     // `Config::reasoning_effort`; otherwise unset ⇒ omitted from the body. The

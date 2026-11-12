@@ -3,6 +3,14 @@
 # Base URL of the OpenAI-compatible chat completions backend (no trailing slash).
 backend_url = "http://localhost:8000/v1"
 
+# Alternatively, specify multiple backend URLs in priority order (primary -> spillover/fallback).
+# Workers schedule onto the primary host while it has available slots, and spill over to
+# secondary hosts when the primary is busy or unreachable:
+# backend_urls = [
+#     "http://192.168.1.10:8000/v1",
+#     "http://192.168.1.11:8000/v1",
+# ]
+
 # Optional bearer token sent as `Authorization: Bearer <token>`.
 auth_token = ""
 

@@ -76,17 +76,18 @@ pub fn resolve_specialist_backend(
     agent: Agent,
 ) -> (String, String, String) {
     let specialist_cfg = cfg.orchestration.specialists.get(agent.as_str());
-    let backend = specialist_cfg
-        .and_then(|sc| sc.backend_url.as_ref())
-        .unwrap_or(&cfg.backend_url)
-        .to_string();
-    let auth_token = specialist_cfg
-        .and_then(|sc| sc.auth_token.as_ref())
-        .unwrap_or(&cfg.auth_token)
-        .to_string();
+    let candidates = specialist_cfg
+        .map(|sc| sc.effective_backend_urls(cfg))
+        .unwrap_or_else(|| cfg.effective_backend_urls());
     let model = specialist_cfg
         .and_then(|sc| sc.model.as_ref())
         .unwrap_or(&cfg.model)
+        .to_string();
+    let backend = crate::orchestrator::pool::select_worker_backend(&candidates, &model)
+        .unwrap_or_else(|| cfg.backend_url.clone());
+    let auth_token = specialist_cfg
+        .and_then(|sc| sc.auth_token.as_ref())
+        .unwrap_or(&cfg.auth_token)
         .to_string();
     (backend, auth_token, model)
 }

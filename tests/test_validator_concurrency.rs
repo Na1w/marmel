@@ -435,6 +435,61 @@ async fn a_validator_override_resolves_to_a_separate_pool() {
     set_active(Config::default());
 }
 
+#[tokio::test]
+async fn specialist_multi_backend_spillover_when_primary_full() {
+    let _serial = VC_TEST_MUTEX.lock().await;
+    reset_cancellation();
+    pool::reset_unhealthy_backends();
+
+    let primary = "http://spill-pri.invalid:8080/v1".to_string();
+    let secondary = "http://spill-sec.invalid:8080/v1".to_string();
+    let model = "model-spill";
+
+    let mut cfg = capped_cfg(&primary, model, 1);
+    cfg.backend_urls = vec![primary.clone(), secondary.clone()];
+    cfg.orchestration
+        .concurrency
+        .by_backend
+        .insert(secondary.clone(), 1);
+    set_active(cfg.clone());
+
+    // 1. Primary has spare capacity -> chosen
+    let (sb1, _, sm1) = resolve_specialist_backend(&cfg, Agent::Coder);
+    assert_eq!(sb1, primary);
+    assert_eq!(sm1, model);
+
+    // 2. Primary slot is occupied by worker 1:
+    let pool_pri = pool::entry_for(&primary, model).expect("pool exists");
+    let permit = pool_pri.semaphore().clone().acquire_owned().await.unwrap();
+    assert_eq!(pool_pri.available(), 0);
+
+    // 3. Worker 2 resolves -> spills over to secondary!
+    let (sb2, _, sm2) = resolve_specialist_backend(&cfg, Agent::Coder);
+    assert_eq!(sb2, secondary);
+    assert_eq!(sm2, model);
+
+    // 4. Worker 1 finishes and drops its permit on primary:
+    drop(permit);
+    assert_eq!(pool_pri.available(), 1);
+
+    // 5. Worker 3 resolves -> primary has free slots again, so primary is chosen!
+    let (sb3, _, sm3) = resolve_specialist_backend(&cfg, Agent::Coder);
+    assert_eq!(sb3, primary);
+    assert_eq!(sm3, model);
+
+    // 6. Primary is marked unhealthy -> spills over to secondary even when primary is free:
+    pool::mark_backend_unhealthy(&primary);
+    let (sb4, _, _) = resolve_specialist_backend(&cfg, Agent::Coder);
+    assert_eq!(sb4, secondary);
+
+    // 7. Primary recovers:
+    pool::mark_backend_healthy(&primary);
+    let (sb5, _, _) = resolve_specialist_backend(&cfg, Agent::Coder);
+    assert_eq!(sb5, primary);
+
+    set_active(Config::default());
+}
+
 /// The behavioural half of the same statement: an auditor's calls are metered
 /// against the pool of the pair its client was built from, so an auditor pointed
 /// at its own model runs straight through a saturated specialist slot instead of
