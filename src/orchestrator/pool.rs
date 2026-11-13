@@ -398,6 +398,10 @@ pub fn has_spare_session_capacity(backend_url: &str, model: &str) -> bool {
         return false;
     }
     let key = pool_key(backend_url, model);
+    let active = active_worker_count(backend_url, model);
+    if active >= limit {
+        return false;
+    }
     POOLS
         .get(&key)
         .is_none_or(|entry| entry.waiting() == 0 && entry.available() > 0)
@@ -412,7 +416,47 @@ pub fn open_pool_count() -> usize {
 pub const BACKEND_UNHEALTHY_COOLDOWN_SECS: u64 = 30;
 
 static UNHEALTHY_BACKENDS: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
+static ACTIVE_WORKERS: LazyLock<DashMap<PoolKey, usize>> = LazyLock::new(DashMap::new);
+static SELECTION_MUTEX: Mutex<()> = Mutex::new(());
 static RR_UNMETERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of active workers currently assigned to a (backend, model) pair.
+pub fn active_worker_count(backend_url: &str, model: &str) -> usize {
+    let key = pool_key(backend_url, model);
+    ACTIVE_WORKERS.get(&key).map(|v| *v).unwrap_or(0)
+}
+
+/// Reset active workers registry. Test/diagnostic only.
+pub fn reset_active_workers() {
+    ACTIVE_WORKERS.clear();
+}
+
+/// An RAII guard tracking an active worker assignment to a (backend, model) pair.
+#[derive(Debug)]
+pub struct WorkerLease {
+    key: PoolKey,
+}
+
+impl WorkerLease {
+    pub fn new(backend_url: &str, model: &str) -> Self {
+        let key = pool_key(backend_url, model);
+        ACTIVE_WORKERS
+            .entry(key.clone())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        Self { key }
+    }
+}
+
+impl Drop for WorkerLease {
+    fn drop(&mut self) {
+        if let Some(mut count) = ACTIVE_WORKERS.get_mut(&self.key)
+            && *count > 0
+        {
+            *count -= 1;
+        }
+    }
+}
 
 /// Mark a backend URL as temporarily unhealthy (e.g. after a transport failure).
 pub fn mark_backend_unhealthy(backend_url: &str) {
@@ -444,22 +488,7 @@ pub fn reset_unhealthy_backends() {
     UNHEALTHY_BACKENDS.clear();
 }
 
-/// Select the best backend for a new worker from an ordered list of candidate URLs.
-///
-/// Priority/Spillover policy:
-/// 1. Evaluates candidates in configured order (Primary -> Secondary/Spillover -> ...).
-/// 2. If a healthy candidate has spare session capacity ([`has_spare_session_capacity`]),
-///    it is selected immediately. This ensures sequential tasks stay on the primary
-///    host (maximizing KV-cache reuse), and only spill over when the primary is busy
-///    or unhealthy.
-/// 3. If none of the candidates are capped (all unmetered), rotates healthy candidates
-///    round-robin so load is distributed evenly across backends.
-/// 4. If capped candidates are all currently full (0 free permits), chooses the
-///    healthy candidate with the shortest waiting queue ([`PoolEntry::waiting`]), or the
-///    first healthy candidate if equal.
-/// 5. If all candidates are marked unhealthy (e.g. network partition), fails open
-///    by picking the first candidate (or first with capacity) so the system can attempt recovery.
-pub fn select_worker_backend(candidates: &[String], model: &str) -> Option<String> {
+fn select_worker_backend_internal(candidates: &[String], model: &str) -> Option<String> {
     if candidates.is_empty() {
         return None;
     }
@@ -480,16 +509,18 @@ pub fn select_worker_backend(candidates: &[String], model: &str) -> Option<Strin
             }
         }
 
-        // Pass 2: If none have spare capacity, pick healthy candidate with shortest waiting queue.
+        // Pass 2: If none have spare capacity, pick healthy candidate with shortest waiting queue + active workers.
         let mut best_healthy: Option<(&String, usize)> = None;
         for candidate in candidates {
             if is_backend_healthy(candidate) {
                 let key = pool_key(candidate, model);
                 let waiting = POOLS.get(&key).map(|e| e.waiting()).unwrap_or(0);
+                let active = active_worker_count(candidate, model);
+                let load = waiting + active;
                 match best_healthy {
-                    None => best_healthy = Some((candidate, waiting)),
-                    Some((_, best_waiting)) if waiting < best_waiting => {
-                        best_healthy = Some((candidate, waiting));
+                    None => best_healthy = Some((candidate, load)),
+                    Some((_, best_load)) if load < best_load => {
+                        best_healthy = Some((candidate, load));
                     }
                     _ => {}
                 }
@@ -519,6 +550,24 @@ pub fn select_worker_backend(candidates: &[String], model: &str) -> Option<Strin
     }
 
     Some(candidates[0].clone())
+}
+
+/// Select the best backend for a new worker from an ordered list of candidate URLs,
+/// acquiring an RAII [`WorkerLease`] that tracks the assigned worker.
+pub fn select_worker_backend_with_lease(
+    candidates: &[String],
+    model: &str,
+) -> Option<(String, WorkerLease)> {
+    let _guard = SELECTION_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let selected = select_worker_backend_internal(candidates, model)?;
+    let lease = WorkerLease::new(&selected, model);
+    Some((selected, lease))
+}
+
+/// Select the best backend for a new worker from an ordered list of candidate URLs.
+pub fn select_worker_backend(candidates: &[String], model: &str) -> Option<String> {
+    let _guard = SELECTION_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    select_worker_backend_internal(candidates, model)
 }
 
 /// Take a FIFO ticket for this key's queue.

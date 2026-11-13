@@ -12,7 +12,7 @@
 use crate::agents::Agent;
 use crate::agents::runner::fix_loop::{
     FixLoopBounds, FixLoopResult, LoopParams, assemble_tools, register_loop_worker,
-    resolve_validator_backend, run_fix_loop,
+    resolve_validator_backend_with_lease, run_fix_loop,
 };
 use crate::markers::{has_failure_verdict_cue, is_failure_verdict_word};
 use crate::tool_names::is_leave_verdict_tool_name;
@@ -406,8 +406,8 @@ async fn run_automated_validation_inner(
     // `[specialists.validator] backend_url` or a `validator_model` /
     // `[specialists.validator] model` override resolves elsewhere, which is
     // correct: a different model server has its own slots, so it gets its own pool.
-    let (backend, auth, validator_model, validator_reasoning_effort) =
-        resolve_validator_backend(cfg, agent);
+    let (backend, auth, validator_model, validator_reasoning_effort, _val_lease) =
+        resolve_validator_backend_with_lease(cfg, agent);
     let val_client = crate::llm::ChatClient::new_with_token(&backend, &validator_model, &auth);
 
     let brief = format!(
@@ -617,8 +617,8 @@ async fn run_plan_validation_inner(
     // resolved `backend + model` pair, which is the global pair (and therefore the
     // global cap) unless a `[specialists.planner] validator_*` or
     // `[specialists.validator]` override points it at another endpoint/model.
-    let (backend, auth, validator_model, validator_reasoning_effort) =
-        resolve_validator_backend(cfg, Agent::Planner);
+    let (backend, auth, validator_model, validator_reasoning_effort, _val_lease) =
+        resolve_validator_backend_with_lease(cfg, Agent::Planner);
     let val_client = crate::llm::ChatClient::new_with_token(&backend, &validator_model, &auth);
 
     let brief = format!(
