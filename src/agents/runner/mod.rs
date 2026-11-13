@@ -41,13 +41,7 @@ pub(crate) async fn run_specialist_llm(
         return res;
     }
 
-    let is_test_runner = std::env::current_exe()
-        .map(|p| {
-            let s = p.to_string_lossy();
-            s.contains("/deps/") || s.contains(r"\deps\")
-        })
-        .unwrap_or(false)
-        && std::env::var("MARMEL_LIVE_TEST").is_err();
+    let is_test_runner = crate::agents::is_test_runner();
 
     if is_test_runner {
         canned
@@ -118,15 +112,8 @@ pub(crate) async fn try_run_specialist_live(
     if tokio::runtime::Handle::try_current().is_err() {
         return None;
     }
-    // If running inside cargo test suite (integration tests binaries in target/.../deps/), bypass live network calls
-    if std::env::current_exe()
-        .map(|p| {
-            let s = p.to_string_lossy();
-            s.contains("/deps/") || s.contains(r"\deps\")
-        })
-        .unwrap_or(false)
-        && std::env::var("MARMEL_LIVE_TEST").is_err()
-    {
+    // If running inside cargo test suite (integration tests binaries in target/.../deps/ or build/.../out), bypass live network calls
+    if crate::agents::is_test_runner() {
         return None;
     }
     let cfg = crate::config::get_active().or_else(|| crate::config::load(None).ok())?;

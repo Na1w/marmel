@@ -29,6 +29,26 @@ pub(crate) use runner::run_specialist_llm;
 pub use validation::ValidationOutcome;
 pub use validator::Validator;
 
+/// Returns true if currently running within a cargo test runner (unit test or integration test binary),
+/// unless `MARMEL_LIVE_TEST` is explicitly set.
+pub fn is_test_runner() -> bool {
+    (cfg!(test)
+        || std::env::current_exe()
+            .map(|p| {
+                let s = p.to_string_lossy();
+                s.contains("/deps/")
+                    || s.contains(r"\deps\")
+                    || s.contains("/build/")
+                    || s.contains(r"\build\")
+                    || p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|name| name.starts_with("test_") || name.starts_with("test-"))
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false))
+        && std::env::var("MARMEL_LIVE_TEST").is_err()
+}
+
 use crate::markers::{ABORT_REASON, aborted_deliverable};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

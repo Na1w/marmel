@@ -319,13 +319,7 @@ impl PromptBuilder {
         req: &DelegationRequest,
         prompts_dir: Option<&Path>,
     ) -> AgentBlueprint {
-        let is_test_runner = std::env::current_exe()
-            .map(|p| {
-                let s = p.to_string_lossy();
-                s.contains("/deps/") || s.contains(r"\deps\")
-            })
-            .unwrap_or(false)
-            && std::env::var("MARMEL_LIVE_TEST").is_err();
+        let is_test_runner = crate::agents::is_test_runner();
 
         let blueprint = if req.agent_name == crate::agents::Agent::Planner || is_test_runner {
             Self::synthesize_offline(catalog, req)
