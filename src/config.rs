@@ -748,6 +748,27 @@ pub fn effective_max_sessions(backend_url: &str) -> Option<usize> {
     }
 }
 
+/// Total simultaneous LLM session capacity across all active backends according to
+/// `[orchestration.concurrency]`.
+///
+/// - If any active backend is unmetered (no cap or cap below [`MIN_MAX_SESSIONS`]),
+///   returns `None` (unlimited).
+/// - Otherwise, returns the sum of caps across the active backend URLs.
+pub fn effective_parallel_capacity(cfg: &Config) -> Option<usize> {
+    let urls = cfg.effective_backend_urls();
+    if urls.is_empty() {
+        return None;
+    }
+    let mut total = 0;
+    for url in &urls {
+        match resolve_max_sessions(&cfg.orchestration.concurrency, url) {
+            Some(cap) if cap >= MIN_MAX_SESSIONS => total += cap,
+            _ => return None,
+        }
+    }
+    if total > 0 { Some(total) } else { None }
+}
+
 /// The `git_workflow_policy` of the globally active config;
 /// [`GitWorkflowPolicy::default`] when no config is active — i.e. the key's own
 /// default value, so a prompt path that finds no active config behaves as if the

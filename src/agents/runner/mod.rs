@@ -41,13 +41,7 @@ pub(crate) async fn run_specialist_llm(
         return res;
     }
 
-    let is_test_runner = std::env::current_exe()
-        .map(|p| {
-            let s = p.to_string_lossy();
-            s.contains("/deps/") || s.contains(r"\deps\")
-        })
-        .unwrap_or(false)
-        && std::env::var("MARMEL_LIVE_TEST").is_err();
+    let is_test_runner = crate::agents::is_test_runner();
 
     if is_test_runner {
         canned
@@ -71,10 +65,15 @@ pub(crate) async fn run_specialist_llm(
 /// either side both chains land on the global `backend_url` + `model` and one
 /// semaphore serves both (validator passes count against the same `max_sessions`,
 /// design §4); an override on either side moves that side to its own pool.
-pub fn resolve_specialist_backend(
+pub fn resolve_specialist_backend_with_lease(
     cfg: &crate::config::Config,
     agent: Agent,
-) -> (String, String, String) {
+) -> (
+    String,
+    String,
+    String,
+    crate::orchestrator::pool::WorkerLease,
+) {
     let specialist_cfg = cfg.orchestration.specialists.get(agent.as_str());
     let candidates = specialist_cfg
         .map(|sc| sc.effective_backend_urls(cfg))
@@ -83,12 +82,25 @@ pub fn resolve_specialist_backend(
         .and_then(|sc| sc.model.as_ref())
         .unwrap_or(&cfg.model)
         .to_string();
-    let backend = crate::orchestrator::pool::select_worker_backend(&candidates, &model)
-        .unwrap_or_else(|| cfg.backend_url.clone());
+    let (backend, lease) =
+        crate::orchestrator::pool::select_worker_backend_with_lease(&candidates, &model)
+            .unwrap_or_else(|| {
+                let b = cfg.backend_url.clone();
+                let l = crate::orchestrator::pool::WorkerLease::new(&b, &model);
+                (b, l)
+            });
     let auth_token = specialist_cfg
         .and_then(|sc| sc.auth_token.as_ref())
         .unwrap_or(&cfg.auth_token)
         .to_string();
+    (backend, auth_token, model, lease)
+}
+
+pub fn resolve_specialist_backend(
+    cfg: &crate::config::Config,
+    agent: Agent,
+) -> (String, String, String) {
+    let (backend, auth_token, model, _lease) = resolve_specialist_backend_with_lease(cfg, agent);
     (backend, auth_token, model)
 }
 
@@ -100,19 +112,13 @@ pub(crate) async fn try_run_specialist_live(
     if tokio::runtime::Handle::try_current().is_err() {
         return None;
     }
-    // If running inside cargo test suite (integration tests binaries in target/.../deps/), bypass live network calls
-    if std::env::current_exe()
-        .map(|p| {
-            let s = p.to_string_lossy();
-            s.contains("/deps/") || s.contains(r"\deps\")
-        })
-        .unwrap_or(false)
-        && std::env::var("MARMEL_LIVE_TEST").is_err()
-    {
+    // If running inside cargo test suite (integration tests binaries in target/.../deps/ or build/.../out), bypass live network calls
+    if crate::agents::is_test_runner() {
         return None;
     }
     let cfg = crate::config::get_active().or_else(|| crate::config::load(None).ok())?;
-    let (backend_url, auth_token, model) = resolve_specialist_backend(&cfg, agent);
+    let (backend_url, auth_token, model, _worker_lease) =
+        resolve_specialist_backend_with_lease(&cfg, agent);
     if backend_url.is_empty() {
         return None;
     }

@@ -650,10 +650,16 @@ pub fn assemble_tools(
 /// unset). Blank values are normalized away **here**, so an empty
 /// `validator_reasoning_effort` falls through to the top-level value instead of
 /// masking it; [`build_turn_request`] normalizes again as the wire chokepoint.
-pub fn resolve_validator_backend(
+pub fn resolve_validator_backend_with_lease(
     cfg: &crate::config::Config,
     specialist: crate::agents::Agent,
-) -> (String, String, String, Option<String>) {
+) -> (
+    String,
+    String,
+    String,
+    Option<String>,
+    crate::orchestrator::pool::WorkerLease,
+) {
     let specialist_cfg = cfg.orchestration.specialists.get(specialist.as_str());
     let validator_cfg = cfg
         .orchestration
@@ -682,25 +688,30 @@ pub fn resolve_validator_backend(
             })
         })
         .unwrap_or_else(|| cfg.effective_backend_urls());
-    let backend = crate::orchestrator::pool::select_worker_backend(&candidates, &model)
-        .unwrap_or_else(|| cfg.backend_url.clone());
+    let (backend, lease) =
+        crate::orchestrator::pool::select_worker_backend_with_lease(&candidates, &model)
+            .unwrap_or_else(|| {
+                let b = cfg.backend_url.clone();
+                let l = crate::orchestrator::pool::WorkerLease::new(&b, &model);
+                (b, l)
+            });
     let token = specialist_cfg
         .and_then(|sc| sc.validator_auth_token.as_ref())
         .or_else(|| validator_cfg.and_then(|vc| vc.auth_token.as_ref()))
         .unwrap_or(&cfg.auth_token)
         .to_string();
-    // Per-validator dial: the specialist's `validator_reasoning_effort` (the key
-    // that sits next to `validator_model`) wins; otherwise the top-level
-    // `Config::reasoning_effort`; otherwise unset ⇒ omitted from the body. The
-    // `[specialists.validator]` entry is consulted for model/backend/token above
-    // but carries no `validator_reasoning_effort` of its own here, because that
-    // key is defined on the *audited* role's section (it names that role's
-    // validator), and the specialist's own `reasoning_effort` is never a
-    // validator value. A blank value at either level counts as **unset**, so it
-    // falls through the chain instead of masking the level below it.
     let reasoning_effort = specialist_cfg
         .and_then(|sc| normalized_reasoning_effort(sc.validator_reasoning_effort.as_deref()))
         .or_else(|| normalized_reasoning_effort(cfg.reasoning_effort.as_deref()));
+    (backend, token, model, reasoning_effort, lease)
+}
+
+pub fn resolve_validator_backend(
+    cfg: &crate::config::Config,
+    specialist: crate::agents::Agent,
+) -> (String, String, String, Option<String>) {
+    let (backend, token, model, reasoning_effort, _lease) =
+        resolve_validator_backend_with_lease(cfg, specialist);
     (backend, token, model, reasoning_effort)
 }
 

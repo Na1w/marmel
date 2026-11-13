@@ -128,16 +128,24 @@ pub(crate) fn load_system_prompt_with_plan_and_warning(
             }
         }
     }
-    if crate::config::resolve_max_sessions(&cfg.orchestration.concurrency, &cfg.backend_url)
-        == Some(1)
-    {
-        prompt.push_str(
-            "\n## Single-Session Backend Scheduling (`max_sessions = 1`)\n\
-             The active LLM backend is configured with `max_sessions = 1` (a single inference slot). \
-             To preserve KV-cache prefix locality and avoid turn-by-turn prompt eviction across concurrent subagents, \
-             **you MUST schedule `delegate_task` calls sequentially: emit ONLY ONE `delegate_task` call per turn** \
-             and wait for that specialist to complete before delegating the next pending task.\n",
-        );
+    if let Some(capacity) = crate::config::effective_parallel_capacity(cfg) {
+        if capacity == 1 {
+            prompt.push_str(
+                "\n## Single-Session Backend Scheduling (`max_sessions = 1`)\n\
+                 The active LLM backend is configured with `max_sessions = 1` (a single inference slot). \
+                 To preserve KV-cache prefix locality and avoid turn-by-turn prompt eviction across concurrent subagents, \
+                 **you MUST schedule `delegate_task` calls sequentially: emit ONLY ONE `delegate_task` call per turn** \
+                 and wait for that specialist to complete before delegating the next pending task.\n",
+            );
+        } else {
+            prompt.push_str(&format!(
+                "\n## Parallel Task Scheduling (Capacity: {capacity} concurrent slots)\n\
+                 The LLM backend infrastructure is configured to handle up to {capacity} concurrent session(s) in parallel. \
+                 When multiple pending execution plan tasks are independent (do not depend on each other's outputs), \
+                 **you SHOULD schedule up to {capacity} `delegate_task` calls in parallel per turn** to maximize throughput. \
+                 Do NOT emit more than {capacity} concurrent `delegate_task` calls in a single turn to avoid queue congestion.\n",
+            ));
+        }
     }
     let mcp_servers = cfg.effective_orchestration_mcp_servers();
     let mcp_block = crate::prompts::format_mcp_prompt_block(cfg, &mcp_servers);
@@ -1730,6 +1738,43 @@ mod tests {
             .expect("load success");
         assert!(single_slot_prompt.contains("Single-Session Backend Scheduling"));
         assert!(single_slot_prompt.contains("emit ONLY ONE"));
+    }
+
+    #[test]
+    fn test_load_system_prompt_injects_parallel_scheduling_when_capacity_greater_than_one() {
+        let plan = crate::manager::phase::Plan::default();
+        let mut cfg = Config::default();
+
+        cfg.orchestration.concurrency.max_sessions = Some(2);
+        let multi_slot_prompt = load_system_prompt_with_plan_and_warning(&cfg, &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        assert!(
+            multi_slot_prompt.contains("Parallel Task Scheduling (Capacity: 2 concurrent slots)")
+        );
+        assert!(
+            multi_slot_prompt
+                .contains("schedule up to 2 `delegate_task` calls in parallel per turn")
+        );
+
+        // Multi-backend aggregate capacity:
+        cfg.orchestration.concurrency.max_sessions = None;
+        let url_a = "http://host-a:8080/v1".to_string();
+        let url_b = "http://host-b:8080/v1".to_string();
+        cfg.backend_urls = vec![url_a.clone(), url_b.clone()];
+        cfg.orchestration.concurrency.by_backend.insert(url_a, 2);
+        cfg.orchestration.concurrency.by_backend.insert(url_b, 1);
+        let multi_backend_prompt = load_system_prompt_with_plan_and_warning(&cfg, &plan)
+            .map(|(prompt, _warning)| prompt)
+            .expect("load success");
+        assert!(
+            multi_backend_prompt
+                .contains("Parallel Task Scheduling (Capacity: 3 concurrent slots)")
+        );
+        assert!(
+            multi_backend_prompt
+                .contains("schedule up to 3 `delegate_task` calls in parallel per turn")
+        );
     }
 
     /// The Manager prompt carries the same detected-git fragment the worker path

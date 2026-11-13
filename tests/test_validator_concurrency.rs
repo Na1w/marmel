@@ -490,6 +490,75 @@ async fn specialist_multi_backend_spillover_when_primary_full() {
     set_active(Config::default());
 }
 
+#[tokio::test]
+async fn specialist_multi_backend_parallel_workers_spillover_evenly() {
+    let _serial = VC_TEST_MUTEX.lock().await;
+    reset_cancellation();
+    pool::reset_unhealthy_backends();
+    pool::reset_active_workers();
+
+    let primary = "http://par-pri.invalid:8080/v1".to_string();
+    let secondary = "http://par-sec.invalid:8080/v1".to_string();
+    let model = "model-parallel";
+
+    let mut cfg = capped_cfg(&primary, model, 1);
+    cfg.backend_urls = vec![primary.clone(), secondary.clone()];
+    cfg.orchestration
+        .concurrency
+        .by_backend
+        .insert(primary.clone(), 1);
+    cfg.orchestration
+        .concurrency
+        .by_backend
+        .insert(secondary.clone(), 1);
+    set_active(cfg.clone());
+
+    assert_eq!(
+        marmennill::config::effective_parallel_capacity(&cfg),
+        Some(2)
+    );
+
+    // When 4 workers are spawned concurrently, each holds its lease during execution:
+    let (b1, _, _, l1) =
+        marmennill::agents::runner::resolve_specialist_backend_with_lease(&cfg, Agent::Coder);
+    assert_eq!(b1, primary, "worker 1 must pick primary (free)");
+
+    let (b2, _, _, l2) =
+        marmennill::agents::runner::resolve_specialist_backend_with_lease(&cfg, Agent::Coder);
+    assert_eq!(
+        b2, secondary,
+        "worker 2 must spill over to secondary (primary has active worker)"
+    );
+
+    let (b3, _, _, l3) =
+        marmennill::agents::runner::resolve_specialist_backend_with_lease(&cfg, Agent::Coder);
+    assert_eq!(
+        b3, primary,
+        "worker 3 assigned to primary (equal load 1 vs 1, primary priority)"
+    );
+
+    let (b4, _, _, _l4) =
+        marmennill::agents::runner::resolve_specialist_backend_with_lease(&cfg, Agent::Coder);
+    assert_eq!(
+        b4, secondary,
+        "worker 4 assigned to secondary (load 2 on pri vs 1 on sec)"
+    );
+
+    // Dropping worker 1's lease frees up a slot on primary:
+    drop(l1);
+    let (b5, _, _, _l5) =
+        marmennill::agents::runner::resolve_specialist_backend_with_lease(&cfg, Agent::Coder);
+    assert_eq!(
+        b5, primary,
+        "worker 5 must pick primary after worker 1 finishes"
+    );
+
+    drop(l2);
+    drop(l3);
+    pool::reset_active_workers();
+    set_active(Config::default());
+}
+
 /// The behavioural half of the same statement: an auditor's calls are metered
 /// against the pool of the pair its client was built from, so an auditor pointed
 /// at its own model runs straight through a saturated specialist slot instead of
